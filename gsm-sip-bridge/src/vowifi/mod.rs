@@ -1747,6 +1747,13 @@ fn handle_connection(
                 }
                 outcome => {
                     let reason = outcome.reason();
+                    // The telephone side's own status, when it gave one, so
+                    // `vowifi-status` shows *why* — `declined:pbx_failed:404`
+                    // reads very differently from `declined:pbx_rejected:603`.
+                    let summary = match outcome.status() {
+                        Some(status) => format!("declined:{reason}:{status}"),
+                        None => format!("declined:{reason}"),
+                    };
                     tracing::info!(call_id = %call_id, reason, "PBX leg never answered; declining");
                     reporter.report(
                         AgentState::default(),
@@ -1770,7 +1777,7 @@ fn handle_connection(
                         CallRecord {
                             call_id,
                             caller,
-                            outcome: format!("declined:{reason}"),
+                            outcome: summary,
                             started_at,
                             ended_at: Some(now_unix()),
                         },
@@ -1914,13 +1921,18 @@ const PBX_RING_TIMEOUT: Duration = Duration::from_secs(45);
 const PBX_RING_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// What became of the PBX leg while the caller listened to ringback.
+#[derive(Debug, PartialEq, Eq)]
 enum PbxOutcome {
     /// A human picked up.
     Answered,
-    /// The PBX hung up on us — busy, rejected, or the extension is gone.
-    Rejected,
-    /// It just rang out.
-    NoAnswer,
+    /// The telephone side declined: it answered `486`, `600` or `603`.
+    Rejected { status: u16 },
+    /// Nobody picked up — our own ring timeout (`status: None`), or the
+    /// telephone side giving up on its own no-answer timer (`480`/`408`).
+    NoAnswer { status: Option<u16> },
+    /// The leg ended before answer for any other reason, including no status
+    /// at all. Never treated as busy: a dead PBX is not a declining human.
+    Failed { status: Option<u16> },
     /// The caller gave up before anyone picked up. Agent A has already told
     /// the carrier; we only need to stop ringing the extension.
     CallerGone,
@@ -1931,10 +1943,37 @@ impl PbxOutcome {
         match self {
             // Only ever called on the paths that didn't answer.
             PbxOutcome::Answered => "answered",
-            PbxOutcome::Rejected => control::reason::PBX_REJECTED,
-            PbxOutcome::NoAnswer => control::reason::PBX_NO_ANSWER,
+            PbxOutcome::Rejected { .. } => control::reason::PBX_REJECTED,
+            PbxOutcome::NoAnswer { .. } => control::reason::PBX_NO_ANSWER,
+            PbxOutcome::Failed { .. } => control::reason::PBX_FAILED,
             PbxOutcome::CallerGone => control::reason::CALLER_CANCELLED,
         }
+    }
+
+    /// The telephone side's final status, when it gave one.
+    fn status(&self) -> Option<u16> {
+        match self {
+            PbxOutcome::Rejected { status } => Some(*status),
+            PbxOutcome::NoAnswer { status } | PbxOutcome::Failed { status } => *status,
+            PbxOutcome::Answered | PbxOutcome::CallerGone => None,
+        }
+    }
+}
+
+/// Why the PBX leg ended before answer, from its final SIP status.
+///
+/// Agent A answers the carrier `486 Busy Here` only for `Rejected` and `480`
+/// otherwise. That split is the whole of issue #108: T2 treats `480` as
+/// "unavailable, try elsewhere" (RFC 3261 §21.4.18) and re-offers the call,
+/// so a human reject reported as `480` rang the phone again ~11s later —
+/// while `486` is what §13.3.1.3 says a UAS that won't take the call SHOULD
+/// send. The opposite mistake matters as much: a broken PBX reported as
+/// `486` would send callers to busy treatment (often voicemail) for a fault.
+fn classify_pbx_disconnect(status: Option<u16>) -> PbxOutcome {
+    match status {
+        Some(code @ (486 | 600 | 603)) => PbxOutcome::Rejected { status: code },
+        Some(code @ (480 | 408)) => PbxOutcome::NoAnswer { status: Some(code) },
+        other => PbxOutcome::Failed { status: other },
     }
 }
 
@@ -1945,7 +1984,7 @@ fn wait_for_pbx_answer(pbx_call: &Call, ctrl_rx: &mpsc::Receiver<ControlMessage>
     while Instant::now() < deadline {
         match pbx_call.poll_state() {
             CallState::Confirmed => return PbxOutcome::Answered,
-            CallState::Disconnected => return PbxOutcome::Rejected,
+            CallState::Disconnected => return classify_pbx_disconnect(pbx_call.last_status()),
             // Calling/Early — still ringing.
             _ => {}
         }
@@ -1961,7 +2000,7 @@ fn wait_for_pbx_answer(pbx_call: &Call, ctrl_rx: &mpsc::Receiver<ControlMessage>
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
-    PbxOutcome::NoAnswer
+    PbxOutcome::NoAnswer { status: None }
 }
 
 /// Reads Agent A's control messages on a thread so the ring loop can wait on
@@ -2319,6 +2358,51 @@ pub fn query_status(addr: &str) -> BridgeResult<ControlMessage> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// specs/084 FR-001: the telephone side's final status, not merely the
+    /// leg having ended, decides declined / no answer / failed — and only a
+    /// genuine decline may ever become `pbx_rejected` (Agent A's `486`).
+    #[test]
+    fn classify_pbx_disconnect_maps_every_status() {
+        for code in [486, 600, 603] {
+            let outcome = classify_pbx_disconnect(Some(code));
+            assert_eq!(outcome, PbxOutcome::Rejected { status: code });
+            assert_eq!(outcome.reason(), control::reason::PBX_REJECTED);
+            assert_eq!(outcome.status(), Some(code));
+        }
+        for code in [480, 408] {
+            let outcome = classify_pbx_disconnect(Some(code));
+            assert_eq!(outcome, PbxOutcome::NoAnswer { status: Some(code) });
+            assert_eq!(outcome.reason(), control::reason::PBX_NO_ANSWER);
+        }
+        for status in [Some(404), Some(401), Some(488), Some(500), Some(503), None] {
+            let outcome = classify_pbx_disconnect(status);
+            assert_eq!(outcome, PbxOutcome::Failed { status });
+            assert_eq!(outcome.reason(), control::reason::PBX_FAILED);
+            assert_eq!(outcome.status(), status);
+        }
+    }
+
+    /// The ring loop classifies from the leg's real final status — a `603`
+    /// is a decline, and a leg that ended with no status at all is a failure
+    /// rather than the "rejected" every disconnect used to be (issue #108).
+    #[test]
+    fn wait_for_pbx_answer_classifies_a_disconnect_by_its_final_status() {
+        let (_ctrl_tx, ctrl_rx) = mpsc::channel::<ControlMessage>();
+
+        let mut declined = Call::from_id(1, CallState::Disconnected);
+        declined.set_last_status(Some(603));
+        assert_eq!(
+            wait_for_pbx_answer(&declined, &ctrl_rx),
+            PbxOutcome::Rejected { status: 603 }
+        );
+
+        let vanished = Call::from_id(2, CallState::Disconnected);
+        assert_eq!(
+            wait_for_pbx_answer(&vanished, &ctrl_rx),
+            PbxOutcome::Failed { status: None }
+        );
+    }
 
     #[test]
     fn expires_in_marks_a_lapsed_registration_rather_than_leaving_arithmetic_to_the_reader() {

@@ -20,9 +20,9 @@ use crate::ims::session::{
 };
 use crate::ims::sip_client::{
     build_100_trying, build_180_ringing, build_415_unsupported_media, build_420_bad_extension,
-    build_486_busy_here, build_488_incompatible_transport, build_488_not_acceptable,
-    build_580_precondition_failure, build_uas_response, build_uas_response_with_headers,
-    format_sip_addr, random_hex, SipMessage, SipRequest, SipSink,
+    build_488_incompatible_transport, build_488_not_acceptable, build_580_precondition_failure,
+    build_uas_response, build_uas_response_with_headers, format_sip_addr, random_hex, SipMessage,
+    SipRequest, SipSink,
 };
 use crate::vowifi::control::{reason, write_msg, ControlMessage};
 use chrono::Utc;
@@ -469,12 +469,20 @@ pub(super) fn handle_invite(
             // in silence until someone picks up. Wait for Agent B to report a
             // real answer — while still watching the carrier's own signaling,
             // since the caller may give up (`CANCEL`) while it rings.
-            match await_pbx_answer(&call_id, &ctrl_rx, inbound, req, &to_tag, &contact, sink)? {
+            match await_pbx_answer(
+                &call_id,
+                &ctrl_rx,
+                &inbound.rx,
+                req,
+                &to_tag,
+                &contact,
+                sink,
+            )? {
                 RingOutcome::Answered => {}
-                RingOutcome::PbxDeclined => {
+                RingOutcome::PbxDeclined { reason } => {
                     obs.report_call_not_answered(
                         CallStatus::Missed,
-                        BridgeFailureReason::PbxDeclined,
+                        observability::map_bridge_failure_reason(&reason),
                         &caller,
                         started_at,
                     );
@@ -673,7 +681,7 @@ pub(super) fn handle_invite(
             ..
         } => {
             tracing::info!(call_id = %call_id, reason = %fail_reason, "Agent B could not bridge the call, declining");
-            sink.send(&build_486_busy_here(req, &random_hex(4)))?;
+            sink.send(&decline_response(req, &to_tag, &fail_reason))?;
             obs.report_call_not_answered(
                 CallStatus::Failed,
                 observability::map_bridge_failure_reason(&fail_reason),
@@ -779,7 +787,7 @@ fn handle_offerless_invite(
                 ..
             } => {
                 tracing::info!(call_id = %call_id, reason = %fail_reason, "Agent B could not bridge the call, declining");
-                sink.send(&build_486_busy_here(req, &random_hex(4)))?;
+                sink.send(&decline_response(req, &to_tag, &fail_reason))?;
                 obs.report_call_not_answered(
                     CallStatus::Failed,
                     observability::map_bridge_failure_reason(&fail_reason),
@@ -816,12 +824,12 @@ fn handle_offerless_invite(
         sdp::CodecOffer::preferring_wideband(ctx.wideband && amr_safe::is_available()),
     );
 
-    match await_pbx_answer(call_id, &ctrl_rx, inbound, req, &to_tag, &contact, sink)? {
+    match await_pbx_answer(call_id, &ctrl_rx, &inbound.rx, req, &to_tag, &contact, sink)? {
         RingOutcome::Answered => {}
-        RingOutcome::PbxDeclined => {
+        RingOutcome::PbxDeclined { reason } => {
             obs.report_call_not_answered(
                 CallStatus::Missed,
-                BridgeFailureReason::PbxDeclined,
+                observability::map_bridge_failure_reason(&reason),
                 caller,
                 started_at,
             );
@@ -1054,6 +1062,27 @@ fn handle_offerless_invite(
     }))
 }
 
+/// The final response that declines `invite` because Agent B reported
+/// `BridgeFailed { reason }` — at setup, or while the PBX rang.
+///
+/// Only a telephone-side decline (`reason::PBX_REJECTED`) is `486 Busy Here`
+/// (RFC 3261 §13.3.1.3); every other reason, including one this build has
+/// never heard of, is `480 Temporarily Unavailable`. Issue #108: T2 treats
+/// `480` as "unavailable, try elsewhere" (§21.4.18) and re-offered a call the
+/// user had just rejected, ringing the phone again ~11s later; and the
+/// opposite mistake would report a dead PBX to the caller as a busy line.
+///
+/// `to_tag` must be the tag our `180 Ringing` already established, so the
+/// decline lands on the early dialog the carrier is holding.
+fn decline_response(invite: &SipRequest, to_tag: &str, reason: &str) -> String {
+    let (status, phrase) = if reason == reason::PBX_REJECTED {
+        (486, "Busy Here")
+    } else {
+        (480, "Temporarily Unavailable")
+    };
+    build_uas_response(status, phrase, invite, Some(to_tag), None, None)
+}
+
 /// Why we stopped ringing. The carrier has already been sent its final
 /// response in every case; the distinction is whether **Agent B** still needs
 /// telling — if it does and we don't, the PBX extension keeps ringing at
@@ -1062,8 +1091,9 @@ enum RingOutcome {
     /// A human picked up the PBX extension; answer the carrier.
     Answered,
     /// Agent B gave up on the PBX itself (`BridgeFailed`) and has already torn
-    /// its own legs down. Nothing more to tell it.
-    PbxDeclined,
+    /// its own legs down. Nothing more to tell it. `reason` is Agent B's —
+    /// declined, no answer, or failed — for the metric.
+    PbxDeclined { reason: String },
     /// We stopped ringing while Agent B still thinks the call is alive — the
     /// caller hung up, or we hit our own ring timeout. Agent B must be told to
     /// stop ringing the extension.
@@ -1082,7 +1112,7 @@ enum RingOutcome {
 fn await_pbx_answer(
     call_id: &str,
     ctrl_rx: &mpsc::Receiver<ControlMessage>,
-    inbound: &Inbound,
+    sip_rx: &mpsc::Receiver<(SipMessage, SipSink)>,
     invite: &SipRequest,
     to_tag: &str,
     contact: &str,
@@ -1100,7 +1130,7 @@ fn await_pbx_answer(
     while Instant::now() < deadline {
         // 1. Did the caller give up while it rang? A CANCEL must be answered
         //    promptly or the network keeps retransmitting it.
-        while let Ok((msg, req_sink)) = inbound.rx.try_recv() {
+        while let Ok((msg, req_sink)) = sip_rx.try_recv() {
             let SipMessage::Request(req) = msg else {
                 continue;
             };
@@ -1150,8 +1180,8 @@ fn await_pbx_answer(
             Ok(ControlMessage::CallAnswered { .. }) => return Ok(RingOutcome::Answered),
             Ok(ControlMessage::BridgeFailed { reason, .. }) => {
                 tracing::info!(call_id = %call_id, reason = %reason, "PBX leg did not answer; declining");
-                decline(480, "Temporarily Unavailable");
-                return Ok(RingOutcome::PbxDeclined);
+                respond(sink, &reason, &decline_response(invite, to_tag, &reason));
+                return Ok(RingOutcome::PbxDeclined { reason });
             }
             Ok(other) => {
                 tracing::warn!(call_id = %call_id, message = ?other, "unexpected control message while ringing");
@@ -1184,6 +1214,96 @@ mod tests {
              {headers}Call-ID: c1\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"
         );
         SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    /// The decline Agent A answers for each `BridgeFailed` reason (specs/084
+    /// FR-002..FR-004): only a telephone-side decline is busy; everything
+    /// else — no answer, a broken PBX, a setup failure, or a reason this build
+    /// has never heard of — is `480`. Always on the early dialog's tag.
+    #[test]
+    fn decline_response_maps_reasons() {
+        let req = invite_with_headers(
+            "From: <sip:+919000000000@ims.example>;tag=abc\r\nTo: <sip:me@ims.example>\r\n",
+        );
+        let busy = decline_response(&req, "tagR", reason::PBX_REJECTED);
+        assert!(busy.starts_with("SIP/2.0 486 Busy Here\r\n"), "{busy}");
+        assert!(busy.contains(";tag=tagR"), "{busy}");
+        for other in [
+            reason::PBX_NO_ANSWER,
+            reason::PBX_FAILED,
+            reason::PBX_UNREACHABLE,
+            "some_future_reason",
+        ] {
+            let resp = decline_response(&req, "tagR", other);
+            assert!(
+                resp.starts_with("SIP/2.0 480 Temporarily Unavailable\r\n"),
+                "{other}: {resp}"
+            );
+            assert!(resp.contains(";tag=tagR"), "{other}: {resp}");
+        }
+    }
+
+    /// Issue #108 end to end through the ringing wait: Agent B's verdict
+    /// arrives on the control channel, and what actually goes out on a real
+    /// UDP socket to the "carrier" is the matching final response, on the
+    /// `180`'s tag — `486` for a human reject, `480` otherwise.
+    #[test]
+    fn await_pbx_answer_declines_with_the_status_agent_b_reported() {
+        use crate::ims::sip_client::SipTransport;
+        use std::net::UdpSocket;
+
+        for (reason, status_line) in [
+            (reason::PBX_REJECTED, "SIP/2.0 486 Busy Here\r\n"),
+            (
+                reason::PBX_NO_ANSWER,
+                "SIP/2.0 480 Temporarily Unavailable\r\n",
+            ),
+            (
+                reason::PBX_FAILED,
+                "SIP/2.0 480 Temporarily Unavailable\r\n",
+            ),
+        ] {
+            let carrier = UdpSocket::bind("127.0.0.1:0").unwrap();
+            carrier
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let sink = SipTransport::connect(carrier.local_addr().unwrap(), false)
+                .unwrap()
+                .sink()
+                .unwrap();
+            let (_sip_tx, sip_rx) = mpsc::channel::<(SipMessage, SipSink)>();
+            let (ctrl_tx, ctrl_rx) = mpsc::channel::<ControlMessage>();
+            ctrl_tx
+                .send(ControlMessage::BridgeFailed {
+                    call_id: "c1".into(),
+                    reason: reason.into(),
+                })
+                .unwrap();
+            let req = invite_with_headers(
+                "From: <sip:+919000000000@ims.example>;tag=abc\r\nTo: <sip:me@ims.example>\r\n",
+            );
+
+            let outcome = await_pbx_answer(
+                "c1",
+                &ctrl_rx,
+                &sip_rx,
+                &req,
+                "tag180",
+                "<sip:me@10.0.0.9>",
+                &sink,
+            )
+            .unwrap();
+
+            match outcome {
+                RingOutcome::PbxDeclined { reason: got } => assert_eq!(got, reason),
+                _ => panic!("{reason}: expected PbxDeclined"),
+            }
+            let mut buf = [0u8; 4096];
+            let n = carrier.recv(&mut buf).unwrap();
+            let sent = String::from_utf8_lossy(&buf[..n]);
+            assert!(sent.starts_with(status_line), "{reason}: {sent}");
+            assert!(sent.contains(";tag=tag180"), "{reason}: {sent}");
+        }
     }
 
     #[test]
