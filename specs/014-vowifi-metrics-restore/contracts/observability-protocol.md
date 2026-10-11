@@ -66,7 +66,7 @@ convention already used by `vowifi::control::ControlMessage`.
 |---|---|
 | `call_completed` | `status`: `answered` \| `missed` \| `failed`; `duration_seconds`: number |
 | `pbx_leg_completed` | `outcome`: `success` \| `failed` |
-| `bridge_failed` | `reason`: `bridge_setup_failed` \| `ring_timeout` \| `caller_cancelled` \| `pbx_declined` \| `agent_unreachable` |
+| `bridge_failed` | `reason`: `bridge_setup_failed` \| `ring_timeout` \| `caller_cancelled` \| `pbx_declined` \| `pbx_failed` \| `agent_unreachable` \| `one_way_audio` (`pbx_failed` added by specs/084: `pbx_declined` now means only a telephone-side 486/600/603) |
 | `sms_received` | — |
 | `sms_forwarded` | `outcome`: `sent` \| `failed` |
 | `registration_attempt` | `status`: `success` \| `auth_failed` \| `rejected` \| `timeout` |

@@ -10,6 +10,20 @@ across releases.
 
 ### Fixed
 
+- **A rejected inbound call no longer rings the phone again.** When the
+  phone or PBX rejected an incoming VoWiFi/VoLTE call, the bridge told the
+  carrier `480 Temporarily Unavailable`, which some networks (T2) read as
+  "try again elsewhere": about 11 seconds later the same caller's call was
+  offered again and the phone rang a second time. A reject (`486`, `600` or
+  `603` from the phone side) is now answered `486 Busy Here`. No answer, an
+  unreachable PBX or any other phone-side failure is still `480`, so a
+  broken PBX is never reported to callers as a busy line. Every final
+  response now keeps the `180 Ringing`'s To-tag, the ACK after a reject is
+  no longer logged as unmatched, and the `bridge_failed` metric separates
+  declines (`pbx_declined`) from no-answers (`ring_timeout`) and from
+  phone-side failures (new `pbx_failed`). Reported by @mironovlab
+  ([#108](https://github.com/selvakn/gsm-sip-bridge/issues/108)).
+
 - **VoWiFi line stuck with "control channel not bindable yet" forever.**
   The per-line veth pair was built once, right after the tunnel first came
   up, with every command's result discarded, and nothing ever looked at it
