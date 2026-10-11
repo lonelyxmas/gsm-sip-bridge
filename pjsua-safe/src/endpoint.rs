@@ -24,6 +24,26 @@ static RINGBACK_ACTIVE: AtomicBool = AtomicBool::new(false);
 static BRIDGE_PAIRS: LazyLock<Mutex<std::collections::HashMap<i32, i32>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// The final SIP status of each call PJSIP has disconnected, captured inside
+/// `on_call_state_cb` — the only point where it is reliably readable, since
+/// PJSUA resets the call's slot (and `pjsua_call_get_info` starts failing)
+/// as soon as that callback returns. Read by `Call::last_status`. An entry is
+/// dropped on the next non-disconnected state for the same id, so a reused
+/// call id never reports the previous call's status.
+#[cfg(feature = "pjsip-linked")]
+static DISCONNECT_STATUS: LazyLock<Mutex<std::collections::HashMap<i32, u16>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// The status `on_call_state_cb` captured when `call_id` disconnected.
+#[cfg(feature = "pjsip-linked")]
+pub(crate) fn disconnect_status(call_id: i32) -> Option<u16> {
+    DISCONNECT_STATUS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&call_id)
+        .copied()
+}
+
 /// Calls PJSIP has notified us of via `on_incoming_call` that no Rust-side
 /// caller has claimed yet (spec 025, research.md R-007). `Endpoint` exposes
 /// this as a polling API (`poll_incoming_call`), the same idiom `Call`
@@ -891,6 +911,19 @@ unsafe extern "C" fn on_call_state_cb( // SAFETY: PJSIP invokes with valid call_
 
     let state = info.state;
     tracing::info!(call_id, state, "SIP call state changed");
+
+    {
+        let mut statuses = DISCONNECT_STATUS.lock().unwrap_or_else(|e| e.into_inner());
+        if state == pjsua_sys::pjsip_inv_state_PJSIP_INV_STATE_DISCONNECTED {
+            if let Ok(code) = u16::try_from(info.last_status) {
+                if code > 0 {
+                    statuses.insert(call_id, code);
+                }
+            }
+        } else {
+            statuses.remove(&call_id);
+        }
+    }
 
     match state {
         s if s == pjsua_sys::pjsip_inv_state_PJSIP_INV_STATE_CALLING

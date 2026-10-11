@@ -25,6 +25,10 @@ pub struct Call {
     #[allow(dead_code)]
     call_id: i32,
     state: CallState,
+    /// Stub builds only: what [`Call::last_status`] reports, set by tests via
+    /// [`Call::set_last_status`]. A linked build reads PJSIP instead.
+    #[allow(dead_code)]
+    last_status: Option<u16>,
 }
 
 impl Call {
@@ -111,6 +115,7 @@ impl Call {
                 return Ok(Self {
                     call_id,
                     state: CallState::Calling,
+                    last_status: None,
                 });
             }
         }
@@ -122,6 +127,7 @@ impl Call {
             Ok(Self {
                 call_id: 0,
                 state: CallState::Calling,
+                last_status: None,
             })
         }
     }
@@ -135,7 +141,11 @@ impl Call {
     /// `on_incoming_call`, the same way `Call::make`'s `call_id` comes from
     /// `pjsua_call_make_call`.
     pub fn from_id(call_id: i32, state: CallState) -> Self {
-        Self { call_id, state }
+        Self {
+            call_id,
+            state,
+            last_status: None,
+        }
     }
 
     /// Answers an incoming call with the given SIP status `code` (e.g. 180
@@ -326,6 +336,44 @@ impl Call {
         self.state = state;
     }
 
+    /// The final SIP status that ended this call — e.g. `486` when the far
+    /// end rejected it, `408` when it timed out — or `None` if the call has
+    /// not ended or PJSIP recorded no status for it.
+    ///
+    /// Reads the live call info first, but PJSUA resets the call's slot as
+    /// soon as its `DISCONNECTED` callback returns, so by the time a caller
+    /// polling [`Call::poll_state`] sees `Disconnected` that info is usually
+    /// gone. The status captured inside that callback (`endpoint`'s
+    /// `DISCONNECT_STATUS`) covers exactly that window.
+    pub fn last_status(&self) -> Option<u16> {
+        #[cfg(feature = "pjsip-linked")]
+        {
+            ensure_pjsip_thread();
+            unsafe // SAFETY: PJSIP initialized; call_id owned by this Call; writable stack out-param
+            {
+                let mut info = std::mem::zeroed::<pjsua_sys::pjsua_call_info>();
+                if pjsua_sys::pjsua_call_get_info(self.call_id, &mut info)
+                    == crate::error::PJ_SUCCESS
+                    && info.last_status > 0
+                {
+                    return u16::try_from(info.last_status).ok();
+                }
+            }
+            crate::endpoint::disconnect_status(self.call_id)
+        }
+
+        #[cfg(not(feature = "pjsip-linked"))]
+        {
+            self.last_status
+        }
+    }
+
+    /// Stub builds: sets what [`Call::last_status`] reports. A linked build
+    /// ignores it — PJSIP is the only source of truth there.
+    pub fn set_last_status(&mut self, status: Option<u16>) {
+        self.last_status = status;
+    }
+
     pub fn call_id(&self) -> i32 {
         self.call_id
     }
@@ -354,6 +402,15 @@ fn parse_uri_user(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(feature = "pjsip-linked"))]
+    #[test]
+    fn a_stub_call_reports_the_final_status_it_was_given() {
+        let mut call = Call::from_id(3, CallState::Early);
+        assert_eq!(call.last_status(), None);
+        call.set_last_status(Some(603));
+        assert_eq!(call.last_status(), Some(603));
+    }
 
     #[test]
     fn parse_uri_user_bare() {
