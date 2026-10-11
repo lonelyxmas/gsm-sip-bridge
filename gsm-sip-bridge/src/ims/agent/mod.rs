@@ -468,6 +468,79 @@ fn names_active_call(req: &SipRequest, active_call_id: Option<&str>) -> bool {
     active_call_id.is_some_and(|id| req.header("Call-ID") == Some(id))
 }
 
+/// How long a declined INVITE is remembered for its ACK: Timer H, 64·T1
+/// (RFC 3261 §17.2.1) — past that the carrier has given up retransmitting
+/// the final response, so no ACK for it can still be on its way.
+const DECLINE_ACK_WINDOW: Duration = Duration::from_secs(32);
+/// Bound on remembered declines, so a burst of refused calls cannot grow the
+/// list without limit; the oldest is forgotten first.
+const DECLINE_ACK_CAPACITY: usize = 64;
+
+/// Call-IDs of inbound INVITEs this loop answered with a failure, kept just
+/// long enough to recognise their ACK (RFC 3261 §17.1.1.3: the ACK to a
+/// non-2xx carries the INVITE's Call-ID). Used only to label that ACK in the
+/// log — issue #108's live trace showed a perfectly correct ACK after `486`
+/// logged as unmatched. Never a gate on admitting a new INVITE.
+#[derive(Default)]
+struct RecentDeclines {
+    entries: std::collections::VecDeque<(String, Instant)>,
+}
+
+impl RecentDeclines {
+    fn record(&mut self, invite: &SipRequest, now: Instant) {
+        let Some(call_id) = invite.header("Call-ID") else {
+            return;
+        };
+        self.prune(now);
+        if self.entries.len() >= DECLINE_ACK_CAPACITY {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((call_id.to_string(), now));
+    }
+
+    fn contains(&self, call_id: &str, now: Instant) -> bool {
+        self.entries.iter().any(|(id, at)| {
+            id == call_id && now.saturating_duration_since(*at) < DECLINE_ACK_WINDOW
+        })
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while self
+            .entries
+            .front()
+            .is_some_and(|(_, at)| now.saturating_duration_since(*at) >= DECLINE_ACK_WINDOW)
+        {
+            self.entries.pop_front();
+        }
+    }
+}
+
+/// Which call an inbound ACK belongs to, for `LoopState::log_ack`.
+#[derive(Debug, PartialEq, Eq)]
+enum AckDisposition {
+    ActiveCall,
+    DeclinedCall,
+    Unmatched,
+}
+
+fn ack_disposition(
+    req: &SipRequest,
+    active_call_id: Option<&str>,
+    declines: &RecentDeclines,
+    now: Instant,
+) -> AckDisposition {
+    if names_active_call(req, active_call_id) {
+        AckDisposition::ActiveCall
+    } else if req
+        .header("Call-ID")
+        .is_some_and(|id| declines.contains(id, now))
+    {
+        AckDisposition::DeclinedCall
+    } else {
+        AckDisposition::Unmatched
+    }
+}
+
 /// The fallback final response when handling an inbound INVITE fails
 /// outright. `480`, not `486`: the line is not busy, the bridge could not be
 /// built. On `to_tag` — the tag `inbound::handle_invite` used for its `180`,
@@ -1683,6 +1756,10 @@ struct LoopState {
     /// already logged, so a retransmission of it (our final response lost)
     /// does not repeat the warning — see [`Self::unreadable_caller_to_log`].
     unreadable_caller_warned: Option<String>,
+    /// INVITEs this loop recently declined, so their ACK reads as the
+    /// expected end of a decline rather than as an unmatched ACK
+    /// (specs/084 FR-006). Diagnostics only — never consulted for admission.
+    recent_declines: RecentDeclines,
 }
 
 impl LoopState {
@@ -1700,6 +1777,7 @@ impl LoopState {
             gm_conn: crate::ims::GmConnectionState::Up,
             consecutive_renewal_failures: 0,
             unreadable_caller_warned: None,
+            recent_declines: RecentDeclines::default(),
         }
     }
 
@@ -2307,6 +2385,7 @@ impl LoopState {
         if Admission::for_current(occupant) == Admission::RejectBusy {
             tracing::info!("declining inbound call: another VoWiFi call is already active");
             let _ = sink.send(&build_486_busy_here(req, &random_hex(4)));
+            self.recent_declines.record(req, Instant::now());
             p.obs.report_call_not_answered(
                 CallStatus::Failed,
                 BridgeFailureReason::BridgeSetupFailed,
@@ -2336,6 +2415,7 @@ impl LoopState {
                 None,
                 None,
             ));
+            self.recent_declines.record(req, Instant::now());
             p.obs.report_call_not_answered(
                 CallStatus::Failed,
                 BridgeFailureReason::AgentUnreachable,
@@ -2351,6 +2431,9 @@ impl LoopState {
         let to_tag = random_hex(4);
         match inbound::handle_invite(session, req, sink, inbound, &p.invite_ctx(), &to_tag) {
             Ok(call) => {
+                if call.is_none() {
+                    self.recent_declines.record(req, Instant::now());
+                }
                 if call.is_some() {
                     p.obs.set_active_calls(1);
                     // Fresh call, fresh media baseline (the meter starts at
@@ -2362,6 +2445,7 @@ impl LoopState {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to handle inbound INVITE");
+                self.recent_declines.record(req, Instant::now());
                 // Tell the caller. Without this the carrier never gets a final
                 // response, so the caller keeps hearing the ringback our
                 // earlier `180` started and waits out the network's own timer —
@@ -2429,14 +2513,20 @@ impl LoopState {
     /// ever sent for an ACK either way.
     fn log_ack(&self, req: &SipRequest) {
         let active_call_id = self.active_call.as_ref().map(|c| c.call_id.as_str());
-        if names_active_call(req, active_call_id) {
-            tracing::debug!(call_id = ?req.header("Call-ID"), "received ACK, dialog confirmed");
-        } else {
-            tracing::warn!(
-                call_id = ?req.header("Call-ID"),
-                active_call_id = ?active_call_id,
-                "received ACK for a Call-ID that does not match the active call (or no call is active)"
-            );
+        match ack_disposition(req, active_call_id, &self.recent_declines, Instant::now()) {
+            AckDisposition::ActiveCall => {
+                tracing::debug!(call_id = ?req.header("Call-ID"), "received ACK, dialog confirmed");
+            }
+            AckDisposition::DeclinedCall => {
+                tracing::debug!(call_id = ?req.header("Call-ID"), "received ACK for an INVITE we declined");
+            }
+            AckDisposition::Unmatched => {
+                tracing::warn!(
+                    call_id = ?req.header("Call-ID"),
+                    active_call_id = ?active_call_id,
+                    "received ACK for a Call-ID that does not match the active call (or no call is active)"
+                );
+            }
         }
     }
 
@@ -2898,6 +2988,70 @@ mod tests {
             "INVITE sip:x SIP/2.0\r\n{headers}Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"
         );
         SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    fn ack_for(call_id: &str) -> SipRequest {
+        let raw = format!(
+            "ACK sip:x SIP/2.0\r\nCall-ID: {call_id}\r\nCSeq: 1 ACK\r\nContent-Length: 0\r\n\r\n"
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    fn invite_for(call_id: &str) -> SipRequest {
+        let raw = format!(
+            "INVITE sip:x SIP/2.0\r\nCall-ID: {call_id}\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    /// specs/084 FR-006: the ACK after our decline is recognised as such,
+    /// within Timer H, and forgotten after it.
+    #[test]
+    fn the_ack_for_a_declined_invite_is_recognised_until_timer_h() {
+        let t0 = Instant::now();
+        let mut declines = RecentDeclines::default();
+        declines.record(&invite_for("declined-1"), t0);
+
+        assert_eq!(
+            ack_disposition(
+                &ack_for("declined-1"),
+                None,
+                &declines,
+                t0 + Duration::from_millis(45)
+            ),
+            AckDisposition::DeclinedCall
+        );
+        assert_eq!(
+            ack_disposition(
+                &ack_for("declined-1"),
+                None,
+                &declines,
+                t0 + DECLINE_ACK_WINDOW
+            ),
+            AckDisposition::Unmatched
+        );
+        assert_eq!(
+            ack_disposition(&ack_for("other"), None, &declines, t0),
+            AckDisposition::Unmatched
+        );
+        assert_eq!(
+            ack_disposition(&ack_for("live"), Some("live"), &declines, t0),
+            AckDisposition::ActiveCall
+        );
+    }
+
+    /// A burst of declines cannot grow the list past its bound; the oldest
+    /// goes first.
+    #[test]
+    fn recent_declines_are_bounded_oldest_first() {
+        let t0 = Instant::now();
+        let mut declines = RecentDeclines::default();
+        for i in 0..=DECLINE_ACK_CAPACITY {
+            declines.record(&invite_for(&format!("c{i}")), t0);
+        }
+        assert_eq!(declines.entries.len(), DECLINE_ACK_CAPACITY);
+        assert!(!declines.contains("c0", t0));
+        assert!(declines.contains(&format!("c{DECLINE_ACK_CAPACITY}"), t0));
     }
 
     /// specs/084 FR-005: the fallback after a failed INVITE is `480` on the
