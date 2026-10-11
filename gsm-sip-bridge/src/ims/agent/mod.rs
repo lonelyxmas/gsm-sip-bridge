@@ -468,6 +468,22 @@ fn names_active_call(req: &SipRequest, active_call_id: Option<&str>) -> bool {
     active_call_id.is_some_and(|id| req.header("Call-ID") == Some(id))
 }
 
+/// The fallback final response when handling an inbound INVITE fails
+/// outright. `480`, not `486`: the line is not busy, the bridge could not be
+/// built. On `to_tag` — the tag `inbound::handle_invite` used for its `180`,
+/// if it got that far — since a final response on a fresh tag after a `180`
+/// names a dialog the carrier has never seen (specs/084 FR-005).
+fn bridge_error_response(req: &SipRequest, to_tag: &str) -> String {
+    build_uas_response(
+        480,
+        "Temporarily Unavailable",
+        req,
+        Some(to_tag),
+        None,
+        None,
+    )
+}
+
 /// The `tag=` parameter of a header value (RFC 3261 §19.3) — e.g. `"abc"`
 /// from `<sip:x@y>;tag=abc`. `None` if the header is absent or carries none.
 fn header_tag(value: &str) -> Option<&str> {
@@ -2329,7 +2345,11 @@ impl LoopState {
             return;
         }
 
-        match inbound::handle_invite(session, req, sink, inbound, &p.invite_ctx()) {
+        // One tag for every response to this INVITE, owned here so the `Err`
+        // fallback below lands on the same early dialog as the `180` that
+        // `handle_invite` may already have sent (specs/084 FR-005).
+        let to_tag = random_hex(4);
+        match inbound::handle_invite(session, req, sink, inbound, &p.invite_ctx(), &to_tag) {
             Ok(call) => {
                 if call.is_some() {
                     p.obs.set_active_calls(1);
@@ -2353,14 +2373,7 @@ impl LoopState {
                 // line is not busy, the bridge could not be built. Saying which
                 // is the difference between a caller redialling now and one
                 // redialling later.
-                if let Err(send_err) = sink.send(&build_uas_response(
-                    480,
-                    "Temporarily Unavailable",
-                    req,
-                    Some(&random_hex(4)),
-                    None,
-                    None,
-                )) {
+                if let Err(send_err) = sink.send(&bridge_error_response(req, &to_tag)) {
                     tracing::warn!(
                         error = %send_err,
                         "could not tell the caller the bridge failed"
@@ -2885,6 +2898,27 @@ mod tests {
             "INVITE sip:x SIP/2.0\r\n{headers}Call-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"
         );
         SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    /// specs/084 FR-005: the fallback after a failed INVITE is `480` on the
+    /// tag it is handed — the `180`'s — not a fresh one.
+    #[test]
+    fn the_error_fallback_declines_on_the_given_to_tag() {
+        let req = invite_with_headers(
+            "Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKone\r\n\
+             From: <sip:+919000000000@ims.example>;tag=abc\r\n\
+             To: <sip:me@ims.example>\r\n",
+        );
+        let resp = bridge_error_response(&req, "tagX");
+        assert!(
+            resp.starts_with("SIP/2.0 480 Temporarily Unavailable\r\n"),
+            "{resp}"
+        );
+        let to = resp
+            .lines()
+            .find(|l| l.starts_with("To:"))
+            .expect("To header");
+        assert!(to.ends_with(";tag=tagX"), "{to}");
     }
 
     /// Issue #104, verbatim from the T2 capture (synthetic number): the
