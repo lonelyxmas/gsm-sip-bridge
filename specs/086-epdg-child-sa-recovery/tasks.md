@@ -18,7 +18,7 @@ description: "Task list for specs/086-epdg-child-sa-recovery"
 
 ## Phase 1: Setup
 
-- [ ] T001 Confirm the baseline on branch `086-epdg-child-sa-recovery` is green: run `make lint && make test` from the repo root and record any pre-existing failures before touching code (there should be none; stop if there are)
+- [X] T001 Confirm the baseline on branch `086-epdg-child-sa-recovery` is green: run `make lint && make test` from the repo root and record any pre-existing failures before touching code (there should be none; stop if there are)
 
 ---
 
@@ -26,9 +26,9 @@ description: "Task list for specs/086-epdg-child-sa-recovery"
 
 **Purpose**: replace the positional `unreachable_streak: &mut u32` with a struct that can carry the new per-line state (research R2, data-model "SteadyTracking"). Pure refactor, no behaviour change.
 
-- [ ] T002 In `gsm-sip-bridge/src/supervise/line_supervisor.rs`, add `#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)] pub struct SteadyTracking { pub pcscf_unreachable: u32, pub child_sa_missing: u32, pub child_sa_usable: bool }` with a doc comment (loop-owned, survives between ticks, keeps the tick a pure decision over its inputs). Change `tick_steady_state`'s `unreachable_streak: &mut u32` parameter to `tracking: &mut SteadyTracking`, and replace every use of `*unreachable_streak` with `tracking.pcscf_unreachable`. Leave `child_sa_missing`/`child_sa_usable` unused for now
-- [ ] T003 Update the test-helper shadow `tick_steady_state` and every test call site in `gsm-sip-bridge/src/supervise/line_supervisor.rs`: `&mut 0` becomes `&mut SteadyTracking::default()`. Tests that read the streak afterwards (e.g. the swu reachability-window tests using `let mut streak`) now hold a `SteadyTracking` and read `.pcscf_unreachable`
-- [ ] T004 Update both callers in `gsm-sip-bridge/src/supervise/orchestrate.rs`: in the strongswan steady-state loop (~line 1623, `let mut unreachable_streak = 0u32;`) and the swu loop (~line 2089), use `let mut tracking = line_supervisor::SteadyTracking::default();` and pass `&mut tracking`. Run `make format && make lint && make test` and commit: `refactor(supervise): thread steady-state tracking through a struct`
+- [X] T002 In `gsm-sip-bridge/src/supervise/line_supervisor.rs`, add `#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)] pub struct SteadyTracking { pub pcscf_unreachable: u32, pub child_sa_missing: u32, pub child_sa_usable: bool }` with a doc comment (loop-owned, survives between ticks, keeps the tick a pure decision over its inputs). Change `tick_steady_state`'s `unreachable_streak: &mut u32` parameter to `tracking: &mut SteadyTracking`, and replace every use of `*unreachable_streak` with `tracking.pcscf_unreachable`. Leave `child_sa_missing`/`child_sa_usable` unused for now
+- [X] T003 Update the test-helper shadow `tick_steady_state` and every test call site in `gsm-sip-bridge/src/supervise/line_supervisor.rs`: `&mut 0` becomes `&mut SteadyTracking::default()`. Tests that read the streak afterwards (e.g. the swu reachability-window tests using `let mut streak`) now hold a `SteadyTracking` and read `.pcscf_unreachable`
+- [X] T004 Update both callers in `gsm-sip-bridge/src/supervise/orchestrate.rs`: in the strongswan steady-state loop (~line 1623, `let mut unreachable_streak = 0u32;`) and the swu loop (~line 2089), use `let mut tracking = line_supervisor::SteadyTracking::default();` and pass `&mut tracking`. Run `make format && make lint && make test` and commit: `refactor(supervise): thread steady-state tracking through a struct`
 
 **Checkpoint**: behaviour identical, all tests green.
 

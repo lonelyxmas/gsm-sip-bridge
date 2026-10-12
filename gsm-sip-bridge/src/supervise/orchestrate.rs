@@ -1620,7 +1620,7 @@ fn start_vowifi_line_strongswan(
     let mut current_pcscf = pcscf;
     // Consecutive ticks the P-CSCF has been unreachable. Owned by the loop, like
     // `current_pcscf`, so the tick function stays a decision over inputs.
-    let mut unreachable_streak = 0u32;
+    let mut tracking = line_supervisor::SteadyTracking::default();
     loop {
         runner.sleep(line_supervisor::STEADY_STATE_POLL_INTERVAL);
         // Held across the whole tick_steady_state call, not just a one-off
@@ -1644,7 +1644,7 @@ fn start_vowifi_line_strongswan(
             &engine,
             runner.as_ref(),
             &current_pcscf,
-            &mut unreachable_streak,
+            &mut tracking,
             line_supervisor::STEADY_STATE_POLL_INTERVAL,
         ) {
             line_supervisor::SteadyOutcome::StillUp => {
@@ -2086,7 +2086,7 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
     start_line_tail(ctx, idx, &netns, line, &usim_holder, pcscf.clone());
 
     let mut current_pcscf = pcscf;
-    let mut unreachable_streak = 0u32;
+    let mut tracking = line_supervisor::SteadyTracking::default();
     loop {
         // Named, and shared with the reachability-window derivation: this loop
         // polls six times faster than the strongswan one, so any threshold
@@ -2106,7 +2106,7 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
             &engine,
             runner.as_ref(),
             &current_pcscf,
-            &mut unreachable_streak,
+            &mut tracking,
             line_supervisor::SWU_STEADY_STATE_POLL_INTERVAL,
         ) {
             line_supervisor::SteadyOutcome::StillUp => {

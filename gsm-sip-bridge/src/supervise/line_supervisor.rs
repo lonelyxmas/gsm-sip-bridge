@@ -290,6 +290,19 @@ pub enum SteadyOutcome {
     },
 }
 
+/// Per-line state the steady-state loop carries between ticks. Owned by the
+/// loop (not the engine) so [`tick_steady_state`] stays a pure decision over
+/// its inputs.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SteadyTracking {
+    /// Consecutive ticks the P-CSCF was unreachable.
+    pub pcscf_unreachable: u32,
+    /// Consecutive ticks the CHILD_SA was missing under a live IKE_SA.
+    pub child_sa_missing: u32,
+    /// Whether the last tick saw a usable CHILD_SA.
+    pub child_sa_usable: bool,
+}
+
 /// Advances the steady-state state machine by one tick. 1:1 port of both
 /// engines' steady-state supervisor loop bodies (see module docs) — the
 /// order of checks matches the bash exactly: process-alive first, then
@@ -299,7 +312,7 @@ pub fn tick_steady_state(
     engine: &dyn TunnelEngine,
     runner: &dyn CommandRunner,
     current_pcscf: &str,
-    unreachable_streak: &mut u32,
+    tracking: &mut SteadyTracking,
     poll_interval: Duration,
 ) -> SteadyOutcome {
     if !engine.is_process_alive(runner) {
@@ -377,7 +390,7 @@ pub fn tick_steady_state(
     }
 
     if engine.pcscf_reachable(runner, current_pcscf) {
-        *unreachable_streak = 0;
+        tracking.pcscf_unreachable = 0;
     } else {
         // Before escalating: is the route simply gone? That is a millisecond
         // repair with no disruption, against a rebuild that renegotiates the SA
@@ -390,16 +403,16 @@ pub fn tick_steady_state(
         // installs moments earlier. On 2026-08-19 that loop ran 202 times over
         // six hours without ever restoring the data path.
         if engine.repair_default_route(runner) {
-            *unreachable_streak = 0;
+            tracking.pcscf_unreachable = 0;
             return SteadyOutcome::Recovered {
                 reason: DegradeReason::DefaultRouteMissing,
             };
         }
-        *unreachable_streak = unreachable_streak.saturating_add(1);
+        tracking.pcscf_unreachable = tracking.pcscf_unreachable.saturating_add(1);
         // Derived from this loop's own cadence, so both engines wait the same
         // ~90s of real time rather than the same number of ticks.
-        if *unreachable_streak >= pcscf_unreachable_strikes(poll_interval) {
-            *unreachable_streak = 0;
+        if tracking.pcscf_unreachable >= pcscf_unreachable_strikes(poll_interval) {
+            tracking.pcscf_unreachable = 0;
             // The same remedy as `TunVanished`, and for the same underlying
             // reason: there is no working data path. `recreate_interface` runs
             // first and the rebuild is conditional on it, exactly as there —
@@ -460,13 +473,13 @@ mod tests {
         engine: &dyn TunnelEngine,
         runner: &dyn CommandRunner,
         current_pcscf: &str,
-        unreachable_streak: &mut u32,
+        tracking: &mut SteadyTracking,
     ) -> SteadyOutcome {
         super::tick_steady_state(
             engine,
             runner,
             current_pcscf,
-            unreachable_streak,
+            tracking,
             STEADY_STATE_POLL_INTERVAL,
         )
     }
@@ -705,7 +718,8 @@ mod tests {
             alive: RefCell::new(false),
             ..Default::default()
         };
-        let outcome = tick_steady_state(&engine, &runner, "10.0.0.1", &mut 0);
+        let outcome =
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut SteadyTracking::default());
         assert_eq!(
             outcome,
             SteadyOutcome::Recovered {
@@ -722,7 +736,8 @@ mod tests {
             health: RefCell::new(SteadyStateHealth::ViciBroken),
             ..Default::default()
         };
-        let outcome = tick_steady_state(&engine, &runner, "10.0.0.1", &mut 0);
+        let outcome =
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut SteadyTracking::default());
         assert_eq!(
             outcome,
             SteadyOutcome::Recovered {
@@ -739,7 +754,8 @@ mod tests {
             health: RefCell::new(SteadyStateHealth::TunVanished),
             ..Default::default()
         };
-        let outcome = tick_steady_state(&engine, &runner, "10.0.0.1", &mut 0);
+        let outcome =
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut SteadyTracking::default());
         assert_eq!(
             outcome,
             SteadyOutcome::Recovered {
@@ -770,7 +786,7 @@ mod tests {
             health: RefCell::new(SteadyStateHealth::TunVanished),
             ..Default::default()
         };
-        tick_steady_state(&engine, &runner, "10.0.0.1", &mut 0);
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut SteadyTracking::default());
         assert_eq!(
             *engine.call_order.borrow(),
             vec!["recreate_interface", "terminate", "reinitiate"],
@@ -787,7 +803,8 @@ mod tests {
             recreate_ok: false,
             ..Default::default()
         };
-        let outcome = tick_steady_state(&engine, &runner, "10.0.0.1", &mut 0);
+        let outcome =
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut SteadyTracking::default());
         assert_eq!(
             outcome,
             SteadyOutcome::Recovered {
@@ -827,7 +844,7 @@ mod tests {
             pcscf_reachable: RefCell::new(false),
             ..Default::default()
         };
-        let mut streak = 0;
+        let mut streak = SteadyTracking::default();
 
         // A single failure is routine on a mobile bearer -- one dropped packet
         // during a rekey must not tear down a working tunnel.
@@ -853,7 +870,10 @@ mod tests {
         assert_eq!(*engine.recreate_interface_calls.borrow(), 1);
         assert_eq!(*engine.terminate_calls.borrow(), 1);
         assert_eq!(*engine.reinitiate_calls.borrow(), 1);
-        assert_eq!(streak, 0, "the streak resets after acting");
+        assert_eq!(
+            streak.pcscf_unreachable, 0,
+            "the streak resets after acting"
+        );
     }
 
     #[test]
@@ -861,14 +881,14 @@ mod tests {
         // A flapping bearer must never accumulate its way to a teardown.
         let runner = MockCommandRunner::new();
         let engine = FakeEngine::default();
-        let mut streak = 0;
+        let mut streak = SteadyTracking::default();
         for _ in 0..10 {
             *engine.pcscf_reachable.borrow_mut() = false;
             tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak);
             *engine.pcscf_reachable.borrow_mut() = true;
             tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak);
         }
-        assert_eq!(streak, 0);
+        assert_eq!(streak.pcscf_unreachable, 0);
         assert_eq!(
             *engine.reinitiate_calls.borrow(),
             0,
@@ -880,7 +900,7 @@ mod tests {
     fn a_reachable_pcscf_is_still_up_and_touches_nothing() {
         let runner = MockCommandRunner::new();
         let engine = FakeEngine::default();
-        let mut streak = 0;
+        let mut streak = SteadyTracking::default();
         assert_eq!(
             tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
             SteadyOutcome::StillUp
@@ -902,14 +922,17 @@ mod tests {
             pcscf_reachable: RefCell::new(false),
             ..Default::default()
         };
-        let mut streak = 0;
+        let mut streak = SteadyTracking::default();
         assert_eq!(
             tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
             SteadyOutcome::PcscfChanged {
                 new_pcscf: "10.0.0.2".to_string()
             }
         );
-        assert_eq!(streak, 0, "a refresh must not count as an unreachable tick");
+        assert_eq!(
+            streak.pcscf_unreachable, 0,
+            "a refresh must not count as an unreachable tick"
+        );
         assert_eq!(*engine.reinitiate_calls.borrow(), 0);
     }
 
@@ -928,7 +951,7 @@ mod tests {
             route_missing: RefCell::new(true),
             ..Default::default()
         };
-        let mut streak = 0;
+        let mut streak = SteadyTracking::default();
 
         assert_eq!(
             tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
@@ -943,7 +966,10 @@ mod tests {
         assert_eq!(*engine.terminate_calls.borrow(), 0);
         assert_eq!(*engine.reinitiate_calls.borrow(), 0);
         assert_eq!(*engine.recreate_interface_calls.borrow(), 0);
-        assert_eq!(streak, 0, "a repaired route must not count as a strike");
+        assert_eq!(
+            streak.pcscf_unreachable, 0,
+            "a repaired route must not count as a strike"
+        );
 
         // And the line is well again on the next tick.
         assert_eq!(
@@ -962,7 +988,7 @@ mod tests {
             route_missing: RefCell::new(false),
             ..Default::default()
         };
-        let mut streak = 0;
+        let mut streak = SteadyTracking::default();
         let strikes = pcscf_unreachable_strikes(STEADY_STATE_POLL_INTERVAL);
         let mut rebuilt = false;
         for _ in 0..strikes {
@@ -983,7 +1009,7 @@ mod tests {
         // tick. A healthy line must not pay for them.
         let runner = MockCommandRunner::new();
         let engine = FakeEngine::default();
-        let mut streak = 0;
+        let mut streak = SteadyTracking::default();
         assert_eq!(
             tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
             SteadyOutcome::StillUp
@@ -1038,7 +1064,7 @@ mod tests {
             pcscf_reachable: RefCell::new(false),
             ..Default::default()
         };
-        let mut streak = 0;
+        let mut streak = SteadyTracking::default();
         let blip_ticks =
             (Duration::from_secs(15).as_secs() / SWU_STEADY_STATE_POLL_INTERVAL.as_secs()) as u32;
         for tick in 0..blip_ticks {
@@ -1082,7 +1108,8 @@ mod tests {
             health: RefCell::new(SteadyStateHealth::ChildSaMissing),
             ..Default::default()
         };
-        let outcome = tick_steady_state(&engine, &runner, "10.0.0.1", &mut 0);
+        let outcome =
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut SteadyTracking::default());
         assert_eq!(
             outcome,
             SteadyOutcome::Recovered {
@@ -1101,7 +1128,8 @@ mod tests {
             pcscf: RefCell::new(Some("10.0.0.9".to_string())),
             ..Default::default()
         };
-        let outcome = tick_steady_state(&engine, &runner, "10.0.0.1", &mut 0);
+        let outcome =
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut SteadyTracking::default());
         assert_eq!(
             outcome,
             SteadyOutcome::PcscfChanged {
@@ -1120,7 +1148,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            tick_steady_state(&engine, &runner, "10.0.0.1", &mut 0),
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut SteadyTracking::default()),
             SteadyOutcome::StillUp
         );
     }
