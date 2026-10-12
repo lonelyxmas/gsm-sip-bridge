@@ -163,7 +163,7 @@ description: "Task list for specs/086-epdg-child-sa-recovery"
 
 ## Phase 6: Polish, live gate and release
 
-- [ ] T028 Run the full `make format && make lint && make test`, and grep for leftovers: `rg -n "unreachable_streak|grep pattern|1:1 port of .grep -q '\^ims:'" gsm-sip-bridge/src` must return nothing stale. Then confirm FR-018 (scope guard): `git diff --stat main -- docker/` must be empty, because no swanctl template, strongSwan build or charon config change is allowed in this feature
+- [X] T028 Run the full `make format && make lint && make test`, and grep for leftovers: `rg -n "unreachable_streak|grep pattern|1:1 port of .grep -q '\^ims:'" gsm-sip-bridge/src` must return nothing stale. Then confirm FR-018 (scope guard): `git diff --stat main -- docker/` must be empty, because no swanctl template, strongSwan build or charon config change is allowed in this feature
 - [ ] T029 Run the SC-008 live gate per `specs/086-epdg-child-sa-recovery/quickstart.md` §2:
   - build `gsm-sip-bridge:child-sa-recovery-local`, point `test/docker-compose.yaml` at it, and recreate the container;
   - §2a: gauge 0 during establishment, then 1;
