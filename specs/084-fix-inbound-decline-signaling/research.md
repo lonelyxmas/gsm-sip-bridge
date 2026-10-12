@@ -16,6 +16,12 @@ All decisions below were checked against the code on `main` at `d7cbc1e`.
   only the stored entry, never the live call info, which may by then belong
   to the call that reused the id. For the same reason, `poll_state` reports
   `Disconnected` once the id's `user_data` is no longer this call's token.
+- Record every disconnect, with or without a status, and have `poll_state`
+  report `Disconnected` for a placed call only once that record exists.
+  PJSIP marks the call `DISCONNECTED` before it runs the callback, so
+  without this an instant reject could be read before its status was
+  captured. The live release gate caught exactly that: a `603` sent
+  within a millisecond of ringing went to the carrier as `480`.
 - Stub builds keep a settable field instead.
 
 **Rationale**: Agent B polls `poll_state()` every 100 ms. As far as we know

@@ -323,6 +323,18 @@ impl Call {
                 if pjsua_sys::pjsua_call_get_user_data(self.call_id) as usize != self.token {
                     return CallState::Disconnected;
                 }
+                // PJSIP marks the call DISCONNECTED before running
+                // `on_call_state_cb`, which is where the final status is
+                // captured. Keep reporting the call as in progress until that
+                // capture exists, so `last_status` after `Disconnected` never
+                // races it. Only for calls we placed (token != 0); the window
+                // is the few microseconds the callback takes.
+                if info.state == pjsua_sys::pjsip_inv_state_PJSIP_INV_STATE_DISCONNECTED
+                    && self.token != 0
+                    && crate::endpoint::disconnect_status(self.token).is_none()
+                {
+                    return CallState::Early;
+                }
                 #[allow(non_upper_case_globals)]
                 return match info.state {
                     pjsua_sys::pjsip_inv_state_PJSIP_INV_STATE_NULL => CallState::Null,
@@ -364,7 +376,7 @@ impl Call {
             if self.token == 0 {
                 return None;
             }
-            crate::endpoint::disconnect_status(self.token)
+            crate::endpoint::disconnect_status(self.token).flatten()
         }
 
         #[cfg(not(feature = "pjsip-linked"))]
