@@ -114,7 +114,7 @@ the tag it is given. Phase 3's tests already cover the decline paths.
 ## Phase 6: Polish
 
 - [X] T024 [P] Add `pbx_failed` to the documented reason set in specs/014-vowifi-metrics-restore/contracts/observability-protocol.md, noting that it was added by specs/084.
-- [X] T025 [P] Add an Unreleased entry to CHANGELOG.md, following repo style: bold summary, plain description, no internal detail. RELEASE_NOTES.md is per-version and gets written at release time, so it is not touched here.
+- [X] T025 [P] Add an Unreleased entry to CHANGELOG.md and RELEASE_NOTES.md (under `## Unreleased`, renamed at release time), following repo style: bold summary, plain description.
 - [X] T026 Run `make format && make lint && make test` on the whole workspace and confirm they are clean.
 - [ ] T027 Live release gate (FR-011, quickstart.md). Run on the Vodafone rig and the Jio Pi. This is manual, so record the results in the PR.
 

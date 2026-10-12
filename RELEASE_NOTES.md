@@ -1,5 +1,12 @@
 # Release Notes
 
+<!-- Rename the "## Unreleased" heading to the real "## vX.Y.Z" at release
+     time — publish.yml's notes extractor matches ^## v${TAG}$ exactly, so an
+     "Unreleased" heading is not picked up for the GitHub release. -->
+## Unreleased
+
+- **A rejected inbound call no longer rings the phone again** -- When the phone or PBX rejected an incoming VoWiFi or VoLTE call, the bridge answered the carrier `480 Temporarily Unavailable`. Some networks (T2) read that as "try again", and about 11 seconds later offered the same call again, so the phone rang a second time. A reject (`486`, `600` or `603` from the phone side) is now answered `486 Busy Here`. No answer, an unreachable PBX and any other phone-side failure still get `480`, so a broken PBX is never reported to callers as a busy line; an unreachable PBX used to get `486`. Every final response now keeps the `180 Ringing`'s To-tag, the ACK after a reject is no longer logged as unmatched, and the `bridge_failed` metric now separates rejects (`pbx_declined`), no-answers (`ring_timeout`) and other phone-side failures (new `pbx_failed`). Call history records the phone's status, e.g. `declined:pbx_rejected:603`. Reported by @mironovlab (#108).
+
 ## v8.19.2
 
 - **Caller ID from `tel:` numbers** -- Incoming calls and SMS now show the caller when the carrier names them with a `tel:` URI (T2), instead of `caller=unknown`. The network-asserted identity (`P-Asserted-Identity`) is now honoured on every carrier, including when it is a `tel:` URI, and SMS delivery reports go to the SMS gateway's `sip:` address. When no caller can be read, one warning logs the raw headers. Reported by @mironovlab (#104).
