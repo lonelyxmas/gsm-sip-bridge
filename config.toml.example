@@ -32,6 +32,11 @@ tls_verify = "strict"          # strict or skip
 # Audio is still decoded and re-encoded by the bridge; this saves bandwidth
 # toward the phone, it does not pass carrier audio through untouched.
 # codecs = ["AMR-WB", "OPUS", "G722", "PCMU"]
+# How AMR is packed when this bridge makes the offer (inbound calls). true
+# (default) = octet-aligned, which most softphones require; false =
+# bandwidth-efficient, a few bytes smaller per packet. A phone that makes the
+# offer (outbound calls) is always followed. VoWiFi/VoLTE only.
+# amr_octet_align = true
 
 [bridge]
 sip_destination = ""           # empty = DID passthrough, or fixed extension e.g. "100"

@@ -232,6 +232,7 @@ fn build_sip(raw: RawSip, server: &SipServerConfig) -> BridgeResult<SipConfig> {
         tls_verify,
         public_addr,
         codecs,
+        amr_octet_align: raw.amr_octet_align,
     })
 }
 

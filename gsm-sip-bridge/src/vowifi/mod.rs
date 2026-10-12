@@ -301,7 +301,12 @@ pub(crate) fn run_telephony_side(
     endpoint.set_accept_incoming_calls(config.outbound.enabled);
     // Unconditional: the narrowband path must pin the AMR/Opus codecs too
     // (spec 085, research R3), and an operator list applies to both.
-    codecs::apply(&endpoint, config.sip.codecs.as_deref(), wideband)?;
+    codecs::apply(
+        &endpoint,
+        config.sip.codecs.as_deref(),
+        wideband,
+        config.sip.amr_octet_align,
+    )?;
 
     // In SIP server mode this process is the one that would have owned the PBX
     // trunk (see `crate::sip::SipBridge`'s `register_trunk`), so it is the one

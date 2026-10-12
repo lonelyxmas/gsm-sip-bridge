@@ -743,3 +743,15 @@ fn test_sip_codecs_typo_key_rejected() {
     let f = sip_with_codecs(r#"codec = ["PCMU"]"#);
     assert!(load_config(f.path()).is_err());
 }
+
+#[test]
+fn test_sip_amr_octet_align_defaults_to_true() {
+    let f = sip_with_codecs("");
+    assert!(load_config(f.path()).unwrap().sip.amr_octet_align);
+}
+
+#[test]
+fn test_sip_amr_octet_align_can_be_turned_off() {
+    let f = sip_with_codecs("amr_octet_align = false");
+    assert!(!load_config(f.path()).unwrap().sip.amr_octet_align);
+}

@@ -53,6 +53,12 @@ pub struct SipConfig {
     /// circuit-switched path. PCMU is always present when `Some`: the
     /// bridge's internal agent link falls back to it (research R4).
     pub codecs: Option<Vec<PhoneCodec>>,
+    /// Offer AMR to the phone octet-aligned (`octet-align=1`) rather than
+    /// bandwidth-efficient. Default `true`: most softphones (baresip,
+    /// Linphone, many desk phones) implement only the octet-aligned packing
+    /// and refuse the other. A far end that makes the offer is followed
+    /// either way. VoWiFi/VoLTE only.
+    pub amr_octet_align: bool,
 }
 
 /// A codec an operator may name in `[sip].codecs`.

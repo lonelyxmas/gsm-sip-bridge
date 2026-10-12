@@ -502,6 +502,62 @@ impl Endpoint {
         Vec::new()
     }
 
+    /// Choose the RTP packing PJSIP *offers* for AMR-NB and AMR-WB: octet-aligned
+    /// (`octet-align=1`) or bandwidth-efficient (the RFC 4867 default when the
+    /// SDP says nothing). When the far end makes the offer PJSIP follows its
+    /// `octet-align` regardless; this only decides what we advertise first.
+    /// Bitrates are PJSIP's own defaults (5.9 kbit/s NB, 12.65 kbit/s WB).
+    ///
+    /// Needs a PJSIP built with opencore-amr, so a `pjsip-linked` build against
+    /// a libpjproject without it fails to link (the Docker image always has it).
+    pub fn set_amr_octet_align(&self, octet_align: bool) -> Result<(), PjsipError> {
+        #[cfg(feature = "pjsip-linked")]
+        {
+            self.ensure_thread_registered();
+            // Mirrors pjmedia_codec_amr_config in pjmedia-codec/opencore_amr.h
+            // (pj_bool_t is a C int); pjsua.h does not pull that header in, so
+            // it is not in the generated bindings.
+            #[repr(C)]
+            struct AmrConfig {
+                octet_align: std::os::raw::c_int,
+                bitrate: std::os::raw::c_uint,
+            }
+            extern "C" {
+                fn pjmedia_codec_opencore_amrnb_set_config(cfg: *const AmrConfig) -> i32;
+                fn pjmedia_codec_opencore_amrwb_set_config(cfg: *const AmrConfig) -> i32;
+            }
+            let flag = std::os::raw::c_int::from(octet_align);
+            let nb = AmrConfig {
+                octet_align: flag,
+                bitrate: 5900,
+            };
+            let wb = AmrConfig {
+                octet_align: flag,
+                bitrate: 12650,
+            };
+            // SAFETY: pjsua started so the codec factory exists; the configs are
+            // plain C structs that outlive the calls, which copy them.
+            let (nb_status, wb_status) = unsafe {
+                (
+                    pjmedia_codec_opencore_amrnb_set_config(&nb),
+                    pjmedia_codec_opencore_amrwb_set_config(&wb),
+                )
+            };
+            if nb_status != PJ_SUCCESS || wb_status != PJ_SUCCESS {
+                return Err(PjsipError::MediaPort(format!(
+                    "AMR set_config failed (nb {nb_status}, wb {wb_status})"
+                )));
+            }
+            return Ok(());
+        }
+
+        #[cfg(not(feature = "pjsip-linked"))]
+        {
+            let _ = octet_align;
+            Ok(())
+        }
+    }
+
     /// The audio codec negotiated on a live call (e.g. `"AMR-WB"`), or `None`
     /// before its media is active, after it ends, or without `pjsip-linked`.
     pub fn negotiated_codec(&self, call_id: i32) -> Option<String> {

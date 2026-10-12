@@ -77,6 +77,7 @@ pub(crate) fn apply(
     endpoint: &Endpoint,
     codecs: Option<&[PhoneCodec]>,
     wideband: bool,
+    amr_octet_align: bool,
 ) -> BridgeResult<()> {
     let registered: Vec<String> = endpoint.codecs().into_iter().map(|c| c.id).collect();
 
@@ -91,6 +92,10 @@ pub(crate) fn apply(
                 )));
             }
         }
+    }
+
+    if let Err(e) = endpoint.set_amr_octet_align(amr_octet_align) {
+        tracing::warn!(error = %e, "could not set the AMR packing; PJSIP's default (bandwidth-efficient) stays");
     }
 
     for (codec_id, priority) in priority_plan(codecs, wideband, &registered) {

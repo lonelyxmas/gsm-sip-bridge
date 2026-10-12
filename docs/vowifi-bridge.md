@@ -133,6 +133,7 @@ ask for AMR or Opus, and one that prefers them can now negotiate them.
   #111 for passthrough).
 - A PBX in the path must support the codec itself. Stock Asterisk has no AMR, so the built-in
   registrar (`[sip_server]` mode) with an AMR-capable softphone is the primary target.
+- AMR is offered octet-aligned by default (`[sip].amr_octet_align`), because most softphones accept only that packing; set it to `false` for bandwidth-efficient. A phone that makes the offer is followed either way.
 - PCMU must stay in the list; the internal link between the two agents falls back to it.
 - The circuit-switched path never offers these codecs.
 
