@@ -154,8 +154,8 @@ description: "Task list for specs/086-epdg-child-sa-recovery"
 
 ### Docs
 
-- [ ] T026 [P] [US3] `docs/observability.md`: document `gsm_sip_bridge_vowifi_child_sa_up` next to `vowifi_tunnel_up`, with the value table from contracts/observability.md §2 and a sentence on how it differs from `tunnel_up`. Note the new `agent_up{agent="supervisor"}` series. State that the tunnel-failure alert now fires on either signal, once per outage
-- [ ] T027 [P] [US3] `config.toml.example` `[alerts.tunnel_failure]` comment (~line 86): "A VoWiFi line's ePDG/IPsec tunnel non-established, **or its IPsec CHILD_SA missing**, continuously for unhealthy_sec." Also update the same comment in any copy that a config test pins (grep for `tunnel non-established`). Commit (T024–T027): `docs: describe the CHILD_SA gauge and the widened tunnel-failure alert`
+- [X] T026 [P] [US3] `docs/observability.md`: document `gsm_sip_bridge_vowifi_child_sa_up` next to `vowifi_tunnel_up`, with the value table from contracts/observability.md §2 and a sentence on how it differs from `tunnel_up`. Note the new `agent_up{agent="supervisor"}` series. State that the tunnel-failure alert now fires on either signal, once per outage
+- [X] T027 [P] [US3] `config.toml.example` `[alerts.tunnel_failure]` comment (~line 86): "A VoWiFi line's ePDG/IPsec tunnel non-established, **or its IPsec CHILD_SA missing**, continuously for unhealthy_sec." Also update the same comment in any copy that a config test pins (grep for `tunnel non-established`). Commit (T024–T027): `docs: describe the CHILD_SA gauge and the widened tunnel-failure alert`
 
 **Checkpoint**: all three stories complete.
 
