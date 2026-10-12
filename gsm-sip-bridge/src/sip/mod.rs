@@ -219,6 +219,7 @@ impl SipBridge {
         // in this process ever calls `poll_outbound_request` to drain it
         // (specs/025-outbound-calling review).
         endpoint.set_accept_incoming_calls(self.config.outbound_enabled);
+        disable_phone_leg_only_codecs(&endpoint);
 
         // Resolved once, here, not per-request — see `trunk_source_ips`'s
         // own doc comment. A literal IP resolves locally with no network
@@ -316,6 +317,7 @@ impl SipBridge {
         // See the same call in `start` above — SIP-server mode reaches
         // `poll_outbound_request` through this same account too.
         endpoint.set_accept_incoming_calls(self.config.outbound_enabled);
+        disable_phone_leg_only_codecs(&endpoint);
 
         // Bind before anything else can fail: a port clash here is the most
         // likely startup problem, and the operator needs it named plainly.
@@ -734,6 +736,21 @@ fn verify_native_rate(device: &str, expected_rate: u32) {
                 device,
                 "native-rate check: device did not report a rate range"
             );
+        }
+    }
+}
+
+/// Keep AMR, AMR-WB and Opus out of the circuit-switched path's offers.
+///
+/// pjproject registers newly compiled-in codecs *above* PCMU, and this
+/// endpoint sets no priorities of its own, so without this the GSM path's
+/// PBX offer would change the moment the codecs are built in. They exist for
+/// the VoWiFi/VoLTE phone-facing leg only (spec 085, FR-009, research R3).
+/// Best-effort: a build without them just logs and carries on.
+fn disable_phone_leg_only_codecs(endpoint: &Endpoint) {
+    for prefix in ["AMR", "opus"] {
+        if let Err(e) = endpoint.set_codec_priority(prefix, 0) {
+            tracing::warn!(codec = prefix, error = %e, "could not disable codec on the circuit-switched endpoint");
         }
     }
 }

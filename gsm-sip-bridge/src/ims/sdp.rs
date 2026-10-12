@@ -2332,6 +2332,37 @@ mod tests {
         assert_eq!(codec.payload_type, 100);
     }
 
+    /// Spec 085: Agent B now also offers AMR-WB, AMR and Opus (listed before
+    /// L16 and PCMU, as PJSIP orders them by priority). Agent A must keep
+    /// answering the veth link with L16 / PCMU by name and ignore the rest.
+    const PJSIP_VETH_OFFER_WITH_AMR_OPUS: &str = "v=0\r\n\
+         o=- 3992923331 3992923331 IN IP4 10.99.0.2\r\n\
+         s=pjmedia\r\n\
+         t=0 0\r\n\
+         m=audio 4000 RTP/AVP 9 101 102 103 0 8 100 120\r\n\
+         c=IN IP4 10.99.0.2\r\n\
+         a=sendrecv\r\n\
+         a=rtpmap:9 G722/8000\r\n\
+         a=rtpmap:101 AMR-WB/16000\r\n\
+         a=fmtp:101 octet-align=0\r\n\
+         a=rtpmap:102 AMR/8000\r\n\
+         a=fmtp:102 octet-align=0\r\n\
+         a=rtpmap:103 opus/48000/2\r\n\
+         a=fmtp:103 useinbandfec=1\r\n\
+         a=rtpmap:0 PCMU/8000\r\n\
+         a=rtpmap:8 PCMA/8000\r\n\
+         a=rtpmap:100 L16/16000\r\n\
+         a=rtpmap:120 telephone-event/8000\r\n";
+
+    #[test]
+    fn veth_codec_selection_ignores_the_phone_facing_amr_and_opus_offers() {
+        let offer = parse_offer(PJSIP_VETH_OFFER_WITH_AMR_OPUS).unwrap();
+        let wide = select_veth_codec(&offer, true).expect("a wideband pick");
+        assert_eq!(wide.codec, NegotiatedCodec::L16);
+        let narrow = select_veth_codec(&offer, false).expect("a narrowband pick");
+        assert_eq!(narrow.codec, NegotiatedCodec::Pcmu);
+    }
+
     /// The audio stream's port and address must come from the audio section,
     /// not from whichever `m=` section happened to be parsed last.
     #[test]

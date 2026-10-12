@@ -89,6 +89,9 @@ section! {
         /// hostname is resolved once, at config-build time — see
         /// `specs/050-sip-public-addr/`.
         pub public_addr: Option<String>,
+        /// Phone-facing codec preference for VoWiFi/VoLTE (spec 085); absent
+        /// keeps the default order. See `PhoneCodec` for accepted names.
+        pub codecs: Option<Vec<String>>,
     }
 }
 
@@ -104,6 +107,7 @@ impl Default for RawSip {
             display_name: None,
             tls_verify: "strict".to_string(),
             public_addr: None,
+            codecs: None,
         }
     }
 }

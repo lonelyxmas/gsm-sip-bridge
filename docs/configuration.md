@@ -28,6 +28,7 @@ The bridge reads a single TOML configuration file specified via `--config`.
 | `display_name` | string | username | Callee display |
 | `tls_verify` | enum | `strict` | `strict` or `skip` |
 | `public_addr` | string | *(unset)* | IPv4 literal or hostname to advertise in SIP signaling (Contact/Via) and SDP, instead of letting PJSIP's own address discovery pick one — needed when the PBX/phones reach this bridge only over a routed network (e.g. Tailscale) under `network_mode: host`, where the discovered address is otherwise a private, unroutable one and calls connect with no audio in either direction. A hostname is resolved once, at startup, to its first IPv4 result; an IPv6 value or an unresolvable/IPv6-only hostname fails startup rather than starting with broken audio (this bridge's SIP transport is IPv4-only). |
+| `codecs` | array of strings | *(unset)* | VoWiFi/VoLTE only: the codecs the bridge may use toward the PBX or phone, most preferred first; the circuit-switched path ignores it. Accepted names (case-insensitive): `G722`, `PCMU`, `PCMA`, `AMR-WB`, `AMR-NB`, `OPUS`. `PCMU` is required, because the bridge's internal link between its two agents falls back to it. Codecs not listed are neither offered nor accepted. Unset keeps the existing order (G.722, then PCMU) with AMR-WB, AMR-NB and Opus at the lowest priority, so a phone or PBX that prefers them can still negotiate them. An unknown, empty or duplicate entry, or a list without `PCMU`, fails startup; so does naming a codec this build lacks. Audio is still decoded and re-encoded; this saves bandwidth toward the phone, it is not passthrough. |
 
 ### `[bridge]`
 
@@ -509,6 +510,7 @@ display_name = "GSM Bridge"
 # Only needed when phones/PBX reach this bridge over a routed network
 # (e.g. Tailscale) rather than the same LAN segment:
 # public_addr = "100.111.26.23"
+# codecs = ["AMR-WB", "OPUS", "G722", "PCMU"]   # VoWiFi/VoLTE phone-facing order
 
 [bridge]
 sip_destination = ""

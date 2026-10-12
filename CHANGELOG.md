@@ -8,6 +8,16 @@ across releases.
 
 ## [Unreleased]
 
+### Added
+
+- **AMR and Opus toward the phone.** The VoWiFi/VoLTE phone or PBX leg can
+  now use AMR-WB, AMR-NB or Opus (issue #109). With no configuration change,
+  a phone or PBX that prefers one of them can now negotiate it; everything
+  else behaves as before. New `[sip].codecs` sets the order explicitly
+  (`PCMU` is required). Audio is still decoded and re-encoded by the bridge.
+  `vowifi-status` recent calls show the negotiated `phone_codec`. The
+  circuit-switched path is unchanged.
+
 ### Fixed
 
 - **A rejected inbound call no longer rings the phone again.** When the

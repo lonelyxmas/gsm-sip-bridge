@@ -502,6 +502,23 @@ impl Endpoint {
         Vec::new()
     }
 
+    /// The audio codec negotiated on a live call (e.g. `"AMR-WB"`), or `None`
+    /// before its media is active, after it ends, or without `pjsip-linked`.
+    pub fn negotiated_codec(&self, call_id: i32) -> Option<String> {
+        #[cfg(feature = "pjsip-linked")]
+        {
+            self.ensure_thread_registered();
+            // SAFETY: pjsua is started (self exists); a stale or unknown call_id makes
+            // pjsua_call_get_stream_info fail, which negotiated_audio_codec maps to None
+            return unsafe { negotiated_audio_codec(call_id) }.map(|(name, _, _)| name);
+        }
+        #[cfg(not(feature = "pjsip-linked"))]
+        {
+            let _ = call_id;
+            None
+        }
+    }
+
     /// Set a codec's priority: 0 disables it entirely, higher values win, and
     /// the order codecs appear in our SDP offer follows it. `codec_id` is the
     /// id `codecs()` reports (e.g. `"G722/16000/1"`); PJSIP also accepts a

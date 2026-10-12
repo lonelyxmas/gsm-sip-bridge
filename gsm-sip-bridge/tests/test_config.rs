@@ -664,3 +664,82 @@ fn every_shipped_sample_config_defaults_circuit_switching_to_enabled() {
         dir.display()
     );
 }
+
+// ---------------------------------------------------- [sip].codecs (085) ----
+
+fn sip_with_codecs(codecs_line: &str) -> NamedTempFile {
+    std::env::set_var("TEST_CODECS_PASSWORD", "pass");
+    write_config(&format!(
+        r#"
+[sip]
+server = "127.0.0.1"
+username = "user"
+password = "env:TEST_CODECS_PASSWORD"
+{codecs_line}
+"#
+    ))
+}
+
+#[test]
+fn test_sip_codecs_absent_is_none() {
+    let f = sip_with_codecs("");
+    let cfg = load_config(f.path()).unwrap();
+    assert!(cfg.sip.codecs.is_none());
+}
+
+#[test]
+fn test_sip_codecs_parse_case_insensitive_in_order() {
+    use gsm_sip_bridge::config::PhoneCodec::*;
+    let f = sip_with_codecs(r#"codecs = ["amr-wb", "Opus", "G722", "PCMU"]"#);
+    let cfg = load_config(f.path()).unwrap();
+    assert_eq!(cfg.sip.codecs, Some(vec![AmrWb, Opus, G722, Pcmu]));
+}
+
+#[test]
+fn test_sip_codecs_all_names_accepted() {
+    use gsm_sip_bridge::config::PhoneCodec::*;
+    let f = sip_with_codecs(r#"codecs = ["G722","PCMU","PCMA","AMR-WB","AMR-NB","OPUS"]"#);
+    let cfg = load_config(f.path()).unwrap();
+    assert_eq!(
+        cfg.sip.codecs,
+        Some(vec![G722, Pcmu, Pcma, AmrWb, AmrNb, Opus])
+    );
+}
+
+#[test]
+fn test_sip_codecs_empty_rejected() {
+    let f = sip_with_codecs("codecs = []");
+    let msg = load_config(f.path()).unwrap_err().to_string();
+    assert!(msg.contains("[sip].codecs"), "{msg}");
+}
+
+#[test]
+fn test_sip_codecs_without_pcmu_rejected() {
+    let f = sip_with_codecs(r#"codecs = ["G722"]"#);
+    let msg = load_config(f.path()).unwrap_err().to_string();
+    assert!(msg.contains("[sip].codecs"), "{msg}");
+    assert!(msg.contains("PCMU"), "{msg}");
+}
+
+#[test]
+fn test_sip_codecs_unknown_name_rejected() {
+    let f = sip_with_codecs(r#"codecs = ["G729", "PCMU"]"#);
+    let msg = load_config(f.path()).unwrap_err().to_string();
+    assert!(msg.contains("[sip].codecs"), "{msg}");
+    assert!(msg.contains("G729"), "{msg}");
+    assert!(msg.contains("AMR-WB"), "must list accepted names: {msg}");
+}
+
+#[test]
+fn test_sip_codecs_duplicate_rejected() {
+    let f = sip_with_codecs(r#"codecs = ["PCMU", "pcmu"]"#);
+    let msg = load_config(f.path()).unwrap_err().to_string();
+    assert!(msg.contains("[sip].codecs"), "{msg}");
+    assert!(msg.to_lowercase().contains("duplicate"), "{msg}");
+}
+
+#[test]
+fn test_sip_codecs_typo_key_rejected() {
+    let f = sip_with_codecs(r#"codec = ["PCMU"]"#);
+    assert!(load_config(f.path()).is_err());
+}

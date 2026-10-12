@@ -45,7 +45,14 @@ FROM alpine:${ALPINE_VERSION} AS pjsip-builder
 ARG PJSIP_VERSION
 RUN apk add --no-cache \
         build-base wget pkgconf \
-        openssl-dev alsa-lib-dev util-linux-dev linux-headers
+        openssl-dev alsa-lib-dev util-linux-dev linux-headers \
+        opencore-amr-dev vo-amrwbenc-dev opus-dev
+
+# Issue #109 / spec 085: AMR-WB, AMR-NB and Opus on the phone-facing leg need
+# the codecs compiled into PJSIP. configure autodetects them but fails
+# *silently* when a -dev package is missing, so the --with-* flags below are
+# explicit and the config_auto.h check fails the image build instead of
+# producing a PJSIP that only lacks the codecs at runtime.
 
 # PJSIP's build-time config: enables L16/16000, which the VoWiFi bridge's
 # wideband path needs and which pjproject does not register by default.
@@ -57,7 +64,12 @@ RUN wget -q "https://github.com/pjsip/pjproject/archive/refs/tags/${PJSIP_VERSIO
     cp /tmp/config_site.h pjlib/include/pj/config_site.h && \
     ./configure --prefix=/usr/local --disable-shared --enable-static \
         --disable-video --disable-v4l2 --with-external-pa=no \
+        --with-opencore-amr=/usr --with-opencore-amrwbenc=/usr --with-opus=/usr \
         CFLAGS="-fPIC" && \
+    for m in PJMEDIA_HAS_OPENCORE_AMRNB_CODEC PJMEDIA_HAS_OPENCORE_AMRWB_CODEC PJMEDIA_HAS_OPUS_CODEC; do \
+        grep -Eq "#define ${m}[[:space:]]+1" pjmedia/include/pjmedia-codec/config_auto.h \
+            || { echo "pjproject configure did not enable ${m}" >&2; exit 1; }; \
+    done && \
     make -j"$(nproc)" dep && make -j"$(nproc)" && make install
 
 # Stage 2: build gsm-sip-bridge against the static PJSIP from stage 1.
@@ -65,7 +77,7 @@ FROM rust:1-alpine${ALPINE_VERSION} AS rust-builder
 RUN apk add --no-cache \
         build-base pkgconf clang-dev \
         openssl-dev alsa-lib-dev util-linux-dev eudev-dev linux-headers \
-        opencore-amr-dev vo-amrwbenc-dev pcsc-lite-dev
+        opencore-amr-dev vo-amrwbenc-dev opus-dev pcsc-lite-dev
 COPY --from=pjsip-builder /usr/local /usr/local
 
 WORKDIR /app
@@ -262,6 +274,8 @@ ARG INCLUDE_SWU=false
 #   frequently carries no PCMU at all — Airtel offers AMR-WB + AMR-NB on some
 #   mobile-terminating calls and AMR-NB alone on others, so without both
 #   codecs those calls can only be declined.
+#   They (plus opus) also serve PJSIP's phone-facing leg (spec 085, #109):
+#   the PJSIP build links them dynamically (pjsua-sys/build.rs system_libs).
 # pcsc-lite-libs -> pyscard's runtime dependency (libpcsclite.so); also
 #   charon's eap-sim-pcsc plugin and the vpcd driver (both stage 5/6
 #   outputs, dynamically linked against it — confirmed via ldd while
@@ -277,7 +291,7 @@ RUN apk add --no-cache \
         bash \
         iproute2 iputils procps \
         alsa-lib libssl3 libcrypto3 libuuid eudev-libs libgcc \
-        opencore-amr vo-amrwbenc \
+        opencore-amr vo-amrwbenc opus \
         pcsc-lite-libs pcsc-lite ccid \
         ca-certificates
 

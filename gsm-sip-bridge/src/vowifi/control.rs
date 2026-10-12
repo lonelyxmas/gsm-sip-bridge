@@ -215,6 +215,11 @@ pub struct CallRecord {
     pub outcome: String,
     pub started_at: u64,
     pub ended_at: Option<u64>,
+    /// Audio codec negotiated on the PBX/phone leg (e.g. `"AMR-WB"`), once
+    /// that leg's media went active; `None` for calls that never got there.
+    /// `serde(default)` keeps an older agent's reply decodable (spec 085).
+    #[serde(default)]
+    pub phone_codec: Option<String>,
 }
 
 /// `bridge_failed` reasons — kept as `&'static str` constants (rather than a
@@ -645,6 +650,7 @@ mod tests {
                     outcome: "answered".to_string(),
                     started_at: 1_700_000_000,
                     ended_at: Some(1_700_000_300),
+                    phone_codec: Some("AMR-WB".to_string()),
                 },
                 CallRecord {
                     call_id: "2".to_string(),
@@ -652,9 +658,18 @@ mod tests {
                     outcome: "declined:busy".to_string(),
                     started_at: 1_700_000_500,
                     ended_at: Some(1_700_000_500),
+                    phone_codec: None,
                 },
             ],
         };
         assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn call_record_without_phone_codec_still_deserializes() {
+        // What an agent from before spec 085 sends.
+        let old = r#"{"call_id":"1","caller":"+919000000000","outcome":"answered","started_at":1,"ended_at":2}"#;
+        let rec: CallRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(rec.phone_codec, None);
     }
 }

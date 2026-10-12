@@ -219,6 +219,8 @@ fn build_sip(raw: RawSip, server: &SipServerConfig) -> BridgeResult<SipConfig> {
         .map(resolve_public_addr)
         .transpose()?;
 
+    let codecs = raw.codecs.as_deref().map(parse_phone_codecs).transpose()?;
+
     Ok(SipConfig {
         server: raw.server,
         port: in_range(raw.port, "sip.port", 1..=65535)?,
@@ -229,7 +231,47 @@ fn build_sip(raw: RawSip, server: &SipServerConfig) -> BridgeResult<SipConfig> {
         local_port: in_range(raw.local_port, "sip.local_port", 1..=65535)?,
         tls_verify,
         public_addr,
+        codecs,
     })
+}
+
+/// Validate `[sip].codecs` (spec 085, FR-010). Every failure names the key.
+fn parse_phone_codecs(names: &[String]) -> BridgeResult<Vec<PhoneCodec>> {
+    let err = |reason: String| BridgeError::Config(format!("[sip].codecs: {reason}"));
+    let accepted = || {
+        PhoneCodec::ALL
+            .iter()
+            .map(|c| c.config_name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if names.is_empty() {
+        return Err(err(format!(
+            "the list is empty; omit the key for the default order, or list some of: {}",
+            accepted()
+        )));
+    }
+    let mut out: Vec<PhoneCodec> = Vec::with_capacity(names.len());
+    for name in names {
+        let codec = PhoneCodec::parse(name).ok_or_else(|| {
+            err(format!(
+                "unknown codec {name:?}; accepted names (case-insensitive): {}",
+                accepted()
+            ))
+        })?;
+        if out.contains(&codec) {
+            return Err(err(format!("duplicate entry {name:?}")));
+        }
+        out.push(codec);
+    }
+    if !out.contains(&PhoneCodec::Pcmu) {
+        return Err(err(
+            "PCMU is required: the bridge's internal link between its two agents \
+             falls back to it, so it cannot be removed"
+                .to_string(),
+        ));
+    }
+    Ok(out)
 }
 
 // --------------------------------------------------------------- others ----
