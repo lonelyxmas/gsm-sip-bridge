@@ -57,7 +57,7 @@ Run on the Vodafone rig (host network) against `gsm-sip-bridge:amr-opus-local`, 
 
 ## Findings
 
-- **Inbound AMR to an octet-align-only phone does not work.** baresip's AMR module logs `amr: octet-align mode is required` and answers G722 instead. The bridge's PJSIP offers bandwidth-efficient AMR, so a phone that supports only octet-aligned AMR falls back (FR-005 held: the call connected on G722). Outbound from the same phone works because PJSIP adopts the phone's `octet-align=1`. See the open question in the PR.
+- **Pre-fix result:** inbound AMR to an octet-align-only phone fell back to G722, because the bridge offered bandwidth-efficient AMR (the no-`fmtp` capture above is from before this fix). Outbound AMR worked because PJSIP adopts the phone's `octet-align=1`. The `[sip].amr_octet_align` default (`true`) fixes the inbound case; the Results table below records successful inbound and outbound calls.
 
 ## Results
 

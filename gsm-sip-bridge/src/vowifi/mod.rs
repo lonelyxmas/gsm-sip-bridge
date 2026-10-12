@@ -1758,12 +1758,14 @@ fn handle_connection(
             // would miss the PBX extension hanging up first, leaving the caller
             // on a line that is already dead — so watch our own leg too, and
             // tell Agent A when it drops so it can BYE the carrier.
-            // The phone leg's codec is only readable once its media is active,
-            // which can land just after the 200 OK; keep trying until it does.
+            // The phone leg's codec is only readable while its media is active,
+            // which can land just after the 200 OK, and a re-INVITE (hold/resume)
+            // can change it. Refresh on every poll and keep the last value read
+            // once media stops, since the call's final tick can come after it.
             let mut phone_codec = endpoint.negotiated_codec(pbx_call.call_id());
             let end_reason = loop {
-                if phone_codec.is_none() {
-                    phone_codec = endpoint.negotiated_codec(pbx_call.call_id());
+                if let Some(codec) = endpoint.negotiated_codec(pbx_call.call_id()) {
+                    phone_codec = Some(codec);
                 }
                 match ctrl_rx.recv_timeout(PBX_RING_POLL_INTERVAL) {
                     Ok(ControlMessage::CallEnded { reason, .. }) => {
