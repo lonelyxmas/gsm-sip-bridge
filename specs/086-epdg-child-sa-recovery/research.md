@@ -107,7 +107,7 @@ different goals and is out of scope.
   `line.card_id` labels the same `module` as the agent's gauges.
 - `Reporter` re-sends the last state as a heartbeat at `agent_report_interval_seconds`
   (default 10s) from its own thread. A tick blocked in establishment or teardown therefore never
-  makes the record go stale. The staleness threshold is 30s (`metrics/server.rs:16`).
+  makes the record go stale. The staleness threshold is 3× `[metrics].agent_report_interval_seconds` (45s by default; `metrics/server.rs`).
 - Liveness is keyed by `(AgentKind, module_id)` (`ingest.rs:125`), so a Supervisor record never
   collides with the Ims record for the same line.
 - Side benefit: `gsm_sip_bridge_agent_up{agent="supervisor",module=…}` now shows whether the

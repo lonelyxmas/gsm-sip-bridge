@@ -157,6 +157,20 @@ type PendingTransition = (
 /// Liveness is still refreshed either way, since the retry itself proves the
 /// agent is alive.
 pub fn apply_report(report: &AgentReport) {
+    let transitions = apply_report_with(report, ALERTS_CONFIG.get());
+    for (key, category, kind, generation) in transitions {
+        dispatch_transition(key, category, kind, generation);
+    }
+}
+
+/// [`apply_report`] with the alert configuration injected, returning the
+/// transitions to dispatch rather than dispatching them -- so the two-reporter
+/// alert wiring can be exercised without the process-wide `ALERTS_CONFIG` or a
+/// Discord client.
+fn apply_report_with(
+    report: &AgentReport,
+    alerts: Option<&AlertsConfig>,
+) -> Vec<PendingTransition> {
     let module_id = report.module_id.as_str();
     let key = (report.agent, module_id.to_string());
 
@@ -212,7 +226,7 @@ pub fn apply_report(report: &AgentReport) {
                 .inc_by(report.dropped as f64);
         }
 
-        if let Some(cfg) = ALERTS_CONFIG.get() {
+        if let Some(cfg) = alerts {
             let registration_threshold =
                 Duration::from_secs(cfg.registration_loss_thresholds.unhealthy_sec);
             let tunnel_threshold = Duration::from_secs(cfg.tunnel_failure_thresholds.unhealthy_sec);
@@ -343,10 +357,7 @@ pub fn apply_report(report: &AgentReport) {
         },
     );
     drop(guard);
-
-    for (key, category, kind, generation) in pending_transitions {
-        dispatch_transition(key, category, kind, generation);
-    }
+    pending_transitions
 }
 
 /// The pure per-signal decision: given the current unhealthy streak and
@@ -401,6 +412,16 @@ fn decide_folded_tunnel(
     let t = decide_transition(effective, phase, threshold);
     if matches!(t, Transition::Event(CriticalEventKind::Failure)) {
         *generation = effective;
+    }
+    if effective.is_none() {
+        // Both signals are healthy: the incident is over. An in-flight Failure
+        // send for it is abandoned (its callback no longer matches), so a later
+        // outage gets its own decision instead of inheriting the old send's
+        // outcome.
+        if *phase == AlertPhase::Pending {
+            *phase = AlertPhase::Idle;
+        }
+        *generation = None;
     }
     t
 }
@@ -1573,5 +1594,154 @@ mod tests {
         assert_eq!(tunnel_alert_subject(AgentKind::Ims), "VoWiFi");
         assert_eq!(tunnel_alert_subject(AgentKind::Supervisor), "VoWiFi");
         assert_eq!(tunnel_alert_subject(AgentKind::Volte), "volte");
+    }
+
+    // --- Two-reporter wiring through `apply_report_with` (specs/086) ---------
+
+    fn tunnel_cfg() -> AlertsConfig {
+        let mut cfg = AlertsConfig::default();
+        cfg.tunnel_failure_thresholds.unhealthy_sec = 300;
+        cfg
+    }
+
+    fn fold_report(
+        cfg: &AlertsConfig,
+        agent: AgentKind,
+        module_id: &str,
+        seq: u64,
+        up: bool,
+    ) -> Vec<PendingTransition> {
+        let state = match agent {
+            AgentKind::Supervisor => AgentState {
+                child_sa_up: Some(up),
+                ..AgentState::default()
+            },
+            _ => AgentState {
+                tunnel_up: Some(up),
+                ..AgentState::default()
+            },
+        };
+        apply_report_with(
+            &AgentReport {
+                agent,
+                module_id: module_id.to_string(),
+                epoch: 7,
+                seq,
+                state,
+                events: vec![],
+                dropped: 0,
+            },
+            Some(cfg),
+        )
+    }
+
+    fn tunnel_events(t: &[PendingTransition]) -> Vec<(AgentKind, CriticalEventKind)> {
+        t.iter()
+            .filter(|(_, c, _, _)| *c == AlertCategory::TunnelFailure)
+            .map(|(k, _, kind, _)| (k.0, *kind))
+            .collect()
+    }
+
+    fn backdate_tunnel(agent: AgentKind, module_id: &str, secs: u64) {
+        let mut guard = liveness().lock().unwrap();
+        let r = guard.get_mut(&(agent, module_id.to_string())).unwrap();
+        r.tunnel_unhealthy_since = r
+            .tunnel_unhealthy_since
+            .map(|_| Instant::now() - Duration::from_secs(secs));
+    }
+
+    #[test]
+    fn interleaved_reporters_alert_once_per_outage_and_recover_when_both_are_healthy() {
+        let m = "test-two-reporter-outage";
+        let cfg = tunnel_cfg();
+        let sup_key = (AgentKind::Supervisor, m.to_string());
+
+        // Both healthy, then both go down; neither is past the threshold yet.
+        assert!(fold_report(&cfg, AgentKind::Supervisor, m, 1, true).is_empty());
+        assert!(fold_report(&cfg, AgentKind::Ims, m, 1, true).is_empty());
+        assert!(tunnel_events(&fold_report(&cfg, AgentKind::Supervisor, m, 2, false)).is_empty());
+        assert!(tunnel_events(&fold_report(&cfg, AgentKind::Ims, m, 2, false)).is_empty());
+
+        // The supervisor's streak crosses the threshold: one Failure, owned by
+        // the supervisor's record.
+        backdate_tunnel(AgentKind::Supervisor, m, 400);
+        backdate_tunnel(AgentKind::Ims, m, 350);
+        let t = fold_report(&cfg, AgentKind::Supervisor, m, 3, false);
+        assert_eq!(
+            tunnel_events(&t),
+            vec![(AgentKind::Supervisor, CriticalEventKind::Failure)]
+        );
+        let generation = t[0].3.expect("failure carries its generation");
+        // The IMS agent's own report must not produce a second Failure.
+        assert!(tunnel_events(&fold_report(&cfg, AgentKind::Ims, m, 3, false)).is_empty());
+        assert_eq!(
+            liveness().lock().unwrap()[&(AgentKind::Ims, m.to_string())].tunnel_alert_phase,
+            AlertPhase::Idle,
+            "the IMS record never owns the folded decision"
+        );
+
+        // Delivery result lands on the supervisor's record.
+        record_alert_outcome(&sup_key, AlertCategory::TunnelFailure, generation, true);
+        assert_eq!(
+            liveness().lock().unwrap()[&sup_key].tunnel_alert_phase,
+            AlertPhase::Alerted
+        );
+
+        // Partial recovery: the supervisor is healthy, the IMS agent is not.
+        assert!(tunnel_events(&fold_report(&cfg, AgentKind::Supervisor, m, 4, true)).is_empty());
+        assert!(tunnel_events(&fold_report(&cfg, AgentKind::Ims, m, 4, false)).is_empty());
+        // Full recovery: exactly one Recovered.
+        let t = fold_report(&cfg, AgentKind::Ims, m, 5, true);
+        assert_eq!(
+            tunnel_events(&t),
+            vec![(AgentKind::Supervisor, CriticalEventKind::Recovered)]
+        );
+        assert!(tunnel_events(&fold_report(&cfg, AgentKind::Supervisor, m, 5, true)).is_empty());
+    }
+
+    #[test]
+    fn a_new_outage_is_not_swallowed_by_the_previous_outages_late_delivery() {
+        let m = "test-two-reporter-late-delivery";
+        let cfg = tunnel_cfg();
+        let sup_key = (AgentKind::Supervisor, m.to_string());
+
+        fold_report(&cfg, AgentKind::Supervisor, m, 1, false);
+        fold_report(&cfg, AgentKind::Ims, m, 1, true);
+        backdate_tunnel(AgentKind::Supervisor, m, 400);
+        let t = fold_report(&cfg, AgentKind::Supervisor, m, 2, false);
+        let old_generation = t[0].3.unwrap();
+
+        // Everything recovers while the send is still in flight...
+        fold_report(&cfg, AgentKind::Supervisor, m, 3, true);
+        // ...and a fresh outage runs past the threshold.
+        fold_report(&cfg, AgentKind::Supervisor, m, 4, false);
+        backdate_tunnel(AgentKind::Supervisor, m, 400);
+        let t = fold_report(&cfg, AgentKind::Supervisor, m, 5, false);
+        assert_eq!(
+            tunnel_events(&t),
+            vec![(AgentKind::Supervisor, CriticalEventKind::Failure)],
+            "the second outage gets its own Failure"
+        );
+
+        // The first outage's delivery finally resolves: it must not touch the
+        // second outage's phase.
+        record_alert_outcome(&sup_key, AlertCategory::TunnelFailure, old_generation, true);
+        assert_eq!(
+            liveness().lock().unwrap()[&sup_key].tunnel_alert_phase,
+            AlertPhase::Pending
+        );
+    }
+
+    #[test]
+    fn a_supervisor_free_module_keeps_its_own_per_record_decision() {
+        let m = "test-two-reporter-no-supervisor";
+        let cfg = tunnel_cfg();
+        fold_report(&cfg, AgentKind::Ims, m, 1, false);
+        backdate_tunnel(AgentKind::Ims, m, 400);
+        let t = fold_report(&cfg, AgentKind::Ims, m, 2, false);
+        assert_eq!(
+            tunnel_events(&t),
+            vec![(AgentKind::Ims, CriticalEventKind::Failure)]
+        );
     }
 }

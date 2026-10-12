@@ -122,6 +122,9 @@ fn pick_stable_pcscf(batch: &[String]) -> Option<String> {
 /// `TERMINATE_TIMEOUT_SECS` is the precedent for bounding it.
 const STEADY_TERMINATE_TIMEOUT_SECS: u32 = 10;
 
+/// Outer bound on the steady-state `swanctl --list-sas` query.
+const STEADY_LIST_SAS_TIMEOUT_SECS: u32 = 10;
+
 /// CHILD_SA states that still carry (or are about to carry) traffic. A rekey
 /// briefly shows the old SA as `REKEYED` beside the new `INSTALLED` one, and
 /// `REKEYING`/`UPDATING` are the same SA mid-exchange, so none of them may read
@@ -433,7 +436,14 @@ impl TunnelEngine for StrongswanEngine {
         // `--ike <conn>` scopes the query to this line. Without it the shared
         // daemon reports every line's SAs, and another line's healthy
         // CHILD_SA would mask this line's missing one.
+        //
+        // Bounded: a vici call that never returns would otherwise freeze this
+        // line's supervision loop while the reporter thread keeps heartbeating
+        // the last (healthy) state. A timeout reads as a broken vici.
+        let secs = STEADY_LIST_SAS_TIMEOUT_SECS.to_string();
         let sas_output = match runner.run(&[
+            "timeout",
+            &secs,
             "env",
             &env,
             "swanctl",
@@ -943,7 +953,7 @@ mod tests {
         fn steady_state_health_distinguishes_a_bare_ike_sa_from_one_with_a_child() {
             use std::os::unix::process::ExitStatusExt;
             let list_key =
-                "env STRONGSWAN_CONF=/etc/strongswan-shared.conf swanctl --list-sas --ike ims0";
+                "timeout 10 env STRONGSWAN_CONF=/etc/strongswan-shared.conf swanctl --list-sas --ike ims0";
             let seed = |stdout: &str| {
                 let runner = MockCommandRunner::new();
                 runner.set_run_output(

@@ -78,5 +78,5 @@ Logged by the existing `[supervise] line N: recovered from <reason>` line.
 | `module` | line's `card_id` (same as the other `vowifi_*` gauges) |
 
 - 1 or 0, from the last `child_sa_up` received from `AgentKind::Supervisor` for that module.
-- Set to 0 on scrape when that Supervisor record is stale (> 30s since its last report).
+- Set to 0 on scrape when that Supervisor record is stale (more than 3× `[metrics].agent_report_interval_seconds` since its last report, 45s by default).
 - Absent for modules no supervisor reports on (swu lines, VoLTE).

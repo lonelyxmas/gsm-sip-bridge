@@ -58,7 +58,7 @@ gsm_sip_bridge_vowifi_child_sa_up{module="a1b2c3"} 1
 | Supervision started, tunnel still establishing | 0 |
 | Tunnel up, CHILD_SA INSTALLED / REKEYING / REKEYED / UPDATING | 1 |
 | CHILD_SA missing, interface gone, vici or charon down | 0 |
-| Supervisor reports stale (>30s) | 0 (zeroed at scrape) |
+| Supervisor reports stale (3× `[metrics].agent_report_interval_seconds`, 45s at the default) | 0 (zeroed at scrape) |
 | swu engine line, VoLTE line | series absent |
 
 ### Unchanged

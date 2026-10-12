@@ -327,6 +327,9 @@ pub fn tick_steady_state(
     poll_interval: Duration,
 ) -> SteadyOutcome {
     if !engine.is_process_alive(runner) {
+        // A respawned charon starts a fresh connection that gets its own first
+        // retry, so a miss counted against the old one must not carry over.
+        tracking.child_sa_missing = 0;
         tracking.child_sa_usable = false;
         engine.restart_process(runner);
         return SteadyOutcome::Recovered {
@@ -1242,6 +1245,28 @@ mod tests {
         child_sa_tick(&engine, &runner, &mut tracking);
         child_sa_tick(&engine, &runner, &mut tracking);
         assert_eq!(*engine.route_repairs.borrow(), 0);
+    }
+
+    #[test]
+    fn a_process_death_between_misses_resets_the_miss_count() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            health: RefCell::new(SteadyStateHealth::ChildSaMissing),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        child_sa_tick(&engine, &runner, &mut tracking);
+        *engine.alive.borrow_mut() = false;
+        child_sa_tick(&engine, &runner, &mut tracking);
+        *engine.alive.borrow_mut() = true;
+        assert_eq!(
+            child_sa_tick(&engine, &runner, &mut tracking),
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::ChildSaMissing
+            },
+            "the respawned connection gets its own first retry"
+        );
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
     }
 
     #[test]
