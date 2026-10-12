@@ -506,7 +506,8 @@ impl Endpoint {
     /// (`octet-align=1`) or bandwidth-efficient (the RFC 4867 default when the
     /// SDP says nothing). When the far end makes the offer PJSIP follows its
     /// `octet-align` regardless; this only decides what we advertise first.
-    /// Bitrates are PJSIP's own defaults (5.9 kbit/s NB, 12.65 kbit/s WB).
+    /// Encoder bitrates are 12.2 kbit/s NB and 12.65 kbit/s WB (spec 085 FR-007);
+    /// PJSIP's own AMR-NB default is the lower 5.9 kbit/s.
     ///
     /// Needs a PJSIP built with opencore-amr, so a `pjsip-linked` build against
     /// a libpjproject without it fails to link (the Docker image always has it).
@@ -529,7 +530,7 @@ impl Endpoint {
             let flag = std::os::raw::c_int::from(octet_align);
             let nb = AmrConfig {
                 octet_align: flag,
-                bitrate: 5900,
+                bitrate: 12200,
             };
             let wb = AmrConfig {
                 octet_align: flag,
@@ -556,6 +557,12 @@ impl Endpoint {
             let _ = octet_align;
             Ok(())
         }
+    }
+
+    /// Whether this build talks to a real PJSIP. Without it `codecs()` is always
+    /// empty, which is not a failure; with it, an empty `codecs()` is one.
+    pub fn is_linked(&self) -> bool {
+        cfg!(feature = "pjsip-linked")
     }
 
     /// The audio codec negotiated on a live call (e.g. `"AMR-WB"`), or `None`

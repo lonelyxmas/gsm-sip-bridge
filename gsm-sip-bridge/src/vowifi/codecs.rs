@@ -67,6 +67,33 @@ pub(crate) fn priority_plan(
     plan
 }
 
+/// Check every codec an operator listed against what this PJSIP registered.
+///
+/// An empty table is only acceptable in a build without `pjsip-linked`, which
+/// has no codec table at all. In a linked build it means the native read failed
+/// (`Endpoint::codecs()` returns an empty list on error), and passing the list
+/// unchecked would let a codec the build lacks through silently.
+fn validate_listed(list: &[PhoneCodec], registered: &[String], linked: bool) -> BridgeResult<()> {
+    if registered.is_empty() {
+        return if linked {
+            Err(BridgeError::Ims(
+                "could not read PJSIP's codec table, so [sip].codecs cannot be checked".to_string(),
+            ))
+        } else {
+            Ok(())
+        };
+    }
+    for codec in list {
+        if !registered.iter().any(|id| id == codec.pjsip_id()) {
+            return Err(BridgeError::Config(format!(
+                "[sip].codecs names {}, which this build does not include",
+                codec.config_name()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Apply the configured preference to `endpoint` and log the resulting offer.
 ///
 /// Without a list this is best-effort, as the wideband setup always was: a
@@ -81,17 +108,8 @@ pub(crate) fn apply(
 ) -> BridgeResult<()> {
     let registered: Vec<String> = endpoint.codecs().into_iter().map(|c| c.id).collect();
 
-    // Without pjsip-linked there is no codec table at all, so there is
-    // nothing to validate against.
-    if let Some(list) = codecs.filter(|_| !registered.is_empty()) {
-        for codec in list {
-            if !registered.iter().any(|id| id == codec.pjsip_id()) {
-                return Err(BridgeError::Config(format!(
-                    "[sip].codecs names {}, which this build does not include",
-                    codec.config_name()
-                )));
-            }
-        }
+    if let Some(list) = codecs {
+        validate_listed(list, &registered, endpoint.is_linked())?;
     }
 
     if let Err(e) = endpoint.set_amr_octet_align(amr_octet_align) {
@@ -205,6 +223,25 @@ mod tests {
             priority_plan(Some(&list), true, &registered()),
             priority_plan(Some(&list), false, &registered())
         );
+    }
+
+    #[test]
+    fn a_listed_codec_the_build_lacks_is_a_config_error() {
+        let registered = vec!["PCMU/8000/1".to_string()];
+        let err = validate_listed(&[Pcmu, AmrWb], &registered, true).unwrap_err();
+        assert!(matches!(err, BridgeError::Config(_)));
+        assert!(err.to_string().contains("AMR-WB"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_codec_table_fails_a_linked_build_but_not_an_unlinked_one() {
+        assert!(validate_listed(&[Pcmu], &[], true).is_err());
+        assert!(validate_listed(&[Pcmu], &[], false).is_ok());
+    }
+
+    #[test]
+    fn a_fully_registered_list_passes() {
+        assert!(validate_listed(&[AmrWb, Pcmu], &registered(), true).is_ok());
     }
 
     #[test]
