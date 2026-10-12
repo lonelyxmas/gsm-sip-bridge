@@ -24,24 +24,57 @@ static RINGBACK_ACTIVE: AtomicBool = AtomicBool::new(false);
 static BRIDGE_PAIRS: LazyLock<Mutex<std::collections::HashMap<i32, i32>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
-/// The final SIP status of each call PJSIP has disconnected, captured inside
+/// The final SIP status of recently disconnected calls, keyed by the
+/// call's token (see [`next_call_token`]), captured inside
 /// `on_call_state_cb` — the only point where it is reliably readable, since
 /// PJSUA resets the call's slot (and `pjsua_call_get_info` starts failing)
-/// as soon as that callback returns. Read by `Call::last_status`. An entry is
-/// dropped on the next non-disconnected state for the same id, so a reused
-/// call id never reports the previous call's status.
-#[cfg(feature = "pjsip-linked")]
-static DISCONNECT_STATUS: LazyLock<Mutex<std::collections::HashMap<i32, u16>>> =
-    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+/// as soon as that callback returns. Read by `Call::last_status`.
+///
+/// Keyed by token rather than `pjsua_call_id` because PJSUA reuses call ids:
+/// another line's call can take a freed id before the old call's owner reads
+/// its status, and must not overwrite or erase it. Tokens are never reused,
+/// so entries are never cleared on reuse; the oldest is dropped once
+/// [`DISCONNECT_STATUS_CAPACITY`] are held. Owners read within one poll
+/// (~100 ms) of the disconnect, far inside that bound.
+static DISCONNECT_STATUS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::VecDeque<(usize, u16)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
 
-/// The status `on_call_state_cb` captured when `call_id` disconnected.
-#[cfg(feature = "pjsip-linked")]
-pub(crate) fn disconnect_status(call_id: i32) -> Option<u16> {
+const DISCONNECT_STATUS_CAPACITY: usize = 64;
+
+/// Next token to hand out; 0 is reserved for "no token" (a call we did not
+/// place, whose `user_data` PJSUA leaves null).
+static NEXT_CALL_TOKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+/// A process-unique, never-zero token for a call `Call::make` is about to
+/// place. It is passed to PJSUA as the call's `user_data`, so the state
+/// callback can attribute a disconnect to this call even after its id is
+/// reused.
+#[cfg_attr(not(feature = "pjsip-linked"), allow(dead_code))]
+pub(crate) fn next_call_token() -> usize {
+    NEXT_CALL_TOKEN.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The status `on_call_state_cb` captured when the call holding `token`
+/// disconnected.
+#[cfg_attr(not(feature = "pjsip-linked"), allow(dead_code))]
+pub(crate) fn disconnect_status(token: usize) -> Option<u16> {
     DISCONNECT_STATUS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&call_id)
-        .copied()
+        .iter()
+        .rev()
+        .find(|(t, _)| *t == token)
+        .map(|(_, code)| *code)
+}
+
+#[cfg_attr(not(feature = "pjsip-linked"), allow(dead_code))]
+fn record_disconnect_status(token: usize, code: u16) {
+    let mut statuses = DISCONNECT_STATUS.lock().unwrap_or_else(|e| e.into_inner());
+    if statuses.len() >= DISCONNECT_STATUS_CAPACITY {
+        statuses.pop_front();
+    }
+    statuses.push_back((token, code));
 }
 
 /// Calls PJSIP has notified us of via `on_incoming_call` that no Rust-side
@@ -912,16 +945,12 @@ unsafe extern "C" fn on_call_state_cb( // SAFETY: PJSIP invokes with valid call_
     let state = info.state;
     tracing::info!(call_id, state, "SIP call state changed");
 
-    {
-        let mut statuses = DISCONNECT_STATUS.lock().unwrap_or_else(|e| e.into_inner());
-        if state == pjsua_sys::pjsip_inv_state_PJSIP_INV_STATE_DISCONNECTED {
-            if let Ok(code) = u16::try_from(info.last_status) {
-                if code > 0 {
-                    statuses.insert(call_id, code);
-                }
+    if state == pjsua_sys::pjsip_inv_state_PJSIP_INV_STATE_DISCONNECTED {
+        let token = pjsua_sys::pjsua_call_get_user_data(call_id) as usize;
+        if let Ok(code) = u16::try_from(info.last_status) {
+            if token != 0 && code > 0 {
+                record_disconnect_status(token, code);
             }
-        } else {
-            statuses.remove(&call_id);
         }
     }
 
@@ -1094,5 +1123,34 @@ mod disconnect_trigger_tests {
         );
         assert_eq!(trigger_name(pjsip_event_id_e_PJSIP_EVENT_UNKNOWN), "other");
         assert_eq!(trigger_name(pjsip_event_id_e_PJSIP_EVENT_USER), "other");
+    }
+}
+
+#[cfg(test)]
+mod disconnect_status_tests {
+    use super::{
+        disconnect_status, next_call_token, record_disconnect_status, DISCONNECT_STATUS_CAPACITY,
+    };
+
+    /// Two calls that held the same PJSUA call id one after the other keep
+    /// separate statuses: the second call's disconnect neither erases nor
+    /// replaces the first's rejection (PR #110 review).
+    #[test]
+    fn a_reused_call_id_keeps_each_calls_status_and_the_store_is_bounded() {
+        let rejected = next_call_token();
+        let reused = next_call_token();
+        assert_ne!(rejected, 0);
+        assert_ne!(rejected, reused);
+        assert_eq!(disconnect_status(rejected), None);
+
+        record_disconnect_status(rejected, 603);
+        record_disconnect_status(reused, 408);
+        assert_eq!(disconnect_status(rejected), Some(603));
+        assert_eq!(disconnect_status(reused), Some(408));
+
+        for _ in 0..DISCONNECT_STATUS_CAPACITY {
+            record_disconnect_status(next_call_token(), 486);
+        }
+        assert_eq!(disconnect_status(rejected), None);
     }
 }

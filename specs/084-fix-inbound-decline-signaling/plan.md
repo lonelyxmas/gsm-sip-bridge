@@ -75,7 +75,7 @@ specs/084-fix-inbound-decline-signaling/
 
 ```text
 pjsua-safe/src/
-├── endpoint.rs        # DISCONNECT_STATUS map, filled in on_call_state_cb
+├── endpoint.rs        # DISCONNECT_STATUS (keyed by per-call token), filled in on_call_state_cb
 └── call.rs            # Call::last_status(); stub field + set_last_status()
 
 gsm-sip-bridge/src/

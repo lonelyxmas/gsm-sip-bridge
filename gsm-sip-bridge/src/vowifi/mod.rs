@@ -2386,6 +2386,7 @@ mod tests {
     /// The ring loop classifies from the leg's real final status — a `603`
     /// is a decline, and a leg that ended with no status at all is a failure
     /// rather than the "rejected" every disconnect used to be (issue #108).
+    #[cfg(not(feature = "pjsip-linked"))]
     #[test]
     fn wait_for_pbx_answer_classifies_a_disconnect_by_its_final_status() {
         let (_ctrl_tx, ctrl_rx) = mpsc::channel::<ControlMessage>();

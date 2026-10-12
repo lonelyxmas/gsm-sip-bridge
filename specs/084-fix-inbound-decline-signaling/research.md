@@ -6,12 +6,16 @@ All decisions below were checked against the code on `main` at `d7cbc1e`.
 
 **Decision**:
 - Capture PJSIP's `last_status` in the call-state callback when a call
-  reaches `DISCONNECTED`, and store it keyed by call id.
-- Clear the entry on any later non-disconnected state for that id, so a
-  reused id never sees a stale status.
+  reaches `DISCONNECTED`.
+- Store it keyed by a per-call token, not by call id. `Call::make` passes
+  the token to PJSUA as the call's `user_data`. PJSUA reuses call ids, and
+  all lines share one endpoint, so another line's call can take a freed id
+  before the first call's owner reads its status (PR #110 review). Tokens
+  are never reused. The store keeps at most the last 64 entries.
 - Expose it as `pjsua_safe::Call::last_status() -> Option<u16>`. This reads
-  live call info if the call still exists, and falls back to the stored
-  entry otherwise.
+  only the stored entry, never the live call info, which may by then belong
+  to the call that reused the id. For the same reason, `poll_state` reports
+  `Disconnected` once the id's `user_data` is no longer this call's token.
 - Stub builds keep a settable field instead.
 
 **Rationale**: Agent B polls `poll_state()` every 100 ms. As far as we know

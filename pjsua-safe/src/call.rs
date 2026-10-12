@@ -25,6 +25,10 @@ pub struct Call {
     #[allow(dead_code)]
     call_id: i32,
     state: CallState,
+    /// Identifies this call to `on_call_state_cb` across call-id reuse: the
+    /// `user_data` `Call::make` hands PJSUA. 0 for a call we did not place.
+    #[allow(dead_code)]
+    token: usize,
     /// Stub builds only: what [`Call::last_status`] reports, set by tests via
     /// [`Call::set_last_status`]. A linked build reads PJSIP instead.
     #[allow(dead_code)]
@@ -97,12 +101,13 @@ impl Call {
                 opt.vid_cnt = 0;
                 opt.txt_cnt = 0;
 
+                let token = crate::endpoint::next_call_token();
                 let mut call_id: pjsua_sys::pjsua_call_id = -1;
                 let status = pjsua_sys::pjsua_call_make_call(
                     _account.account_id(),
                     &uri,
                     &opt,
-                    std::ptr::null_mut(),
+                    token as *mut std::os::raw::c_void,
                     msg_data_ptr,
                     &mut call_id,
                 );
@@ -115,6 +120,7 @@ impl Call {
                 return Ok(Self {
                     call_id,
                     state: CallState::Calling,
+                    token,
                     last_status: None,
                 });
             }
@@ -127,6 +133,7 @@ impl Call {
             Ok(Self {
                 call_id: 0,
                 state: CallState::Calling,
+                token: 0,
                 last_status: None,
             })
         }
@@ -144,6 +151,7 @@ impl Call {
         Self {
             call_id,
             state,
+            token: 0,
             last_status: None,
         }
     }
@@ -311,6 +319,10 @@ impl Call {
                     // The call is gone as far as PJSIP is concerned.
                     return CallState::Disconnected;
                 }
+                // The id now belongs to a newer call: ours has ended.
+                if pjsua_sys::pjsua_call_get_user_data(self.call_id) as usize != self.token {
+                    return CallState::Disconnected;
+                }
                 #[allow(non_upper_case_globals)]
                 return match info.state {
                     pjsua_sys::pjsip_inv_state_PJSIP_INV_STATE_NULL => CallState::Null,
@@ -340,26 +352,19 @@ impl Call {
     /// end rejected it, `408` when it timed out — or `None` if the call has
     /// not ended or PJSIP recorded no status for it.
     ///
-    /// Reads the live call info first, but PJSUA resets the call's slot as
-    /// soon as its `DISCONNECTED` callback returns, so by the time a caller
-    /// polling [`Call::poll_state`] sees `Disconnected` that info is usually
-    /// gone. The status captured inside that callback (`endpoint`'s
-    /// `DISCONNECT_STATUS`) covers exactly that window.
+    /// PJSUA resets the call's slot as soon as its `DISCONNECTED` callback
+    /// returns, and may hand the id to another call, so the live call info
+    /// is not trusted here. The status is the one captured inside that
+    /// callback (`endpoint`'s `DISCONNECT_STATUS`), found by this call's
+    /// token. Only calls placed with [`Call::make`] have one; any other call
+    /// reports `None`.
     pub fn last_status(&self) -> Option<u16> {
         #[cfg(feature = "pjsip-linked")]
         {
-            ensure_pjsip_thread();
-            unsafe // SAFETY: PJSIP initialized; call_id owned by this Call; writable stack out-param
-            {
-                let mut info = std::mem::zeroed::<pjsua_sys::pjsua_call_info>();
-                if pjsua_sys::pjsua_call_get_info(self.call_id, &mut info)
-                    == crate::error::PJ_SUCCESS
-                    && info.last_status > 0
-                {
-                    return u16::try_from(info.last_status).ok();
-                }
+            if self.token == 0 {
+                return None;
             }
-            crate::endpoint::disconnect_status(self.call_id)
+            crate::endpoint::disconnect_status(self.token)
         }
 
         #[cfg(not(feature = "pjsip-linked"))]
