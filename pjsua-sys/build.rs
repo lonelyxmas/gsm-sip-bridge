@@ -69,7 +69,21 @@ fn probe_libpjproject() -> Option<pkg_config::Library> {
 fn emit_pkg_config_links(lib: &pkg_config::Library) {
     let force_static = env::var("PJSUA_SYS_STATIC").is_ok();
     let system_libs: HashSet<&str> = [
-        "stdc++", "ssl", "crypto", "uuid", "m", "rt", "pthread", "asound",
+        "stdc++",
+        "ssl",
+        "crypto",
+        "uuid",
+        "m",
+        "rt",
+        "pthread",
+        "asound",
+        // Phone-facing AMR/Opus codecs (spec 085): Alpine shared libs already
+        // present at runtime; linking them dynamically avoids relying on .a
+        // files and a second static copy of opencore beside amr-sys's.
+        "opencore-amrnb",
+        "opencore-amrwb",
+        "vo-amrwbenc",
+        "opus",
     ]
     .iter()
     .copied()

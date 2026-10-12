@@ -17,6 +17,7 @@
 //! few duplicated lines, not a new abstraction, and leaves `SipBridge`/the
 //! existing circuit-switched call path completely untouched (FR-006).
 
+mod codecs;
 pub mod control;
 pub mod discovery;
 pub mod ims_mode;
@@ -298,9 +299,14 @@ pub(crate) fn run_telephony_side(
     // process ever calls `poll_incoming_call` to drain it otherwise
     // (specs/025-outbound-calling review).
     endpoint.set_accept_incoming_calls(config.outbound.enabled);
-    if wideband {
-        prioritize_wideband_codecs(&endpoint);
-    }
+    // Unconditional: the narrowband path must pin the AMR/Opus codecs too
+    // (spec 085, research R3), and an operator list applies to both.
+    codecs::apply(
+        &endpoint,
+        config.sip.codecs.as_deref(),
+        wideband,
+        config.sip.amr_octet_align,
+    )?;
 
     // In SIP server mode this process is the one that would have owned the PBX
     // trunk (see `crate::sip::SipBridge`'s `register_trunk`), so it is the one
@@ -1551,45 +1557,6 @@ fn build_discord_client(config: &AppConfig) -> Option<DiscordClient> {
     }
 }
 
-/// PJSIP's G.722 codec id. Wideband (16 kHz internally, whatever RFC 3551's
-/// historical `G722/8000` rtpmap says), built into pjproject with no external
-/// library, and understood by every mainstream PBX without an extra module —
-/// which is why it, rather than Opus, is what the PBX leg reaches for.
-const G722_CODEC_ID: &str = "G722/16000/1";
-/// PJSIP's 16 kHz linear-PCM codec id — uncompressed, and used only on the
-/// veth link to Agent A (see `ims::sdp::NegotiatedCodec::L16`).
-const L16_16K_CODEC_ID: &str = "L16/16000/1";
-
-/// Make Agent B's two calls offer the codecs a wideband bridge needs: G.722
-/// first (what the PBX should pick), and L16/16000 enabled so it appears in the
-/// offer at all (what Agent A picks on the veth link, by name — so its low
-/// priority here doesn't matter; it only keeps L16 out of the PBX's way).
-///
-/// Priorities are endpoint-global, and best-effort: a PJSIP build missing
-/// either codec just logs a warning and carries on. Nothing here can fail a
-/// call — without G.722 the PBX leg falls back to PCMU, and without L16 the
-/// veth link does, which is exactly how this bridge behaved before wideband.
-fn prioritize_wideband_codecs(endpoint: &Endpoint) {
-    for (codec_id, priority) in [(G722_CODEC_ID, 200), (L16_16K_CODEC_ID, 1)] {
-        if let Err(e) = endpoint.set_codec_priority(codec_id, priority) {
-            tracing::warn!(
-                codec = codec_id,
-                error = %e,
-                "could not set codec priority; this PJSIP build may not have the codec"
-            );
-        }
-    }
-    tracing::info!(
-        codecs = ?endpoint
-            .codecs()
-            .iter()
-            .filter(|c| c.priority > 0)
-            .map(|c| (c.id.clone(), c.priority))
-            .collect::<Vec<_>>(),
-        "PJSIP codecs offered, in priority order"
-    );
-}
-
 /// Records a call outcome under `card_id`'s own history — inserts an entry
 /// if this is somehow the first time this card_id is seen (shouldn't
 /// happen; `recent_calls` is pre-populated from the same line list this
@@ -1780,6 +1747,7 @@ fn handle_connection(
                             outcome: summary,
                             started_at,
                             ended_at: Some(now_unix()),
+                            phone_codec: None,
                         },
                     );
                     return Ok(());
@@ -1790,7 +1758,13 @@ fn handle_connection(
             // would miss the PBX extension hanging up first, leaving the caller
             // on a line that is already dead — so watch our own leg too, and
             // tell Agent A when it drops so it can BYE the carrier.
+            // The phone leg's codec is only readable once its media is active,
+            // which can land just after the 200 OK; keep trying until it does.
+            let mut phone_codec = endpoint.negotiated_codec(pbx_call.call_id());
             let end_reason = loop {
+                if phone_codec.is_none() {
+                    phone_codec = endpoint.negotiated_codec(pbx_call.call_id());
+                }
                 match ctrl_rx.recv_timeout(PBX_RING_POLL_INTERVAL) {
                     Ok(ControlMessage::CallEnded { reason, .. }) => {
                         tracing::info!(call_id = %call_id, reason = %reason, "call ended, tearing down both legs");
@@ -1835,6 +1809,7 @@ fn handle_connection(
                     outcome: format!("answered:{end_reason}"),
                     started_at,
                     ended_at: Some(now_unix()),
+                    phone_codec,
                 },
             );
             Ok(())
@@ -1864,6 +1839,7 @@ fn handle_connection(
                     outcome: format!("failed:{e}"),
                     started_at,
                     ended_at: Some(now_unix()),
+                    phone_codec: None,
                 },
             );
             Ok(())
@@ -2268,12 +2244,13 @@ pub fn print_status(_config: &VowifiConfig) -> ExitCode {
             Ok(ControlMessage::CallHistoryReply { calls }) => {
                 for c in calls {
                     println!(
-                        "    {} caller={} outcome={} started={} ended={}",
+                        "    {} caller={} outcome={} started={} ended={} phone_codec={}",
                         c.call_id,
                         c.caller,
                         c.outcome,
                         format_unix(Some(c.started_at)),
-                        format_unix(c.ended_at)
+                        format_unix(c.ended_at),
+                        c.phone_codec.as_deref().unwrap_or("-")
                     );
                 }
             }
@@ -2693,6 +2670,7 @@ mod tests {
             outcome: "answered:caller_hangup".to_string(),
             started_at: 1_700_000_000,
             ended_at: Some(1_700_000_300),
+            phone_codec: None,
         }
     }
 

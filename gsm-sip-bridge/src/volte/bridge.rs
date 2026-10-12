@@ -238,6 +238,13 @@ fn run_inner(service: ServiceConfig, app_config: &AppConfig) -> BridgeResult<()>
                             crate::store::Transport::Volte,
                             Some(pbx_registered.clone()),
                         ) {
+                            if is_fatal_telephony_error(&e) {
+                                // A configuration error (e.g. [sip].codecs names a
+                                // codec this build lacks) will fail identically on
+                                // every retry; stop instead of spinning.
+                                tracing::error!(error = %e, "the telephone-side half cannot start with this configuration; exiting");
+                                std::process::exit(1);
+                            }
                             tracing::error!(
                                 error = %e,
                                 retry_in_secs = LINE_RETRY_BACKOFF.as_secs(),
@@ -282,6 +289,13 @@ fn run_inner(service: ServiceConfig, app_config: &AppConfig) -> BridgeResult<()>
 
 /// `LOOPBACK` when `addr` is empty (research.md R7 — the diagnostic
 /// single-`--modem` path has no veth link), else `addr` itself.
+/// Whether a telephone-side failure is one a retry cannot fix. Only
+/// configuration errors qualify: transient failures (bind races, PJSIP
+/// creation) surface as other variants and keep the retry loop.
+fn is_fatal_telephony_error(e: &BridgeError) -> bool {
+    matches!(e, BridgeError::Config(_))
+}
+
 fn non_empty_or_loopback(addr: &str) -> String {
     if addr.is_empty() {
         LOOPBACK.to_string()
@@ -596,12 +610,13 @@ fn print_line_live_status(
         Ok(ControlMessage::CallHistoryReply { calls }) => {
             for c in calls {
                 println!(
-                    "    {} caller={} outcome={} started={} ended={}",
+                    "    {} caller={} outcome={} started={} ended={} phone_codec={}",
                     c.call_id,
                     c.caller,
                     c.outcome,
                     format_unix(Some(c.started_at)),
-                    format_unix(c.ended_at)
+                    format_unix(c.ended_at),
+                    c.phone_codec.as_deref().unwrap_or("-")
                 );
             }
         }
@@ -617,6 +632,16 @@ fn print_line_live_status(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_configuration_errors_are_fatal_to_the_telephone_side() {
+        assert!(is_fatal_telephony_error(&BridgeError::Config(
+            "[sip].codecs names AMR-WB, which this build does not include".into()
+        )));
+        assert!(!is_fatal_telephony_error(&BridgeError::Ims(
+            "bind failed: address in use".into()
+        )));
+    }
+
     use super::*;
 
     #[test]

@@ -122,6 +122,23 @@ A line's SIM normally comes from a modem, bridged into pcscd's virtual reader by
 `vowifi-usim-bridge`. It can instead come from a real PC/SC smart-card reader (e.g. OmniKey AG
 3x21) with the SIM seated directly in it — see `docs/omnikey-pcsc-vowifi.md`.
 
+## Phone-facing codecs
+
+The PBX/phone leg can use AMR-WB, AMR-NB or Opus as well as G.722 and PCMU (spec 085, #109). AMR-WB
+at about 12.65 kbit/s is roughly a fifth of G.722's 64 kbit/s, which matters on a metered or weak
+link to the phone. `[sip].codecs` sets the order; unset, nothing changes for a phone that does not
+ask for AMR or Opus, and one that prefers them can now negotiate them.
+
+- The bridge still decodes and re-encodes: the carrier's audio is not passed through untouched (see
+  #111 for passthrough).
+- A PBX in the path must support the codec itself. Stock Asterisk has no AMR, so the built-in
+  registrar (`[sip_server]` mode) with an AMR-capable softphone is the primary target.
+- AMR is offered octet-aligned by default (`[sip].amr_octet_align`), because most softphones accept only that packing; set it to `false` for bandwidth-efficient. A phone that makes the offer is followed either way.
+- PCMU must stay in the list; the internal link between the two agents falls back to it.
+- The circuit-switched path never offers these codecs.
+
+The negotiated phone-leg codec shows as `phone_codec=` in `vowifi-status` recent calls.
+
 ## What's verified vs. what needs real hardware
 
 Everything above is unit- and integration-tested without live hardware (175 `gsm-sip-bridge` lib

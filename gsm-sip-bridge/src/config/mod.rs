@@ -47,6 +47,76 @@ pub struct SipConfig {
     /// resolved — a `[sip].public_addr` hostname is resolved once, here at
     /// config-build time, never later (`specs/050-sip-public-addr/`).
     pub public_addr: Option<std::net::IpAddr>,
+    /// Codecs the VoWiFi/VoLTE telephone-side agent may use toward the PBX or
+    /// phone, most preferred first (`[sip].codecs`, spec 085). `None` keeps
+    /// the default order with AMR/Opus pinned lowest. Ignored by the
+    /// circuit-switched path. PCMU is always present when `Some`: the
+    /// bridge's internal agent link falls back to it (research R4).
+    pub codecs: Option<Vec<PhoneCodec>>,
+    /// Offer AMR to the phone octet-aligned (`octet-align=1`) rather than
+    /// bandwidth-efficient. Default `true`: most softphones (baresip,
+    /// Linphone, many desk phones) implement only the octet-aligned packing
+    /// and refuse the other. A far end that makes the offer is followed
+    /// either way. VoWiFi/VoLTE only.
+    pub amr_octet_align: bool,
+}
+
+/// A codec an operator may name in `[sip].codecs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhoneCodec {
+    G722,
+    Pcmu,
+    Pcma,
+    AmrWb,
+    AmrNb,
+    Opus,
+}
+
+impl PhoneCodec {
+    /// Every variant, in the order the config docs list them.
+    pub const ALL: [PhoneCodec; 6] = [
+        PhoneCodec::G722,
+        PhoneCodec::Pcmu,
+        PhoneCodec::Pcma,
+        PhoneCodec::AmrWb,
+        PhoneCodec::AmrNb,
+        PhoneCodec::Opus,
+    ];
+
+    /// The name used in the config file.
+    pub fn config_name(self) -> &'static str {
+        match self {
+            PhoneCodec::G722 => "G722",
+            PhoneCodec::Pcmu => "PCMU",
+            PhoneCodec::Pcma => "PCMA",
+            PhoneCodec::AmrWb => "AMR-WB",
+            PhoneCodec::AmrNb => "AMR-NB",
+            PhoneCodec::Opus => "OPUS",
+        }
+    }
+
+    /// The codec id PJSIP registers it under.
+    pub fn pjsip_id(self) -> &'static str {
+        self.pjsip_id_const()
+    }
+
+    /// `pjsip_id` as a `const fn`, so priority tables can be `const`.
+    pub const fn pjsip_id_const(self) -> &'static str {
+        match self {
+            PhoneCodec::G722 => "G722/16000/1",
+            PhoneCodec::Pcmu => "PCMU/8000/1",
+            PhoneCodec::Pcma => "PCMA/8000/1",
+            PhoneCodec::AmrWb => "AMR-WB/16000/1",
+            PhoneCodec::AmrNb => "AMR/8000/1",
+            PhoneCodec::Opus => "opus/48000/2",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<PhoneCodec> {
+        Self::ALL
+            .into_iter()
+            .find(|c| c.config_name().eq_ignore_ascii_case(name))
+    }
 }
 
 #[derive(Clone, Debug)]
