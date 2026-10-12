@@ -123,14 +123,14 @@ description: "Task list for specs/086-epdg-child-sa-recovery"
 
 ### Alert folding (R6)
 
-- [ ] T019 [US3] Tests first in `gsm-sip-bridge/src/metrics/ingest.rs` tests. Use backdated `Instant`s and the existing alert test helpers (e.g. `seed_pending_record`), plus whatever the existing tests use to capture dispatched transitions without Discord. For one module with both an `Ims` and a `Supervisor` record:
+- [X] T019 [US3] Tests first in `gsm-sip-bridge/src/metrics/ingest.rs` tests. Use backdated `Instant`s and the existing alert test helpers (e.g. `seed_pending_record`), plus whatever the existing tests use to capture dispatched transitions without Discord. For one module with both an `Ims` and a `Supervisor` record:
   - (a) only Supervisor `child_sa_up=false` past the threshold → exactly one TunnelFailure Failure;
   - (b) only Ims `tunnel_up=false` past the threshold → exactly one Failure;
   - (c) both unhealthy → exactly one Failure, and the Ims record's own `tunnel_alert_phase` stays Idle;
   - (d) one recovers while the other is still unhealthy → no Recovered; both healthy → exactly one Recovered;
   - (e) no Supervisor record for the module (swu/VoLTE) → today's per-record behaviour (existing tests stay green);
   - (f) `record_alert_outcome` for the owning Supervisor key matches on `tunnel_alert_generation`, and a stale generation is a no-op.
-- [ ] T020 [US3] Implement in `gsm-sip-bridge/src/metrics/ingest.rs` per research R6 and data-model "Tunnel-failure decision ownership":
+- [X] T020 [US3] Implement in `gsm-sip-bridge/src/metrics/ingest.rs` per research R6 and data-model "Tunnel-failure decision ownership":
   - add `tunnel_alert_generation: Option<Instant>` to `AgentRecord` (and to every struct literal, including tests and `seed_pending_record`).
   - In `apply_report`, under the existing lock: when a Supervisor record for `module_id` exists, or this report is from the Supervisor, compute `effective_since = min` over the `Some` values of the Ims record's and the Supervisor record's `tunnel_unhealthy_since` (using this report's freshly applied value for its own kind). Run `decide_transition` once, on the Supervisor record's `tunnel_alert_phase`. Store `effective_since` in its `tunnel_alert_generation`. Push the transition with key `(Supervisor, module)` and generation `effective_since`. Skip the Ims record's own TunnelFailure decision for that module.
   - When applying an Ims report that changes the decision, write the updated phase/generation back to the Supervisor record via `guard.get_mut`.

@@ -107,6 +107,13 @@ struct AgentRecord {
     /// Same pair, for `tunnel_up`.
     tunnel_unhealthy_since: Option<Instant>,
     tunnel_alert_phase: AlertPhase,
+    /// specs/086. The effective unhealthy-since a tunnel-failure `Failure` was
+    /// decided against, when the decision folds the IMS agent's tunnel signal
+    /// with the supervisor's CHILD_SA signal (only ever set on the supervisor's
+    /// record, which owns the folded decision). Frozen at decision time so a
+    /// later change in which signal is oldest cannot orphan the delivery
+    /// callback's generation match.
+    tunnel_alert_generation: Option<Instant>,
     /// Same pair, for `gm_connection_up` (specs/028-gm-tcp-reconnect).
     gm_connection_unhealthy_since: Option<Instant>,
     gm_connection_alert_phase: AlertPhase,
@@ -127,6 +134,16 @@ fn liveness() -> &'static Mutex<HashMap<(AgentKind, String), AgentRecord>> {
     static STATE: OnceLock<Mutex<HashMap<(AgentKind, String), AgentRecord>>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
+
+/// `(owning key, category, transition, generation)`. The key is explicit because
+/// a folded tunnel decision (specs/086) is owned by the supervisor's record even
+/// when an IMS report triggered it.
+type PendingTransition = (
+    (AgentKind, String),
+    AlertCategory,
+    CriticalEventKind,
+    Option<Instant>,
+);
 
 /// Applies one `AgentReport` to the registry. Never fails: a malformed
 /// individual event is impossible by construction (the wire type is a
@@ -157,6 +174,7 @@ pub fn apply_report(report: &AgentReport) {
     let mut registered_alert_phase =
         existing.map_or(AlertPhase::Idle, |r| r.registered_alert_phase);
     let mut tunnel_alert_phase = existing.map_or(AlertPhase::Idle, |r| r.tunnel_alert_phase);
+    let mut tunnel_alert_generation = existing.and_then(|r| r.tunnel_alert_generation);
     let mut gm_connection_alert_phase =
         existing.map_or(AlertPhase::Idle, |r| r.gm_connection_alert_phase);
     let mut registered_unhealthy_since = existing.and_then(|r| r.registered_unhealthy_since);
@@ -171,8 +189,7 @@ pub fn apply_report(report: &AgentReport) {
     // become a no-op instead of corrupting the new incident's phase
     // (Greptile P1 follow-up: "delivery callbacks not scoped to an incident
     // generation").
-    let mut pending_transitions: Vec<(AlertCategory, CriticalEventKind, Option<Instant>)> =
-        Vec::new();
+    let mut pending_transitions: Vec<PendingTransition> = Vec::new();
 
     if !is_replay {
         apply_state(
@@ -206,6 +223,7 @@ pub fn apply_report(report: &AgentReport) {
                 registration_threshold,
             ) {
                 Transition::Event(kind) => pending_transitions.push((
+                    key.clone(),
                     AlertCategory::RegistrationLoss,
                     kind,
                     registered_unhealthy_since,
@@ -215,20 +233,73 @@ pub fn apply_report(report: &AgentReport) {
                 }
                 Transition::None => {}
             }
-            match decide_transition(
-                tunnel_unhealthy_since,
-                &mut tunnel_alert_phase,
-                tunnel_threshold,
-            ) {
-                Transition::Event(kind) => pending_transitions.push((
-                    AlertCategory::TunnelFailure,
-                    kind,
+            // specs/086: with a supervisor reporting this module, the tunnel
+            // alert fires on either the IMS agent's tunnel signal or the
+            // supervisor's CHILD_SA signal, once per outage. The supervisor's
+            // record owns the folded decision.
+            let supervisor_key = (AgentKind::Supervisor, module_id.to_string());
+            let folds = matches!(report.agent, AgentKind::Ims | AgentKind::Supervisor)
+                && (report.agent == AgentKind::Supervisor || guard.contains_key(&supervisor_key));
+            if folds && report.agent == AgentKind::Supervisor {
+                let ims_since = guard
+                    .get(&(AgentKind::Ims, module_id.to_string()))
+                    .and_then(|r| r.tunnel_unhealthy_since);
+                match decide_folded_tunnel(
+                    ims_since,
                     tunnel_unhealthy_since,
-                )),
-                Transition::Suppressed => {
-                    crate::alerts::record_suppressed(AlertCategory::TunnelFailure)
+                    &mut tunnel_alert_phase,
+                    &mut tunnel_alert_generation,
+                    tunnel_threshold,
+                ) {
+                    Transition::Event(kind) => pending_transitions.push((
+                        key.clone(),
+                        AlertCategory::TunnelFailure,
+                        kind,
+                        tunnel_alert_generation,
+                    )),
+                    Transition::Suppressed => {
+                        crate::alerts::record_suppressed(AlertCategory::TunnelFailure)
+                    }
+                    Transition::None => {}
                 }
-                Transition::None => {}
+            } else if folds {
+                // An IMS report: decide on the supervisor's record.
+                let sup = guard.get_mut(&supervisor_key).unwrap();
+                match decide_folded_tunnel(
+                    tunnel_unhealthy_since,
+                    sup.tunnel_unhealthy_since,
+                    &mut sup.tunnel_alert_phase,
+                    &mut sup.tunnel_alert_generation,
+                    tunnel_threshold,
+                ) {
+                    Transition::Event(kind) => pending_transitions.push((
+                        supervisor_key.clone(),
+                        AlertCategory::TunnelFailure,
+                        kind,
+                        sup.tunnel_alert_generation,
+                    )),
+                    Transition::Suppressed => {
+                        crate::alerts::record_suppressed(AlertCategory::TunnelFailure)
+                    }
+                    Transition::None => {}
+                }
+            } else {
+                match decide_transition(
+                    tunnel_unhealthy_since,
+                    &mut tunnel_alert_phase,
+                    tunnel_threshold,
+                ) {
+                    Transition::Event(kind) => pending_transitions.push((
+                        key.clone(),
+                        AlertCategory::TunnelFailure,
+                        kind,
+                        tunnel_unhealthy_since,
+                    )),
+                    Transition::Suppressed => {
+                        crate::alerts::record_suppressed(AlertCategory::TunnelFailure)
+                    }
+                    Transition::None => {}
+                }
             }
             let gm_connection_threshold =
                 Duration::from_secs(cfg.gm_connection_lost_thresholds.unhealthy_sec);
@@ -238,6 +309,7 @@ pub fn apply_report(report: &AgentReport) {
                 gm_connection_threshold,
             ) {
                 Transition::Event(kind) => pending_transitions.push((
+                    key.clone(),
                     AlertCategory::GmConnectionLost,
                     kind,
                     gm_connection_unhealthy_since,
@@ -264,6 +336,7 @@ pub fn apply_report(report: &AgentReport) {
             registered_alert_phase,
             tunnel_unhealthy_since,
             tunnel_alert_phase,
+            tunnel_alert_generation,
             gm_connection_unhealthy_since,
             gm_connection_alert_phase,
             registration_expires_at,
@@ -271,8 +344,8 @@ pub fn apply_report(report: &AgentReport) {
     );
     drop(guard);
 
-    for (category, kind, generation) in pending_transitions {
-        dispatch_transition(key.clone(), category, kind, generation);
+    for (key, category, kind, generation) in pending_transitions {
+        dispatch_transition(key, category, kind, generation);
     }
 }
 
@@ -308,10 +381,43 @@ fn decide_transition(
     }
 }
 
+/// specs/086: the tunnel-failure decision when the IMS agent's tunnel signal and
+/// the supervisor's CHILD_SA signal are folded into one. The effective streak
+/// starts at the older of the two unhealthy timers, so either signal alone
+/// alerts and an outage seen by both alerts once; it ends only when both are
+/// healthy again. `generation` freezes the effective streak start when a
+/// `Failure` is decided, for `record_alert_outcome`'s staleness check.
+fn decide_folded_tunnel(
+    ims_since: Option<Instant>,
+    supervisor_since: Option<Instant>,
+    phase: &mut AlertPhase,
+    generation: &mut Option<Instant>,
+    threshold: Duration,
+) -> Transition {
+    let effective = match (ims_since, supervisor_since) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    let t = decide_transition(effective, phase, threshold);
+    if matches!(t, Transition::Event(CriticalEventKind::Failure)) {
+        *generation = effective;
+    }
+    t
+}
+
 enum Transition {
     None,
     Suppressed,
     Event(CriticalEventKind),
+}
+
+/// Names the line in a tunnel-failure alert. `Ims` and `Supervisor` both speak
+/// for the same VoWiFi line; every other kind keeps its own name.
+fn tunnel_alert_subject(kind: AgentKind) -> &'static str {
+    match kind {
+        AgentKind::Ims | AgentKind::Supervisor => "VoWiFi",
+        other => other.as_str(),
+    }
 }
 
 /// Builds the event, dispatches it, and — for `Failure` events only — feeds
@@ -346,13 +452,19 @@ fn dispatch_transition(
         (AlertCategory::RegistrationLoss, CriticalEventKind::Recovered) => {
             format!("{} line re-registered", key.0.as_str())
         }
+        // The supervisor and the IMS agent share one folded alert (specs/086),
+        // so both read as the VoWiFi line rather than naming whichever kind
+        // happened to own the decision.
         (AlertCategory::TunnelFailure, CriticalEventKind::Failure) => format!(
             "{} line's tunnel non-established for over {}s",
-            key.0.as_str(),
+            tunnel_alert_subject(key.0),
             cfg.tunnel_failure_thresholds.unhealthy_sec
         ),
         (AlertCategory::TunnelFailure, CriticalEventKind::Recovered) => {
-            format!("{} line's tunnel re-established", key.0.as_str())
+            format!(
+                "{} line's tunnel re-established",
+                tunnel_alert_subject(key.0)
+            )
         }
         (AlertCategory::GmConnectionLost, CriticalEventKind::Failure) => format!(
             "{} line's carrier signaling connection down for over {}s",
@@ -420,7 +532,11 @@ fn record_alert_outcome(
         ),
         AlertCategory::TunnelFailure => (
             &mut record.tunnel_alert_phase,
-            record.tunnel_unhealthy_since,
+            // A folded decision carries its own frozen generation; records that
+            // never had one fall back to their own streak start.
+            record
+                .tunnel_alert_generation
+                .or(record.tunnel_unhealthy_since),
         ),
         AlertCategory::GmConnectionLost => (
             &mut record.gm_connection_alert_phase,
@@ -1227,6 +1343,7 @@ mod tests {
                 registered_alert_phase: AlertPhase::Pending,
                 tunnel_unhealthy_since: None,
                 tunnel_alert_phase: AlertPhase::Idle,
+                tunnel_alert_generation: None,
                 gm_connection_unhealthy_since: None,
                 gm_connection_alert_phase: AlertPhase::Idle,
                 registration_expires_at: None,
@@ -1345,5 +1462,116 @@ mod tests {
         assert!(liveness().lock().unwrap()[&key]
             .tunnel_unhealthy_since
             .is_none());
+    }
+
+    fn ago(secs: u64) -> Option<Instant> {
+        Some(Instant::now() - Duration::from_secs(secs))
+    }
+
+    const FOLD_THRESHOLD: Duration = Duration::from_secs(300);
+
+    fn fold(
+        ims: Option<Instant>,
+        sup: Option<Instant>,
+        phase: &mut AlertPhase,
+    ) -> (Transition, Option<Instant>) {
+        let mut generation = None;
+        let t = decide_folded_tunnel(ims, sup, phase, &mut generation, FOLD_THRESHOLD);
+        (t, generation)
+    }
+
+    #[test]
+    fn a_missing_child_sa_alone_alerts_once() {
+        let mut phase = AlertPhase::Idle;
+        let (t, generation) = fold(None, ago(400), &mut phase);
+        assert!(matches!(t, Transition::Event(CriticalEventKind::Failure)));
+        assert!(generation.is_some());
+        assert_eq!(phase, AlertPhase::Pending);
+    }
+
+    #[test]
+    fn a_dead_ims_tunnel_alone_alerts_once() {
+        let mut phase = AlertPhase::Idle;
+        let (t, _) = fold(ago(400), None, &mut phase);
+        assert!(matches!(t, Transition::Event(CriticalEventKind::Failure)));
+    }
+
+    #[test]
+    fn both_signals_unhealthy_alert_exactly_once() {
+        let mut phase = AlertPhase::Idle;
+        let ims = ago(400);
+        let sup = ago(500);
+        let (t, generation) = fold(ims, sup, &mut phase);
+        assert!(matches!(t, Transition::Event(CriticalEventKind::Failure)));
+        assert_eq!(generation, sup, "the older streak start is the generation");
+        // Further reports from either side, same outage: nothing more.
+        let (t2, _) = fold(ims, sup, &mut phase);
+        assert!(matches!(t2, Transition::None));
+        phase = AlertPhase::Alerted;
+        let (t3, _) = fold(ims, sup, &mut phase);
+        assert!(matches!(t3, Transition::Suppressed));
+    }
+
+    #[test]
+    fn recovery_waits_for_both_signals_then_fires_once() {
+        let mut phase = AlertPhase::Alerted;
+        // One recovered, the other still down: no Recovered.
+        let (t, _) = fold(None, ago(900), &mut phase);
+        assert!(!matches!(t, Transition::Event(_)));
+        assert_eq!(phase, AlertPhase::Alerted);
+        // Both healthy: exactly one Recovered.
+        let (t, _) = fold(None, None, &mut phase);
+        assert!(matches!(t, Transition::Event(CriticalEventKind::Recovered)));
+        let (t, _) = fold(None, None, &mut phase);
+        assert!(matches!(t, Transition::None));
+    }
+
+    #[test]
+    fn a_folded_failure_resolves_against_the_supervisors_frozen_generation() {
+        let m = "test-fold-outcome";
+        let key = (AgentKind::Supervisor, m.to_string());
+        let generation = Instant::now();
+        {
+            let mut guard = liveness().lock().unwrap();
+            guard.insert(
+                key.clone(),
+                AgentRecord {
+                    last_report: Instant::now(),
+                    last_applied: (0, 0),
+                    registered_unhealthy_since: None,
+                    registered_alert_phase: AlertPhase::Idle,
+                    // The streak start has since moved on; the frozen generation must win.
+                    tunnel_unhealthy_since: Some(Instant::now()),
+                    tunnel_alert_phase: AlertPhase::Pending,
+                    tunnel_alert_generation: Some(generation),
+                    gm_connection_unhealthy_since: None,
+                    gm_connection_alert_phase: AlertPhase::Idle,
+                    registration_expires_at: None,
+                },
+            );
+        }
+        // A stale generation is a no-op.
+        record_alert_outcome(
+            &key,
+            AlertCategory::TunnelFailure,
+            generation - Duration::from_secs(1),
+            true,
+        );
+        assert_eq!(
+            liveness().lock().unwrap()[&key].tunnel_alert_phase,
+            AlertPhase::Pending
+        );
+        record_alert_outcome(&key, AlertCategory::TunnelFailure, generation, true);
+        assert_eq!(
+            liveness().lock().unwrap()[&key].tunnel_alert_phase,
+            AlertPhase::Alerted
+        );
+    }
+
+    #[test]
+    fn tunnel_alert_text_names_the_vowifi_line_for_both_kinds_only() {
+        assert_eq!(tunnel_alert_subject(AgentKind::Ims), "VoWiFi");
+        assert_eq!(tunnel_alert_subject(AgentKind::Supervisor), "VoWiFi");
+        assert_eq!(tunnel_alert_subject(AgentKind::Volte), "volte");
     }
 }
