@@ -69,22 +69,36 @@ pub(crate) fn next_call_token() -> usize {
 /// once it has, where `status` is `None` when PJSIP gave no final status.
 #[cfg_attr(not(feature = "pjsip-linked"), allow(dead_code))]
 pub(crate) fn disconnect_status(token: usize) -> Option<Option<u16>> {
-    DISCONNECT_STATUS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
+    status_in(
+        &DISCONNECT_STATUS.lock().unwrap_or_else(|e| e.into_inner()),
+        token,
+    )
+}
+
+#[cfg_attr(not(feature = "pjsip-linked"), allow(dead_code))]
+fn record_disconnect_status(token: usize, code: Option<u16>) {
+    record_in(
+        &mut DISCONNECT_STATUS.lock().unwrap_or_else(|e| e.into_inner()),
+        token,
+        code,
+    );
+}
+
+/// [`disconnect_status`] over an explicit log, so tests can run on a log of
+/// their own instead of sharing the process-wide one.
+fn status_in(log: &DisconnectLog, token: usize) -> Option<Option<u16>> {
+    log.iter()
         .rev()
         .find(|(t, _)| *t == token)
         .map(|(_, code)| *code)
 }
 
-#[cfg_attr(not(feature = "pjsip-linked"), allow(dead_code))]
-fn record_disconnect_status(token: usize, code: Option<u16>) {
-    let mut statuses = DISCONNECT_STATUS.lock().unwrap_or_else(|e| e.into_inner());
-    if statuses.len() >= DISCONNECT_STATUS_CAPACITY {
-        statuses.pop_front();
+/// [`record_disconnect_status`] over an explicit log.
+fn record_in(log: &mut DisconnectLog, token: usize, code: Option<u16>) {
+    if log.len() >= DISCONNECT_STATUS_CAPACITY {
+        log.pop_front();
     }
-    statuses.push_back((token, code));
+    log.push_back((token, code));
 }
 
 /// Calls PJSIP has notified us of via `on_incoming_call` that no Rust-side
@@ -1137,30 +1151,29 @@ mod disconnect_trigger_tests {
 
 #[cfg(test)]
 mod disconnect_status_tests {
-    use super::{
-        disconnect_status, next_call_token, record_disconnect_status, DISCONNECT_STATUS_CAPACITY,
-    };
+    use super::{next_call_token, record_in, status_in, DisconnectLog, DISCONNECT_STATUS_CAPACITY};
 
     /// Two calls that held the same PJSUA call id one after the other keep
     /// separate statuses: the second call's disconnect neither erases nor
     /// replaces the first's rejection (PR #110 review).
     #[test]
     fn a_reused_call_id_keeps_each_calls_status_and_the_store_is_bounded() {
+        let mut log = DisconnectLog::new();
         let rejected = next_call_token();
         let reused = next_call_token();
         assert_ne!(rejected, 0);
         assert_ne!(rejected, reused);
-        assert_eq!(disconnect_status(rejected), None);
+        assert_eq!(status_in(&log, rejected), None);
 
-        record_disconnect_status(rejected, Some(603));
-        record_disconnect_status(reused, Some(408));
-        assert_eq!(disconnect_status(rejected), Some(Some(603)));
-        assert_eq!(disconnect_status(reused), Some(Some(408)));
+        record_in(&mut log, rejected, Some(603));
+        record_in(&mut log, reused, Some(408));
+        assert_eq!(status_in(&log, rejected), Some(Some(603)));
+        assert_eq!(status_in(&log, reused), Some(Some(408)));
 
         for _ in 0..DISCONNECT_STATUS_CAPACITY {
-            record_disconnect_status(next_call_token(), Some(486));
+            record_in(&mut log, next_call_token(), Some(486));
         }
-        assert_eq!(disconnect_status(rejected), None);
+        assert_eq!(status_in(&log, rejected), None);
     }
 
     /// A disconnect PJSIP gave no status for is still recorded, and is told
@@ -1168,9 +1181,10 @@ mod disconnect_status_tests {
     /// that difference.
     #[test]
     fn a_statusless_disconnect_is_recorded_and_distinct_from_none_yet() {
+        let mut log = DisconnectLog::new();
         let token = next_call_token();
-        assert_eq!(disconnect_status(token), None);
-        record_disconnect_status(token, None);
-        assert_eq!(disconnect_status(token), Some(None));
+        assert_eq!(status_in(&log, token), None);
+        record_in(&mut log, token, None);
+        assert_eq!(status_in(&log, token), Some(None));
     }
 }
