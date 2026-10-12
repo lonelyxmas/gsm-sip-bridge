@@ -117,6 +117,11 @@ fn pick_stable_pcscf(batch: &[String]) -> Option<String> {
     v4.or_else(|| batch.iter().min()).cloned()
 }
 
+/// Outer bound on a steady-state IKE_SA teardown. #107's teardown waited 52s on
+/// an exchange the ePDG would never answer; `shutdown.rs`'s
+/// `TERMINATE_TIMEOUT_SECS` is the precedent for bounding it.
+const STEADY_TERMINATE_TIMEOUT_SECS: u32 = 10;
+
 /// CHILD_SA states that still carry (or are about to carry) traffic. A rekey
 /// briefly shows the old SA as `REKEYED` beside the new `INSTALLED` one, and
 /// `REKEYING`/`UPDATING` are the same SA mid-exchange, so none of them may read
@@ -338,16 +343,6 @@ impl StrongswanEngine {
         self.shared.env_prefix()
     }
 
-    /// Blocking `swanctl` invocation — matches the bash calls with no
-    /// trailing `&` (`--load-all`, `--terminate`), which the original script
-    /// runs to completion before continuing.
-    fn swanctl(&self, runner: &dyn CommandRunner, args: &[&str]) {
-        let env = self.env_prefix();
-        let mut argv = vec!["env", env.as_str(), "swanctl"];
-        argv.extend_from_slice(args);
-        let _ = runner.run(&argv);
-    }
-
     /// Backgrounded `swanctl` invocation — matches the bash calls that end
     /// in `&` (every `--initiate`). Fire-and-forget: like the bash version,
     /// the spawned process's handle is never tracked or waited on (the
@@ -401,7 +396,23 @@ impl TunnelEngine for StrongswanEngine {
     }
 
     fn terminate(&self, runner: &dyn CommandRunner) {
-        self.swanctl(runner, &["--terminate", "--ike", &self.conn_name]);
+        // `--force` makes charon delete the IKE_SA without waiting on a pending
+        // exchange: without it #107 spent 52s on a stuck CREATE_CHILD_SA. Not
+        // swanctl's own `--timeout`, which disables `--force`'s no-wait
+        // behaviour; the outer `timeout` bounds it instead.
+        let env = self.env_prefix();
+        let secs = STEADY_TERMINATE_TIMEOUT_SECS.to_string();
+        let _ = runner.run(&[
+            "timeout",
+            &secs,
+            "env",
+            &env,
+            "swanctl",
+            "--terminate",
+            "--ike",
+            &self.conn_name,
+            "--force",
+        ]);
     }
 
     fn reinitiate(&self, runner: &dyn CommandRunner) {
@@ -973,6 +984,28 @@ mod tests {
                 !calls.iter().any(|c| c.contains(&"ims".to_string())),
                 "the bare `ims` name would terminate every line's IKE_SA at once"
             );
+        }
+
+        #[test]
+        fn terminate_is_forced_and_bounded() {
+            let runner = MockCommandRunner::new();
+            strongswan_engine().terminate(&runner);
+            let calls = runner.run_calls.lock().unwrap();
+            let want: Vec<String> = [
+                "timeout",
+                "10",
+                "env",
+                "STRONGSWAN_CONF=/etc/strongswan-shared.conf",
+                "swanctl",
+                "--terminate",
+                "--ike",
+                "ims0",
+                "--force",
+            ]
+            .map(String::from)
+            .to_vec();
+            assert_eq!(calls.iter().filter(|c| **c == want).count(), 1);
+            assert!(!calls.iter().any(|c| c.contains(&"--timeout".to_string())));
         }
 
         #[test]

@@ -87,8 +87,8 @@ description: "Task list for specs/086-epdg-child-sa-recovery"
 
 **Independent test**: the argv test below. Live, the recovery log shows the teardown returning within seconds.
 
-- [ ] T011 [US2] Test first in `gsm-sip-bridge/src/supervise/engines.rs`: extend `terminate_is_scoped_to_this_lines_connection` (~line 879), or add a sibling test, asserting that exactly one `run` call has argv starting `["timeout", "10", "env", "STRONGSWAN_CONF=…", "swanctl", "--terminate", "--ike", "ims0", "--force"]` and does **not** contain `--timeout` (swanctl's own `--timeout` disables `--force`'s no-wait behaviour, research R3). Keep the existing "not bare `ims`" assertion
-- [ ] T012 [US2] Implement in `gsm-sip-bridge/src/supervise/engines.rs`:
+- [X] T011 [US2] Test first in `gsm-sip-bridge/src/supervise/engines.rs`: extend `terminate_is_scoped_to_this_lines_connection` (~line 879), or add a sibling test, asserting that exactly one `run` call has argv starting `["timeout", "10", "env", "STRONGSWAN_CONF=…", "swanctl", "--terminate", "--ike", "ims0", "--force"]` and does **not** contain `--timeout` (swanctl's own `--timeout` disables `--force`'s no-wait behaviour, research R3). Keep the existing "not bare `ims`" assertion
+- [X] T012 [US2] Implement in `gsm-sip-bridge/src/supervise/engines.rs`:
   - add `const STEADY_TERMINATE_TIMEOUT_SECS: u32 = 10;` with a doc comment citing #107's 52s wait and pointing at `shutdown.rs`'s `TERMINATE_TIMEOUT_SECS` as the precedent;
   - rewrite `StrongswanEngine::terminate` to build the argv above through `runner.run` (inline, like `shutdown.rs`'s `TerminateIke` step), with a comment on why `--force` and not swanctl's `--timeout`;
   - update the `TunnelEngine::terminate` doc in `line_supervisor.rs` to say it is non-waiting and bounded.
