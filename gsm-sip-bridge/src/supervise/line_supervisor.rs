@@ -42,6 +42,11 @@ pub enum DegradeReason {
     /// it exists: see the TunVanished branch of [`tick_steady_state`].
     TunUnavailable,
     ChildSaMissing,
+    /// The CHILD_SA stayed missing across consecutive ticks even though it was
+    /// re-initiated (#107): the ePDG ignored CREATE_CHILD_SA inside the
+    /// surviving IKE_SA, and only a fresh IKE_SA recovers. The agent must
+    /// re-register because the new IKE_SA brings a new VIP/P-CSCF pool.
+    ChildSaStuck,
     PcscfChanged,
     /// The P-CSCF became unreachable from inside this line's namespace for
     /// several consecutive ticks, while every structural check still passed
@@ -303,6 +308,11 @@ pub struct SteadyTracking {
     pub child_sa_usable: bool,
 }
 
+/// Consecutive missing-CHILD_SA ticks before the IKE_SA is rebuilt. Tick-based
+/// on purpose: only the strongswan engine, polled every 30s, ever reports
+/// `ChildSaMissing`, so 2 is about 60s. No backoff between repeated rebuilds.
+pub const CHILD_SA_MISSING_STRIKES: u32 = 2;
+
 /// Advances the steady-state state machine by one tick. 1:1 port of both
 /// engines' steady-state supervisor loop bodies (see module docs) — the
 /// order of checks matches the bash exactly: process-alive first, then
@@ -322,7 +332,11 @@ pub fn tick_steady_state(
         };
     }
 
-    match engine.steady_state_health(runner) {
+    let health = engine.steady_state_health(runner);
+    if health != SteadyStateHealth::ChildSaMissing {
+        tracking.child_sa_missing = 0;
+    }
+    match health {
         SteadyStateHealth::ViciBroken => {
             engine.restart_process(runner);
             return SteadyOutcome::Recovered {
@@ -368,9 +382,18 @@ pub fn tick_steady_state(
             };
         }
         SteadyStateHealth::ChildSaMissing => {
-            // Re-initiate only — the original script does NOT restart this
-            // line's vowifi-ims-agent for this branch alone, unlike the
-            // other three recovery paths.
+            tracking.child_sa_missing += 1;
+            if tracking.child_sa_missing >= CHILD_SA_MISSING_STRIKES {
+                // Re-initiating inside the surviving IKE_SA did not bring the
+                // CHILD_SA back; only a fresh IKE_SA will.
+                tracking.child_sa_missing = 0;
+                engine.terminate(runner);
+                engine.reinitiate(runner);
+                return SteadyOutcome::Recovered {
+                    reason: DegradeReason::ChildSaStuck,
+                };
+            }
+            // First miss: re-initiate only, without restarting the agent.
             engine.reinitiate(runner);
             return SteadyOutcome::Recovered {
                 reason: DegradeReason::ChildSaMissing,
@@ -1121,6 +1144,116 @@ mod tests {
         assert_eq!(*engine.restart_calls.borrow(), 0);
     }
 
+    fn child_sa_tick(
+        engine: &FakeEngine,
+        runner: &MockCommandRunner,
+        tracking: &mut SteadyTracking,
+    ) -> SteadyOutcome {
+        tick_steady_state(engine, runner, "10.0.0.1", tracking)
+    }
+
+    #[test]
+    fn a_second_consecutive_missing_child_sa_rebuilds_the_ike_sa() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            health: RefCell::new(SteadyStateHealth::ChildSaMissing),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        assert_eq!(
+            child_sa_tick(&engine, &runner, &mut tracking),
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::ChildSaMissing
+            }
+        );
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+        assert_eq!(
+            child_sa_tick(&engine, &runner, &mut tracking),
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::ChildSaStuck
+            }
+        );
+        assert_eq!(*engine.terminate_calls.borrow(), 1);
+        assert_eq!(*engine.reinitiate_calls.borrow(), 2);
+        assert_eq!(tracking.child_sa_missing, 0);
+    }
+
+    #[test]
+    fn a_healthy_tick_between_misses_prevents_escalation() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            health: RefCell::new(SteadyStateHealth::ChildSaMissing),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        child_sa_tick(&engine, &runner, &mut tracking);
+        *engine.health.borrow_mut() = SteadyStateHealth::Ok;
+        child_sa_tick(&engine, &runner, &mut tracking);
+        *engine.health.borrow_mut() = SteadyStateHealth::ChildSaMissing;
+        assert_eq!(
+            child_sa_tick(&engine, &runner, &mut tracking),
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::ChildSaMissing
+            }
+        );
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn repeated_child_sa_loss_alternates_with_no_backoff() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            health: RefCell::new(SteadyStateHealth::ChildSaMissing),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        let reasons: Vec<_> = (0..4)
+            .map(|_| match child_sa_tick(&engine, &runner, &mut tracking) {
+                SteadyOutcome::Recovered { reason } => reason,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                DegradeReason::ChildSaMissing,
+                DegradeReason::ChildSaStuck,
+                DegradeReason::ChildSaMissing,
+                DegradeReason::ChildSaStuck
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_child_sa_never_reaches_the_route_repair() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            health: RefCell::new(SteadyStateHealth::ChildSaMissing),
+            pcscf_reachable: RefCell::new(false),
+            route_missing: RefCell::new(true),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        child_sa_tick(&engine, &runner, &mut tracking);
+        child_sa_tick(&engine, &runner, &mut tracking);
+        assert_eq!(*engine.route_repairs.borrow(), 0);
+    }
+
+    #[test]
+    fn a_vanished_tun_resets_the_child_sa_miss_count() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            health: RefCell::new(SteadyStateHealth::ChildSaMissing),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        child_sa_tick(&engine, &runner, &mut tracking);
+        assert_eq!(tracking.child_sa_missing, 1);
+        *engine.health.borrow_mut() = SteadyStateHealth::TunVanished;
+        child_sa_tick(&engine, &runner, &mut tracking);
+        assert_eq!(tracking.child_sa_missing, 0);
+    }
+
     #[test]
     fn steady_state_pcscf_change_is_reported_without_any_recovery_action() {
         let runner = MockCommandRunner::new();
@@ -1166,6 +1299,7 @@ mod tests {
             DegradeReason::ViciBroken,
             DegradeReason::TunVanished,
             DegradeReason::PcscfChanged,
+            DegradeReason::ChildSaStuck,
         ] {
             assert!(
                 recovery_restarts_agent(reason),
@@ -1185,12 +1319,16 @@ mod tests {
             DegradeReason::PcscfChanged,
             DegradeReason::PcscfUnreachable,
             DegradeReason::DefaultRouteMissing,
+            DegradeReason::ChildSaStuck,
         ] {
             match reason {
                 DegradeReason::ProcessDied
                 | DegradeReason::ViciBroken
                 | DegradeReason::TunVanished
                 | DegradeReason::PcscfChanged
+                // A fresh IKE_SA brings a new VIP/P-CSCF pool, so the agent
+                // must re-register.
+                | DegradeReason::ChildSaStuck
                 // A rebuilt tunnel means a new data path, which the agent has
                 // to re-register over -- so it must be restarted.
                 | DegradeReason::PcscfUnreachable
