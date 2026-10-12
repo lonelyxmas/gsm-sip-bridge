@@ -116,7 +116,12 @@ the tag it is given. Phase 3's tests already cover the decline paths.
 - [X] T024 [P] Add `pbx_failed` to the documented reason set in specs/014-vowifi-metrics-restore/contracts/observability-protocol.md, noting that it was added by specs/084.
 - [X] T025 [P] Add an Unreleased entry to CHANGELOG.md and RELEASE_NOTES.md (under `## Unreleased`, renamed at release time), following repo style: bold summary, plain description.
 - [X] T026 Run `make format && make lint && make test` on the whole workspace and confirm they are clean.
-- [ ] T027 Live release gate (FR-011, quickstart.md). Run on the Vodafone rig and the Jio Pi. This is manual, so record the results in the PR.
+- [X] T027 Live release gate (FR-011, quickstart.md). Run on the Vodafone rig and the Jio Pi. This is manual, so record the results in the PR.
+  - Done 2026-10-12 on `df509b8`, both rigs on VoWiFi; results are in PR #110.
+  - Reject: `603` → `486` with the `180`'s To-tag, including an instant reject. The first run caught a status-capture race, fixed in `df509b8`.
+  - Setup failure → `480`.
+  - The Jio PBX rejects with `403`, which stays `480` by decision.
+  - Both networks cancel an unanswered call at 30 s (`Q.850;cause=19`), before the bridge's 45 s timer, so the no-answer `480` is covered by unit tests only.
 
 ## Dependencies
 
