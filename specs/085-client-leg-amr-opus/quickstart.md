@@ -47,18 +47,30 @@ For each step, check two-way audio for at least 5 minutes, check the phone-leg c
 
 Place one GSM call with an unchanged config. The negotiated codec is the same as on the release before this branch.
 
+## Automated / container checks
+
+Run on the Vodafone rig (host network) against `gsm-sip-bridge:amr-opus-local`, 2026-10-12, with a Debian baresip (amr, opus, g722 modules) in Docker as the phone:
+
+- Default config, startup log: `G722=200, speex 130/129, iLBC/GSM/PCMU/PCMA/speex32k=128, AMR-WB=4, AMR=3, opus=2, L16=1`. The existing codecs keep today's order; the new ones sit below them.
+- `codecs = ["AMR-WB","G722","PCMU"]`, startup log: `AMR-WB=200, G722=199, PCMU=198, L16=1`; nothing else enabled.
+- Captured inbound INVITE to the phone with that setting: `m=audio ... 96 9 0 97 120 121` = AMR-WB, G722, PCMU, L16 (internal), telephone-event. No speex, iLBC, GSM or opus. The AMR-WB line carries **no fmtp** (bandwidth-efficient).
+
+## Findings
+
+- **Inbound AMR to an octet-align-only phone does not work.** baresip's AMR module logs `amr: octet-align mode is required` and answers G722 instead. The bridge's PJSIP offers bandwidth-efficient AMR, so a phone that supports only octet-aligned AMR falls back (FR-005 held: the call connected on G722). Outbound from the same phone works because PJSIP adopts the phone's `octet-align=1`. See the open question in the PR.
+
 ## Results
 
 | Check | VoWiFi | VoLTE | Notes |
 |-------|--------|-------|-------|
-| 1.2 default → G722 | | | |
+| 1.2 default → G722 | PASS (phone_codec=G722) | not run | siptest as phone |
 | 1.3 phone prefers AMR-WB → AMR-WB | | | |
-| 2.1–2.3 AMR-WB in/out | | | |
-| 2.4 bitrate | | | |
+| 2.1–2.3 AMR-WB in/out | out: PASS; in: G722 fallback | not run | outbound = AMR-WB both ways; inbound blocked by octet-align (see Findings) |
+| 2.4 bitrate | PASS | not run | bridge→phone RTP 46 B/20 ms (34 B AMR-WB octet-aligned) = 13.6 kbit/s payload vs 64 for G.722 (21%) |
 | 2.5 DTMF | | | |
 | 2.6 hold/resume | | | |
 | 3.1–3.3 packing / mode-set | | | |
 | 4.1 AMR-NB | | | |
 | 4.2 Opus | | | |
-| 5.1–5.3 negatives | | | |
+| 5.1–5.3 negatives | 5.3 PASS | not run | siptest (no AMR) + codecs=[AMR-WB,G722,PCMU] connected on G722; 5.1/5.2 covered by unit tests |
 | 6 GSM unchanged | | n/a | |
