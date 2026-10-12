@@ -65,12 +65,12 @@ Run on the Vodafone rig (host network) against `gsm-sip-bridge:amr-opus-local`, 
 |-------|--------|-------|-------|
 | 1.2 default → G722 | PASS (phone_codec=G722) | not run | siptest as phone |
 | 1.3 phone prefers AMR-WB → AMR-WB | | | |
-| 2.1–2.3 AMR-WB in/out | out: PASS; in: G722 fallback | not run | outbound = AMR-WB both ways; inbound blocked by octet-align (see Findings) |
+| 2.1–2.3 AMR-WB in/out | PASS (in + out) | not run | octet-aligned offer (`[sip].amr_octet_align` default); inbound with `codecs=[AMR-WB,G722,PCMU]` |
 | 2.4 bitrate | PASS | not run | bridge→phone RTP 46 B/20 ms (34 B AMR-WB octet-aligned) = 13.6 kbit/s payload vs 64 for G.722 (21%) |
-| 2.5 DTMF | | | |
-| 2.6 hold/resume | | | |
-| 3.1–3.3 packing / mode-set | | | |
-| 4.1 AMR-NB | | | |
-| 4.2 Opus | | | |
+| 2.5 DTMF | sent, receipt unverified | not run | baresip sent digits 1-5; bridge logs nothing for DTMF and the carrier side is not observable from the rig |
+| 2.6 hold/resume | PARTIAL | not run | baresip stats: audio 0 bit/s on hold, full rate after resume; baresip returned 'Invalid argument' to the resume command |
+| 3.1–3.3 packing / mode-set | 3.1 PASS | not run | octet-align=1 negotiated with baresip; bandwidth-efficient and mode-set not tested (baresip cannot) |
+| 4.1 AMR-NB | PASS (in + out) | not run | `codecs=[AMR-NB,PCMU]`, phone leg `AMR` 8 kHz |
+| 4.2 Opus | PASS (in + out) | not run | `codecs=[OPUS,PCMU]`, phone leg `opus` 48 kHz stereo-flagged |
 | 5.1–5.3 negatives | 5.3 PASS | not run | siptest (no AMR) + codecs=[AMR-WB,G722,PCMU] connected on G722; 5.1/5.2 covered by unit tests |
-| 6 GSM unchanged | | n/a | |
+| 6 GSM unchanged | not run | n/a | `[cs]` is disabled on this rig; only unit-tested |

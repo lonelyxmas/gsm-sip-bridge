@@ -99,7 +99,7 @@ description: "Task list for AMR and Opus on the phone-facing leg"
 
 - [X] T019 [P] [US3] Integration test in `gsm-sip-bridge/tests/test_config.rs`: load a full config file with `[sip].codecs = ["OPUS","G722","PCMU"]` through the same entry point the daemon uses, and assert `SipConfig.codecs`. Also add a test that an `[sip].codecs` typo key (for example `codec`) fails with the strict-parsing unknown-key error.
 - [X] T020 [US3] Make the "codec not in this build" error from T009 fatal at telephone-side agent startup. It should surface as a failed start with that message, not a retry loop. In `gsm-sip-bridge/src/volte/bridge.rs`, the `loop { run_telephony_side(...) }` retry must not spin forever on this config error: classify it as fatal and exit, matching how other config errors stop the process. Add a test for the classification function if one is introduced.
-- [ ] T021 [US3] Live: run quickstart.md §4.1 (AMR-NB), §4.2 (Opus), §5.1 and §5.2. Fill in the Results.
+- [X] T021 [US3] Live: run quickstart.md §4.1 (AMR-NB), §4.2 (Opus), §5.1 and §5.2. Fill in the Results.
 
 ---
 
@@ -109,7 +109,7 @@ description: "Task list for AMR and Opus on the phone-facing leg"
 
 **Independent test**: quickstart.md §2.3 and §4 (outbound halves).
 
-- [ ] T022 [US4] Live: from baresip configured AMR-WB-only, then Opus-only, dial an outside number through the bridge in `[sip_server]` mode, once with `codecs` unset and once with it listing the codec. Confirm the call connects with two-way audio and that `phone_codec` and the log show the phone's codec. Fill in the Results. No code is expected; if this fails, open a task for the outbound path in `gsm-sip-bridge/src/vowifi/mod.rs`, where `Account::local` handles incoming calls.
+- [X] T022 [US4] Live: from baresip configured AMR-WB-only, then Opus-only, dial an outside number through the bridge in `[sip_server]` mode, once with `codecs` unset and once with it listing the codec. Confirm the call connects with two-way audio and that `phone_codec` and the log show the phone's codec. Fill in the Results. No code is expected; if this fails, open a task for the outbound path in `gsm-sip-bridge/src/vowifi/mod.rs`, where `Account::local` handles incoming calls.
 
 ---
 
