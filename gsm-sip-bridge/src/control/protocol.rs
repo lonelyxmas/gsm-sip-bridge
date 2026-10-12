@@ -40,7 +40,7 @@ pub enum ControlCmd {
 /// Which VoWiFi agent sent an `AgentReport`. Liveness (`AGENT_UP`) is
 /// tracked per kind, independently of `module_id` — a card can be replaced
 /// or fail to resolve, but the agent process identity is always one of
-/// these two.
+/// these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentKind {
@@ -66,6 +66,9 @@ pub enum AgentKind {
     /// would let each erase the record the other needs to detect a replay,
     /// re-applying already-counted events. See `metrics::ingest::liveness`.
     VolteSip,
+    /// The `supervise` process, reporting per-line tunnel state it alone can
+    /// observe (specs/086). Reports only `child_sa_up`.
+    Supervisor,
 }
 
 impl AgentKind {
@@ -75,6 +78,7 @@ impl AgentKind {
             AgentKind::Sip => "sip",
             AgentKind::Volte => "volte",
             AgentKind::VolteSip => "volte_sip",
+            AgentKind::Supervisor => "supervisor",
         }
     }
 }
@@ -156,6 +160,11 @@ pub struct AgentState {
     /// gauge untouched rather than reading absent as expired.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub registration_expires_at: Option<u64>,
+    /// specs/086: whether the supervisor's last health check confirmed a usable
+    /// CHILD_SA for this line. `None` means not reported (every non-supervisor
+    /// agent); the ingest side leaves the gauge untouched.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub child_sa_up: Option<bool>,
 }
 
 /// A counter delta or histogram observation. Every enumerated field below is
@@ -425,6 +434,37 @@ impl Serialize for ControlResp {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn supervisor_report_round_trips_child_sa_up() {
+        let report = AgentReport {
+            agent: AgentKind::Supervisor,
+            module_id: "m".into(),
+            epoch: 1,
+            seq: 1,
+            state: AgentState {
+                child_sa_up: Some(false),
+                ..Default::default()
+            },
+            events: vec![],
+            dropped: 0,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"agent\":\"supervisor\""));
+        assert!(json.contains("\"child_sa_up\":false"));
+        let back: AgentReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.agent, AgentKind::Supervisor);
+        assert_eq!(back.state.child_sa_up, Some(false));
+    }
+
+    #[test]
+    fn child_sa_up_is_optional_on_the_wire() {
+        let state: AgentState = serde_json::from_str("{}").unwrap();
+        assert_eq!(state.child_sa_up, None);
+        assert!(!serde_json::to_string(&state)
+            .unwrap()
+            .contains("child_sa_up"));
+    }
+
     use super::*;
     use std::io::Cursor;
 

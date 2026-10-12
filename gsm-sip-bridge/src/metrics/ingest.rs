@@ -83,7 +83,8 @@ const TRANSPORT_VOLTE: &str = "volte";
 fn transport_label(agent: AgentKind) -> &'static str {
     match agent {
         AgentKind::Volte | AgentKind::VolteSip => TRANSPORT_VOLTE,
-        AgentKind::Ims | AgentKind::Sip => TRANSPORT_VOWIFI,
+        // The supervisor never reports calls; vowifi is its only path.
+        AgentKind::Ims | AgentKind::Sip | AgentKind::Supervisor => TRANSPORT_VOWIFI,
     }
 }
 
@@ -470,7 +471,7 @@ fn apply_state(
             // — the IMS registration belongs to the `Volte` carrier half — so
             // this arm is unreachable and must not touch a gauge it does not
             // own.
-            AgentKind::VolteSip => {}
+            AgentKind::VolteSip | AgentKind::Supervisor => {}
         }
         // specs/022-discord-critical-alerts: a sustained unhealthy streak,
         // not a raw snapshot — cleared here on every healthy report, but
@@ -493,9 +494,22 @@ fn apply_state(
                 .set(up),
             // The telephony half has no tunnel/PDN of its own; unreachable,
             // same as `registered` above.
-            AgentKind::VolteSip => {}
+            AgentKind::VolteSip | AgentKind::Supervisor => {}
         }
         if tunnel_up {
+            *tunnel_unhealthy_since = None;
+        } else if tunnel_unhealthy_since.is_none() {
+            *tunnel_unhealthy_since = Some(Instant::now());
+        }
+    }
+    // specs/086: the supervisor's CHILD_SA signal. It drives the supervisor
+    // record's own unhealthy timer, which `apply_report` folds with the IMS
+    // agent's tunnel timer so one outage alerts once.
+    if let (AgentKind::Supervisor, Some(child_sa_up)) = (agent, state.child_sa_up) {
+        metrics::VOWIFI_CHILD_SA_UP
+            .with_label_values(&[module_id])
+            .set(if child_sa_up { 1.0 } else { 0.0 });
+        if child_sa_up {
             *tunnel_unhealthy_since = None;
         } else if tunnel_unhealthy_since.is_none() {
             *tunnel_unhealthy_since = Some(Instant::now());
@@ -515,7 +529,7 @@ fn apply_state(
                 .with_label_values(&[module_id])
                 .set(up),
             // The telephony half carries no Gm connection of its own.
-            AgentKind::VolteSip => {}
+            AgentKind::VolteSip | AgentKind::Supervisor => {}
         }
         if gm_connection_up {
             *gm_connection_unhealthy_since = None;
@@ -1270,5 +1284,66 @@ mod tests {
             record.tunnel_unhealthy_since.is_some(),
             "tunnel_up=false must be tracked independently"
         );
+    }
+
+    fn child_sa_report(agent: AgentKind, module_id: &str, seq: u64, up: Option<bool>) {
+        apply_report(&AgentReport {
+            agent,
+            module_id: module_id.to_string(),
+            epoch: 1,
+            seq,
+            state: AgentState {
+                child_sa_up: up,
+                ..AgentState::default()
+            },
+            events: vec![],
+            dropped: 0,
+        });
+    }
+
+    #[test]
+    fn supervisor_child_sa_up_drives_the_gauge() {
+        let m = "test-child-sa-gauge";
+        child_sa_report(AgentKind::Supervisor, m, 1, Some(false));
+        assert_eq!(
+            metrics::VOWIFI_CHILD_SA_UP.with_label_values(&[m]).get(),
+            0.0
+        );
+        child_sa_report(AgentKind::Supervisor, m, 2, Some(true));
+        assert_eq!(
+            metrics::VOWIFI_CHILD_SA_UP.with_label_values(&[m]).get(),
+            1.0
+        );
+        // Absent leaves it alone.
+        child_sa_report(AgentKind::Supervisor, m, 3, None);
+        assert_eq!(
+            metrics::VOWIFI_CHILD_SA_UP.with_label_values(&[m]).get(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn an_ims_report_never_touches_the_child_sa_gauge() {
+        let m = "test-child-sa-ims-isolated";
+        metrics::VOWIFI_CHILD_SA_UP.with_label_values(&[m]).set(1.0);
+        child_sa_report(AgentKind::Ims, m, 1, Some(false));
+        assert_eq!(
+            metrics::VOWIFI_CHILD_SA_UP.with_label_values(&[m]).get(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn supervisor_unhealthy_timer_follows_child_sa_up() {
+        let m = "test-child-sa-timer";
+        child_sa_report(AgentKind::Supervisor, m, 1, Some(false));
+        let key = (AgentKind::Supervisor, m.to_string());
+        assert!(liveness().lock().unwrap()[&key]
+            .tunnel_unhealthy_since
+            .is_some());
+        child_sa_report(AgentKind::Supervisor, m, 2, Some(true));
+        assert!(liveness().lock().unwrap()[&key]
+            .tunnel_unhealthy_since
+            .is_none());
     }
 }

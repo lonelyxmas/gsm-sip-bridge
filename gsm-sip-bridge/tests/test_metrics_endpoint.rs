@@ -61,6 +61,9 @@ fn init_all_metrics() {
     metrics::VOWIFI_TUNNEL_UP
         .with_label_values(&["test"])
         .set(0.0);
+    metrics::VOWIFI_CHILD_SA_UP
+        .with_label_values(&["test"])
+        .set(0.0);
     metrics::VOWIFI_BRIDGE_FAILURES_TOTAL
         .with_label_values(&["test", "ring_timeout"])
         .inc();
@@ -124,6 +127,7 @@ fn test_all_metrics_registered() {
         "gsm_sip_bridge_vowifi_registered",
         "gsm_sip_bridge_vowifi_registrations_total",
         "gsm_sip_bridge_vowifi_tunnel_up",
+        "gsm_sip_bridge_vowifi_child_sa_up",
         "gsm_sip_bridge_vowifi_bridge_failures_total",
         "gsm_sip_bridge_agent_up",
         "gsm_sip_bridge_agent_last_report_seconds",

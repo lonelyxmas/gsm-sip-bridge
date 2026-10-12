@@ -52,6 +52,7 @@ async fn test_observe_report_lands_in_scraped_metrics() {
             sip_server_bindings: None,
             sip_server_ring_registered: None,
             registration_expires_at: None,
+            child_sa_up: None,
         },
         events: vec![ObservedEvent::CallCompleted {
             status: CallStatus::Answered,
@@ -129,6 +130,41 @@ async fn test_observe_heartbeat_with_no_events_still_updates_liveness() {
         before >= 3.0,
         "dropped count from the report must be folded into the daemon-side counter"
     );
+
+    let _ = shutdown_tx.send(true);
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_supervisor_report_sets_the_child_sa_gauge() {
+    let (socket_path, handle, shutdown_tx) = start_test_server().await;
+    let module_id = "test-ingest-child-sa".to_string();
+
+    for (seq, up, want) in [(1u64, false, 0.0), (2, true, 1.0)] {
+        let report = AgentReport {
+            agent: AgentKind::Supervisor,
+            module_id: module_id.clone(),
+            epoch: 1,
+            seq,
+            state: AgentState {
+                child_sa_up: Some(up),
+                ..Default::default()
+            },
+            events: vec![],
+            dropped: 0,
+        };
+        let sock = socket_path.clone();
+        tokio::task::spawn_blocking(move || send_cmd(&sock, &ControlCmd::Observe { report }))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            metrics::VOWIFI_CHILD_SA_UP
+                .with_label_values(&[&module_id])
+                .get(),
+            want
+        );
+    }
 
     let _ = shutdown_tx.send(true);
     handle.abort();
