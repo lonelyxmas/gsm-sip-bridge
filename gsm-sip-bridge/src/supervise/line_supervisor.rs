@@ -74,7 +74,7 @@ pub enum DegradeReason {
 /// Steady-state-only health, beyond "is the process alive" and "is a P-CSCF
 /// change pending" (checked separately) — the three strongswan-specific
 /// checks (`tun_iface` presence, `swanctl --list-sas`'s exit status, the
-/// `ims:` CHILD_SA line's presence) collapse to `Ok` for the swu engine,
+/// CHILD_SA line's presence under the IKE_SA) collapse to `Ok` for the swu engine,
 /// which the original script's own comment says has "no re-initiate-in-place
 /// concept."
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
