@@ -141,9 +141,9 @@ description: "Task list for specs/086-epdg-child-sa-recovery"
 
 ### Supervisor reporting
 
-- [ ] T021 [US3] Test first in `gsm-sip-bridge/src/supervise/line_supervisor.rs` tests: after a tick with `health = Ok`, `tracking.child_sa_usable == true`. After ticks with `ChildSaMissing`, `TunVanished` or `ViciBroken`, it is `false`. After the process-died branch (`is_process_alive` false) it is `false`. After `Ok` health with an unreachable P-CSCF it stays `true` (research R5)
-- [ ] T022 [US3] Implement in `gsm-sip-bridge/src/supervise/line_supervisor.rs`: `tick_steady_state` sets `tracking.child_sa_usable = false` at the top of the process-died branch. After `steady_state_health` it sets `tracking.child_sa_usable = matches!(health, SteadyStateHealth::Ok)` before the match. T021 now passes
-- [ ] T023 [US3] Implement in `gsm-sip-bridge/src/supervise/orchestrate.rs` `start_vowifi_line_strongswan` (~line 1584):
+- [X] T021 [US3] Test first in `gsm-sip-bridge/src/supervise/line_supervisor.rs` tests: after a tick with `health = Ok`, `tracking.child_sa_usable == true`. After ticks with `ChildSaMissing`, `TunVanished` or `ViciBroken`, it is `false`. After the process-died branch (`is_process_alive` false) it is `false`. After `Ok` health with an unreachable P-CSCF it stays `true` (research R5)
+- [X] T022 [US3] Implement in `gsm-sip-bridge/src/supervise/line_supervisor.rs`: `tick_steady_state` sets `tracking.child_sa_usable = false` at the top of the process-died branch. After `steady_state_health` it sets `tracking.child_sa_usable = matches!(health, SteadyStateHealth::Ok)` before the match. T021 now passes
+- [X] T023 [US3] Implement in `gsm-sip-bridge/src/supervise/orchestrate.rs` `start_vowifi_line_strongswan` (~line 1584):
   - before `establish_line_tunnel`, create `let child_sa_reporter = crate::observability::reporter::Reporter::spawn(ctx.config.control.socket_path.clone(), AgentKind::Supervisor, line.card_id.clone(), Duration::from_secs(ctx.config.metrics.agent_report_interval_seconds));` and report `AgentState { child_sa_up: Some(false), ..Default::default() }` with no events;
   - after "tunnel UP", set `tracking.child_sa_usable = true` and report `Some(true)`;
   - after every `tick_steady_state` call (every outcome arm, or once right after the call), report `Some(tracking.child_sa_usable)`. To avoid redundant sends, skip the report when the value is unchanged: the `Reporter` already heartbeats the last state (research R4).

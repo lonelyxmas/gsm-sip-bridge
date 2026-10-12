@@ -1593,11 +1593,34 @@ fn start_vowifi_line_strongswan(
     let idx = line.index;
     let netns = line.netns.clone();
 
+    // specs/086: the CHILD_SA gauge reads 0 from the start of supervision, not
+    // from the first healthy tick, so a line that never establishes is visible.
+    // If establishment gives up, this reporter is dropped, its record goes
+    // stale, and the scrape zeroes the gauge -- the right answer for a line that
+    // never had a tunnel.
+    let child_sa_reporter = crate::observability::reporter::Reporter::spawn(
+        ctx.config.control.socket_path.clone(),
+        crate::control::protocol::AgentKind::Supervisor,
+        line.card_id.clone(),
+        Duration::from_secs(ctx.config.metrics.agent_report_interval_seconds),
+    );
+    let report_child_sa = |up: bool| {
+        child_sa_reporter.report(
+            crate::control::protocol::AgentState {
+                child_sa_up: Some(up),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+    };
+    report_child_sa(false);
+
     let Some((pcscf, usim_holder)) = establish_line_tunnel(ctx, line, mcc, mnc, None) else {
         return;
     };
 
     println!("[supervise] line {idx}: tunnel UP. P-CSCF: {pcscf}");
+    report_child_sa(true);
     let _ = runner.write_file(Path::new(&line.pcscf_source_path), &pcscf);
 
     start_line_tail(ctx, idx, &netns, line, &usim_holder, pcscf.clone());
@@ -1620,7 +1643,12 @@ fn start_vowifi_line_strongswan(
     let mut current_pcscf = pcscf;
     // Consecutive ticks the P-CSCF has been unreachable. Owned by the loop, like
     // `current_pcscf`, so the tick function stays a decision over inputs.
-    let mut tracking = line_supervisor::SteadyTracking::default();
+    let mut tracking = line_supervisor::SteadyTracking {
+        child_sa_usable: true,
+        ..Default::default()
+    };
+    // The reporter heartbeats the last state, so only changes need sending.
+    let mut reported_usable = true;
     loop {
         runner.sleep(line_supervisor::STEADY_STATE_POLL_INTERVAL);
         // Held across the whole tick_steady_state call, not just a one-off
@@ -1640,13 +1668,18 @@ fn start_vowifi_line_strongswan(
         if *guard {
             return;
         }
-        match line_supervisor::tick_steady_state(
+        let outcome = line_supervisor::tick_steady_state(
             &engine,
             runner.as_ref(),
             &current_pcscf,
             &mut tracking,
             line_supervisor::STEADY_STATE_POLL_INTERVAL,
-        ) {
+        );
+        if tracking.child_sa_usable != reported_usable {
+            reported_usable = tracking.child_sa_usable;
+            report_child_sa(reported_usable);
+        }
+        match outcome {
             line_supervisor::SteadyOutcome::StillUp => {
                 // Under the shutdown guard: a repair racing teardown would
                 // recreate the pair the plan just deleted.

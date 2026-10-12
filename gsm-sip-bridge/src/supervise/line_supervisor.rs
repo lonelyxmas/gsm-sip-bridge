@@ -327,6 +327,7 @@ pub fn tick_steady_state(
     poll_interval: Duration,
 ) -> SteadyOutcome {
     if !engine.is_process_alive(runner) {
+        tracking.child_sa_usable = false;
         engine.restart_process(runner);
         return SteadyOutcome::Recovered {
             reason: DegradeReason::ProcessDied,
@@ -334,6 +335,9 @@ pub fn tick_steady_state(
     }
 
     let health = engine.steady_state_health(runner);
+    // Only a fully healthy structural check counts as a usable CHILD_SA; an
+    // unreachable P-CSCF later in the tick does not undo that (specs/086).
+    tracking.child_sa_usable = matches!(health, SteadyStateHealth::Ok);
     if health != SteadyStateHealth::ChildSaMissing {
         tracking.child_sa_missing = 0;
     }
@@ -1253,6 +1257,46 @@ mod tests {
         *engine.health.borrow_mut() = SteadyStateHealth::TunVanished;
         child_sa_tick(&engine, &runner, &mut tracking);
         assert_eq!(tracking.child_sa_missing, 0);
+    }
+
+    #[test]
+    fn child_sa_usable_follows_the_structural_health_check() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking::default();
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        assert!(tracking.child_sa_usable);
+
+        for health in [
+            SteadyStateHealth::ChildSaMissing,
+            SteadyStateHealth::TunVanished,
+            SteadyStateHealth::ViciBroken,
+        ] {
+            *engine.health.borrow_mut() = SteadyStateHealth::Ok;
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+            assert!(tracking.child_sa_usable);
+            *engine.health.borrow_mut() = health;
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+            assert!(!tracking.child_sa_usable, "{health:?}");
+        }
+
+        *engine.health.borrow_mut() = SteadyStateHealth::Ok;
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        *engine.alive.borrow_mut() = false;
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        assert!(!tracking.child_sa_usable, "process died");
+    }
+
+    #[test]
+    fn an_unreachable_pcscf_does_not_clear_child_sa_usable() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            pcscf_reachable: RefCell::new(false),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        assert!(tracking.child_sa_usable);
     }
 
     #[test]
