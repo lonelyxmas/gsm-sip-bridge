@@ -25,6 +25,14 @@ pub struct Call {
     #[allow(dead_code)]
     call_id: i32,
     state: CallState,
+    /// Identifies this call to `on_call_state_cb` across call-id reuse: the
+    /// `user_data` `Call::make` hands PJSUA. 0 for a call we did not place.
+    #[allow(dead_code)]
+    token: usize,
+    /// Stub builds only: what [`Call::last_status`] reports, set by tests via
+    /// [`Call::set_last_status`]. A linked build reads PJSIP instead.
+    #[allow(dead_code)]
+    last_status: Option<u16>,
 }
 
 impl Call {
@@ -93,12 +101,13 @@ impl Call {
                 opt.vid_cnt = 0;
                 opt.txt_cnt = 0;
 
+                let token = crate::endpoint::next_call_token();
                 let mut call_id: pjsua_sys::pjsua_call_id = -1;
                 let status = pjsua_sys::pjsua_call_make_call(
                     _account.account_id(),
                     &uri,
                     &opt,
-                    std::ptr::null_mut(),
+                    token as *mut std::os::raw::c_void,
                     msg_data_ptr,
                     &mut call_id,
                 );
@@ -111,6 +120,8 @@ impl Call {
                 return Ok(Self {
                     call_id,
                     state: CallState::Calling,
+                    token,
+                    last_status: None,
                 });
             }
         }
@@ -122,6 +133,8 @@ impl Call {
             Ok(Self {
                 call_id: 0,
                 state: CallState::Calling,
+                token: 0,
+                last_status: None,
             })
         }
     }
@@ -135,7 +148,12 @@ impl Call {
     /// `on_incoming_call`, the same way `Call::make`'s `call_id` comes from
     /// `pjsua_call_make_call`.
     pub fn from_id(call_id: i32, state: CallState) -> Self {
-        Self { call_id, state }
+        Self {
+            call_id,
+            state,
+            token: 0,
+            last_status: None,
+        }
     }
 
     /// Answers an incoming call with the given SIP status `code` (e.g. 180
@@ -301,6 +319,22 @@ impl Call {
                     // The call is gone as far as PJSIP is concerned.
                     return CallState::Disconnected;
                 }
+                // The id now belongs to a newer call: ours has ended.
+                if pjsua_sys::pjsua_call_get_user_data(self.call_id) as usize != self.token {
+                    return CallState::Disconnected;
+                }
+                // PJSIP marks the call DISCONNECTED before running
+                // `on_call_state_cb`, which is where the final status is
+                // captured. Keep reporting the call as in progress until that
+                // capture exists, so `last_status` after `Disconnected` never
+                // races it. Only for calls we placed (token != 0); the window
+                // is the few microseconds the callback takes.
+                if info.state == pjsua_sys::pjsip_inv_state_PJSIP_INV_STATE_DISCONNECTED
+                    && self.token != 0
+                    && crate::endpoint::disconnect_status(self.token).is_none()
+                {
+                    return CallState::Early;
+                }
                 #[allow(non_upper_case_globals)]
                 return match info.state {
                     pjsua_sys::pjsip_inv_state_PJSIP_INV_STATE_NULL => CallState::Null,
@@ -324,6 +358,37 @@ impl Call {
 
     pub fn set_state(&mut self, state: CallState) {
         self.state = state;
+    }
+
+    /// The final SIP status that ended this call — e.g. `486` when the far
+    /// end rejected it, `408` when it timed out — or `None` if the call has
+    /// not ended or PJSIP recorded no status for it.
+    ///
+    /// PJSUA resets the call's slot as soon as its `DISCONNECTED` callback
+    /// returns, and may hand the id to another call, so the live call info
+    /// is not trusted here. The status is the one captured inside that
+    /// callback (`endpoint`'s `DISCONNECT_STATUS`), found by this call's
+    /// token. Only calls placed with [`Call::make`] have one; any other call
+    /// reports `None`.
+    pub fn last_status(&self) -> Option<u16> {
+        #[cfg(feature = "pjsip-linked")]
+        {
+            if self.token == 0 {
+                return None;
+            }
+            crate::endpoint::disconnect_status(self.token).flatten()
+        }
+
+        #[cfg(not(feature = "pjsip-linked"))]
+        {
+            self.last_status
+        }
+    }
+
+    /// Stub builds: sets what [`Call::last_status`] reports. A linked build
+    /// ignores it — PJSIP is the only source of truth there.
+    pub fn set_last_status(&mut self, status: Option<u16>) {
+        self.last_status = status;
     }
 
     pub fn call_id(&self) -> i32 {
@@ -354,6 +419,15 @@ fn parse_uri_user(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(feature = "pjsip-linked"))]
+    #[test]
+    fn a_stub_call_reports_the_final_status_it_was_given() {
+        let mut call = Call::from_id(3, CallState::Early);
+        assert_eq!(call.last_status(), None);
+        call.set_last_status(Some(603));
+        assert_eq!(call.last_status(), Some(603));
+    }
 
     #[test]
     fn parse_uri_user_bare() {

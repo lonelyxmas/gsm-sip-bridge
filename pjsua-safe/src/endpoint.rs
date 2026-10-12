@@ -24,6 +24,83 @@ static RINGBACK_ACTIVE: AtomicBool = AtomicBool::new(false);
 static BRIDGE_PAIRS: LazyLock<Mutex<std::collections::HashMap<i32, i32>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// Recently disconnected calls and their final SIP status (`None` when PJSIP
+/// recorded none), keyed by the call's token (see [`next_call_token`]),
+/// captured inside `on_call_state_cb` — the only point where the status is
+/// reliably readable, since PJSUA resets the call's slot (and
+/// `pjsua_call_get_info` starts failing) as soon as that callback returns.
+/// Read by `Call::last_status`.
+///
+/// Every disconnect is recorded, status or not, because the entry's presence
+/// is also the signal `Call::poll_state` waits for: PJSIP marks the call
+/// `DISCONNECTED` *before* it runs the callback, so a poll in between would
+/// otherwise see the disconnect before its status exists. An instant reject
+/// lost that race on a live call (a `603` sent to the carrier as `480`).
+///
+/// Keyed by token rather than `pjsua_call_id` because PJSUA reuses call ids:
+/// another line's call can take a freed id before the old call's owner reads
+/// its status, and must not overwrite or erase it. Tokens are never reused,
+/// so entries are never cleared on reuse; the oldest is dropped once
+/// [`DISCONNECT_STATUS_CAPACITY`] are held. Owners read within one poll
+/// (~100 ms) of the disconnect, far inside that bound.
+static DISCONNECT_STATUS: std::sync::LazyLock<std::sync::Mutex<DisconnectLog>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+
+/// `(token, final status)` per recorded disconnect, oldest first.
+type DisconnectLog = std::collections::VecDeque<(usize, Option<u16>)>;
+
+const DISCONNECT_STATUS_CAPACITY: usize = 64;
+
+/// Next token to hand out; 0 is reserved for "no token" (a call we did not
+/// place, whose `user_data` PJSUA leaves null).
+static NEXT_CALL_TOKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+/// A process-unique, never-zero token for a call `Call::make` is about to
+/// place. It is passed to PJSUA as the call's `user_data`, so the state
+/// callback can attribute a disconnect to this call even after its id is
+/// reused.
+#[cfg_attr(not(feature = "pjsip-linked"), allow(dead_code))]
+pub(crate) fn next_call_token() -> usize {
+    NEXT_CALL_TOKEN.fetch_add(1, Ordering::Relaxed)
+}
+
+/// What `on_call_state_cb` recorded when the call holding `token`
+/// disconnected: `None` if it has not (yet) been recorded, `Some(status)`
+/// once it has, where `status` is `None` when PJSIP gave no final status.
+#[cfg_attr(not(feature = "pjsip-linked"), allow(dead_code))]
+pub(crate) fn disconnect_status(token: usize) -> Option<Option<u16>> {
+    status_in(
+        &DISCONNECT_STATUS.lock().unwrap_or_else(|e| e.into_inner()),
+        token,
+    )
+}
+
+#[cfg_attr(not(feature = "pjsip-linked"), allow(dead_code))]
+fn record_disconnect_status(token: usize, code: Option<u16>) {
+    record_in(
+        &mut DISCONNECT_STATUS.lock().unwrap_or_else(|e| e.into_inner()),
+        token,
+        code,
+    );
+}
+
+/// [`disconnect_status`] over an explicit log, so tests can run on a log of
+/// their own instead of sharing the process-wide one.
+fn status_in(log: &DisconnectLog, token: usize) -> Option<Option<u16>> {
+    log.iter()
+        .rev()
+        .find(|(t, _)| *t == token)
+        .map(|(_, code)| *code)
+}
+
+/// [`record_disconnect_status`] over an explicit log.
+fn record_in(log: &mut DisconnectLog, token: usize, code: Option<u16>) {
+    if log.len() >= DISCONNECT_STATUS_CAPACITY {
+        log.pop_front();
+    }
+    log.push_back((token, code));
+}
+
 /// Calls PJSIP has notified us of via `on_incoming_call` that no Rust-side
 /// caller has claimed yet (spec 025, research.md R-007). `Endpoint` exposes
 /// this as a polling API (`poll_incoming_call`), the same idiom `Call`
@@ -892,6 +969,14 @@ unsafe extern "C" fn on_call_state_cb( // SAFETY: PJSIP invokes with valid call_
     let state = info.state;
     tracing::info!(call_id, state, "SIP call state changed");
 
+    if state == pjsua_sys::pjsip_inv_state_PJSIP_INV_STATE_DISCONNECTED {
+        let token = pjsua_sys::pjsua_call_get_user_data(call_id) as usize;
+        if token != 0 {
+            let code = u16::try_from(info.last_status).ok().filter(|code| *code > 0);
+            record_disconnect_status(token, code);
+        }
+    }
+
     match state {
         s if s == pjsua_sys::pjsip_inv_state_PJSIP_INV_STATE_CALLING
             || s == pjsua_sys::pjsip_inv_state_PJSIP_INV_STATE_EARLY =>
@@ -1061,5 +1146,45 @@ mod disconnect_trigger_tests {
         );
         assert_eq!(trigger_name(pjsip_event_id_e_PJSIP_EVENT_UNKNOWN), "other");
         assert_eq!(trigger_name(pjsip_event_id_e_PJSIP_EVENT_USER), "other");
+    }
+}
+
+#[cfg(test)]
+mod disconnect_status_tests {
+    use super::{next_call_token, record_in, status_in, DisconnectLog, DISCONNECT_STATUS_CAPACITY};
+
+    /// Two calls that held the same PJSUA call id one after the other keep
+    /// separate statuses: the second call's disconnect neither erases nor
+    /// replaces the first's rejection (PR #110 review).
+    #[test]
+    fn a_reused_call_id_keeps_each_calls_status_and_the_store_is_bounded() {
+        let mut log = DisconnectLog::new();
+        let rejected = next_call_token();
+        let reused = next_call_token();
+        assert_ne!(rejected, 0);
+        assert_ne!(rejected, reused);
+        assert_eq!(status_in(&log, rejected), None);
+
+        record_in(&mut log, rejected, Some(603));
+        record_in(&mut log, reused, Some(408));
+        assert_eq!(status_in(&log, rejected), Some(Some(603)));
+        assert_eq!(status_in(&log, reused), Some(Some(408)));
+
+        for _ in 0..DISCONNECT_STATUS_CAPACITY {
+            record_in(&mut log, next_call_token(), Some(486));
+        }
+        assert_eq!(status_in(&log, rejected), None);
+    }
+
+    /// A disconnect PJSIP gave no status for is still recorded, and is told
+    /// apart from one not recorded yet — `Call::poll_state` waits on exactly
+    /// that difference.
+    #[test]
+    fn a_statusless_disconnect_is_recorded_and_distinct_from_none_yet() {
+        let mut log = DisconnectLog::new();
+        let token = next_call_token();
+        assert_eq!(status_in(&log, token), None);
+        record_in(&mut log, token, None);
+        assert_eq!(status_in(&log, token), Some(None));
     }
 }

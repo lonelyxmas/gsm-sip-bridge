@@ -233,7 +233,12 @@ impl AgentObservability {
 /// unrecognised collapses to `BridgeSetupFailed`.
 pub fn map_bridge_failure_reason(raw: &str) -> BridgeFailureReason {
     match raw {
-        reason::PBX_UNREACHABLE | reason::PBX_REJECTED => BridgeFailureReason::PbxDeclined,
+        // Only a genuine decline is `pbx_declined` (specs/084 FR-007a): a PBX
+        // that could not even be reached at setup is a setup failure, and a
+        // PBX leg that died before answer is `pbx_failed`, not a busy human.
+        reason::PBX_REJECTED => BridgeFailureReason::PbxDeclined,
+        reason::PBX_UNREACHABLE => BridgeFailureReason::BridgeSetupFailed,
+        reason::PBX_FAILED => BridgeFailureReason::PbxFailed,
         reason::PBX_NO_ANSWER => BridgeFailureReason::RingTimeout,
         reason::CALLER_CANCELLED => BridgeFailureReason::CallerCancelled,
         reason::VETH_LEG_FAILED => BridgeFailureReason::BridgeSetupFailed,
@@ -250,7 +255,11 @@ mod tests {
     fn map_bridge_failure_reason_covers_every_known_reason_constant() {
         assert_eq!(
             map_bridge_failure_reason(reason::PBX_UNREACHABLE),
-            BridgeFailureReason::PbxDeclined
+            BridgeFailureReason::BridgeSetupFailed
+        );
+        assert_eq!(
+            map_bridge_failure_reason(reason::PBX_FAILED),
+            BridgeFailureReason::PbxFailed
         );
         assert_eq!(
             map_bridge_failure_reason(reason::PBX_REJECTED),

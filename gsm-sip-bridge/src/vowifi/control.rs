@@ -53,7 +53,10 @@ pub enum ControlMessage {
     /// listening to dead air while the extension is still ringing.
     CallAnswered { call_id: String },
     /// Agent B → Agent A. The PBX-side or veth-side leg could not be
-    /// established; Agent A must decline the inbound INVITE (486 Busy Here).
+    /// established, or ended before anyone answered; Agent A must decline the
+    /// inbound INVITE. `reason` decides how: only `reason::PBX_REJECTED` is
+    /// answered `486 Busy Here`, everything else `480 Temporarily
+    /// Unavailable` (specs/084, issue #108).
     BridgeFailed { call_id: String, reason: String },
     /// Agent B → Agent A. Confirms both of Agent B's legs have been torn
     /// down in response to a `CallEnded`.
@@ -219,9 +222,16 @@ pub struct CallRecord {
 /// wire, per `contracts/agent-control-protocol.md`.
 pub mod reason {
     pub const PBX_UNREACHABLE: &str = "pbx_unreachable";
+    /// The telephone side declined the call — it answered `486`, `600` or
+    /// `603`. The only reason Agent A turns into `486 Busy Here`.
     pub const PBX_REJECTED: &str = "pbx_rejected";
-    /// Nobody picked up the PBX extension before the ring timeout.
+    /// Nobody picked up the PBX extension: our ring timeout expired, or the
+    /// telephone side gave up on its own no-answer timer (`480`/`408`).
     pub const PBX_NO_ANSWER: &str = "pbx_no_answer";
+    /// The PBX leg ended before answer for any other reason — an unknown
+    /// extension, a PBX error, a transport failure, or no status at all.
+    /// Never reported to the carrier as busy (specs/084).
+    pub const PBX_FAILED: &str = "pbx_failed";
     /// The caller gave up (`CANCEL`) while the PBX extension was still ringing.
     pub const CALLER_CANCELLED: &str = "caller_cancelled";
     pub const VETH_LEG_FAILED: &str = "veth_leg_failed";

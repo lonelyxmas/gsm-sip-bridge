@@ -292,7 +292,13 @@ pub enum BridgeFailureReason {
     BridgeSetupFailed,
     RingTimeout,
     CallerCancelled,
+    /// The telephone side declined the call (`486`/`600`/`603`) — and only
+    /// that; a no-answer is `RingTimeout`, a broken PBX `PbxFailed`.
     PbxDeclined,
+    /// The telephone-side leg ended before answer for a reason other than a
+    /// decline or a no-answer — unknown extension, PBX error, transport
+    /// failure, or no status at all (specs/084).
+    PbxFailed,
     AgentUnreachable,
     /// The call connected but audio did not flow both ways (FR-017) — a bridged
     /// call that carried one-way or no audio is a failure, not a success.
@@ -306,6 +312,7 @@ impl BridgeFailureReason {
             BridgeFailureReason::RingTimeout => "ring_timeout",
             BridgeFailureReason::CallerCancelled => "caller_cancelled",
             BridgeFailureReason::PbxDeclined => "pbx_declined",
+            BridgeFailureReason::PbxFailed => "pbx_failed",
             BridgeFailureReason::AgentUnreachable => "agent_unreachable",
             BridgeFailureReason::OneWayAudio => "one_way_audio",
         }
