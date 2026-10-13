@@ -1774,6 +1774,10 @@ struct LoopState {
     /// as a failure — a registrar can report the same loss in more than one
     /// NOTIFY, and only the first may move the ladder.
     early_loss_counted: bool,
+    /// The renewal budget was spent by a loss reported mid-call, where exiting
+    /// would have torn the call down. Owed to the supervisor as soon as the
+    /// line is idle — checked before any renewal can run and clear the count.
+    budget_exit_owed: Option<BridgeError>,
     /// Call-ID of the last INVITE whose caller identity was unreadable and
     /// already logged, so a retransmission of it (our final response lost)
     /// does not repeat the warning — see [`Self::unreadable_caller_to_log`].
@@ -1801,6 +1805,7 @@ impl LoopState {
             last_registered: Instant::now(),
             ladder_before_success: (RETRY_INITIAL_BACKOFF, 0),
             early_loss_counted: false,
+            budget_exit_owed: None,
             unreadable_caller_warned: None,
             recent_declines: RecentDeclines::default(),
         }
@@ -1890,26 +1895,45 @@ impl LoopState {
     /// Never `Err` while `busy`. Exiting tears the session down, and the
     /// renewal path only gets to exit because the maintenance policy has
     /// already held it for any call in progress; a NOTIFY can arrive mid-call.
-    /// A loss that would spend the budget then only schedules the retry, and
-    /// the renewal held until the call ends decides whether the line exits.
+    /// A loss that spends the budget then is still counted, and the exit is
+    /// owed until the call ends — see [`Self::take_owed_budget_exit`].
     fn on_network_deregistration(&mut self, now: Instant, busy: bool) -> BridgeResult<()> {
         self.force_renewal = true;
         let age = now.saturating_duration_since(self.last_registered);
         if age >= REGISTRATION_SETTLE || self.early_loss_counted {
             return Ok(());
         }
+        self.early_loss_counted = true;
         (self.backoff, self.consecutive_renewal_failures) = self.ladder_before_success;
         tracing::warn!(
             registered_secs_ago = age.as_secs(),
             retry_in_secs = self.backoff.as_secs(),
             "the network dropped a registration it had only just accepted; retrying on backoff"
         );
-        if busy && self.consecutive_renewal_failures + 1 >= MAX_CONSECUTIVE_RENEWAL_FAILURES {
-            self.next_renewal_attempt = Some(now + self.backoff);
+        match self.schedule_renewal_retry() {
+            Err(e) if busy => {
+                tracing::warn!(
+                    error = %e,
+                    "renewal budget spent mid-call; exiting once the call ends"
+                );
+                self.budget_exit_owed = Some(e);
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    /// The exit [`Self::on_network_deregistration`] held back for a call, once
+    /// no call is in progress. Taken before the renewal gate in `on_idle_tick`,
+    /// so a renewal's success can never clear the count that spent it.
+    fn take_owed_budget_exit(&mut self) -> BridgeResult<()> {
+        if self.busy() {
             return Ok(());
         }
-        self.early_loss_counted = true;
-        self.schedule_renewal_retry()
+        match self.budget_exit_owed.take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     fn schedule_renewal_retry(&mut self) -> BridgeResult<()> {
@@ -2723,6 +2747,7 @@ impl LoopState {
         // first, unconditionally, so no early `return` later in this
         // function (renewal not due, deferred, backed off, ...) can skip it.
         flush_expired_reassembly(p);
+        self.take_owed_budget_exit()?;
 
         // Gm connection liveness (specs/028) runs here, on the idle path, only
         // when no call is in progress — a live call proves the connection by
@@ -4417,23 +4442,40 @@ mod tests {
         assert_eq!(st.next_renewal_attempt, retry_after_failure);
     }
 
-    /// The loss that would spend the budget arriving mid-call must not end
-    /// the loop under the call: the retry is scheduled, and the renewal held
-    /// for the call decides the exit afterwards.
+    /// The loss that spends the budget arriving mid-call must not end the
+    /// loop under the call — but it is still owed: the exit is taken as soon
+    /// as the line is idle, before a renewal's success could clear the count.
     #[test]
-    fn a_loss_that_would_spend_the_budget_never_exits_mid_call() {
+    fn a_loss_that_spends_the_budget_mid_call_exits_once_the_call_ends() {
         let mut st = LoopState::new();
         for _ in 1..MAX_CONSECUTIVE_RENEWAL_FAILURES {
             st.on_network_deregistration(st.last_registered + Duration::from_secs(8), false)
                 .expect("below the budget");
             st.on_renewal_success();
         }
-        st.on_network_deregistration(st.last_registered + Duration::from_secs(8), true)
+        let during_call = st.last_registered + Duration::from_secs(8);
+        st.on_network_deregistration(during_call, true)
             .expect("never an exit while a call is up");
-        assert!(st.force_renewal);
-        assert!(st.next_renewal_attempt.is_some());
-        // The renewal that runs once the call ends spends it, if it fails.
-        assert!(st.schedule_renewal_retry().is_err());
+        // A repeat notice mid-call changes nothing.
+        let retry_at = st.next_renewal_attempt;
+        st.on_network_deregistration(during_call + Duration::from_secs(5), true)
+            .expect("never an exit while a call is up");
+        assert_eq!(st.next_renewal_attempt, retry_at);
+        assert_eq!(
+            st.consecutive_renewal_failures,
+            MAX_CONSECUTIVE_RENEWAL_FAILURES
+        );
+
+        // No call in progress (LoopState::new has none): the owed exit is taken.
+        let err = st
+            .take_owed_budget_exit()
+            .expect_err("the budget was spent; the supervisor is owed the exit");
+        assert!(
+            err.to_string()
+                .contains("exiting so the supervisor can recover"),
+            "{err}"
+        );
+        assert!(st.take_owed_budget_exit().is_ok(), "taken once");
     }
 
     /// A binding that has been live a while and is then dropped is a new event
