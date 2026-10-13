@@ -153,7 +153,7 @@ All paths are relative to the repo root. `supervise/` means `gsm-sip-bridge/src/
 
 ### Tests for User Story 3
 
-- [ ] T018 [P] [US3] Update and extend the terminate tests in `gsm-sip-bridge/src/supervise/engines.rs`, replacing `terminate_is_scoped_to_this_lines_connection`'s single-call expectation. With `MockCommandRunner`:
+- [x] T018 [P] [US3] Update and extend the terminate tests in `gsm-sip-bridge/src/supervise/engines.rs`, replacing `terminate_is_scoped_to_this_lines_connection`'s single-call expectation. With `MockCommandRunner`:
   - (a) Graceful call argv is exactly `["timeout","8","env",<prefix>,"swanctl","--terminate","--ike","ims0","--timeout","5"]`, then a list-sas with `timeout 10` returning no header → **no** `--force` call.
   - (b) List-sas still shows the `ims0: #` header → a third call `["timeout","10","env",<prefix>,"swanctl","--terminate","--ike","ims0","--force"]`.
   - (c) List-sas fails (non-zero) → `--force` is issued.
@@ -162,7 +162,7 @@ All paths are relative to the repo root. `supervise/` means `gsm-sip-bridge/src/
 
 ### Implementation for User Story 3
 
-- [ ] T019 [US3] Rewrite `StrongswanEngine::terminate` in `gsm-sip-bridge/src/supervise/engines.rs` per research R3:
+- [x] T019 [US3] Rewrite `StrongswanEngine::terminate` in `gsm-sip-bridge/src/supervise/engines.rs` per research R3:
   - Add constants `GRACEFUL_TERMINATE_WAIT_SECS = 5` and `GRACEFUL_TERMINATE_TIMEOUT_SECS = 8`.
   - Factor the bounded list-sas invocation out of `steady_state_health` into a private `fn list_sas(&self, runner) -> Option<String>` (`None` on failure) and use it in both places.
   - Print `[supervise] line {idx}: IKE_SA deleted (acknowledged)` or `[supervise] line {idx}: ePDG did not acknowledge DELETE within 5s; forced`.

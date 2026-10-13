@@ -165,6 +165,11 @@ pub const POST_RECOVERY_PCSCF_POLL: Duration = Duration::from_secs(1);
 /// `TERMINATE_TIMEOUT_SECS` is the precedent for bounding it.
 const STEADY_TERMINATE_TIMEOUT_SECS: u32 = 10;
 
+/// How long a graceful `swanctl --terminate` waits for the ePDG's DELETE
+/// response (swanctl's own `--timeout`), and the outer `timeout` around it.
+const GRACEFUL_TERMINATE_WAIT_SECS: u32 = 5;
+const GRACEFUL_TERMINATE_TIMEOUT_SECS: u32 = 8;
+
 /// Outer bound on the steady-state `swanctl --list-sas` query.
 const STEADY_LIST_SAS_TIMEOUT_SECS: u32 = 10;
 
@@ -426,6 +431,34 @@ impl StrongswanEngine {
         self.shared.env_prefix()
     }
 
+    /// `swanctl --list-sas` scoped to this line's connection; `None` if the
+    /// call failed or timed out.
+    ///
+    /// `--ike <conn>` keeps the shared daemon from reporting every line's SAs,
+    /// where another line's healthy CHILD_SA would mask this line's missing
+    /// one. Bounded: a vici call that never returns would otherwise freeze this
+    /// line's supervision loop while the reporter thread keeps heartbeating the
+    /// last (healthy) state. A timeout reads as a broken vici.
+    fn list_sas(&self, runner: &dyn CommandRunner) -> Option<String> {
+        let env = self.env_prefix();
+        let secs = STEADY_LIST_SAS_TIMEOUT_SECS.to_string();
+        match runner.run(&[
+            "timeout",
+            &secs,
+            "env",
+            &env,
+            "swanctl",
+            "--list-sas",
+            "--ike",
+            &self.conn_name,
+        ]) {
+            Ok(out) if out.status.success() => {
+                Some(String::from_utf8_lossy(&out.stdout).into_owned())
+            }
+            _ => None,
+        }
+    }
+
     /// The charon log's current length, taken before a recovery is issued so
     /// [`Self::fresh_pcscf_since`] can tell the new negotiation from the old.
     /// `0` if the log cannot be read, which makes any closed batch count.
@@ -503,12 +536,53 @@ impl TunnelEngine for StrongswanEngine {
             .unwrap_or(IkeSaLossCause::Unknown)
     }
 
+    /// Graceful delete first, forced only if the ePDG does not acknowledge it
+    /// (specs/087, research R3).
+    ///
+    /// A non-forced terminate sends the DELETE and waits up to
+    /// `GRACEFUL_TERMINATE_WAIT_SECS` for the ePDG's response, which is the
+    /// ePDG's own statement that the old session is gone. That is what a fixed
+    /// post-terminate sleep used to guess at (#106). Whether it was
+    /// acknowledged is decided by presence (a follow-up `--list-sas`), not by
+    /// swanctl's exit status; a failed presence query counts as "still there",
+    /// because forcing is the only safe step then. `--force` is never combined
+    /// with swanctl's `--timeout`, which disables its no-wait behaviour (the
+    /// outer `timeout` bounds it instead; #107 spent 52s on a stuck exchange).
+    ///
+    /// No sleep on either path: on the forced path the ePDG is not answering,
+    /// so waiting buys nothing. Worst case is 8 + 10 + 10 = 28s, under the
+    /// shutdown read guard; `shutdown.rs`'s own teardown is already non-forced
+    /// with a 5s bound and is intentionally unchanged.
     fn terminate(&self, runner: &dyn CommandRunner) {
-        // `--force` makes charon delete the IKE_SA without waiting on a pending
-        // exchange: without it #107 spent 52s on a stuck CREATE_CHILD_SA. Not
-        // swanctl's own `--timeout`, which disables `--force`'s no-wait
-        // behaviour; the outer `timeout` bounds it instead.
         let env = self.env_prefix();
+        let graceful_outer = GRACEFUL_TERMINATE_TIMEOUT_SECS.to_string();
+        let graceful_wait = GRACEFUL_TERMINATE_WAIT_SECS.to_string();
+        let _ = runner.run(&[
+            "timeout",
+            &graceful_outer,
+            "env",
+            &env,
+            "swanctl",
+            "--terminate",
+            "--ike",
+            &self.conn_name,
+            "--timeout",
+            &graceful_wait,
+        ]);
+        if self
+            .list_sas(runner)
+            .is_some_and(|out| !list_sas_has_ike_sa(&out, &self.conn_name))
+        {
+            println!(
+                "[supervise] line {}: IKE_SA deleted (acknowledged)",
+                self.idx
+            );
+            return;
+        }
+        println!(
+            "[supervise] line {}: ePDG did not acknowledge DELETE within {GRACEFUL_TERMINATE_WAIT_SECS}s; forced",
+            self.idx
+        );
         let secs = STEADY_TERMINATE_TIMEOUT_SECS.to_string();
         let _ = runner.run(&[
             "timeout",
@@ -537,33 +611,13 @@ impl TunnelEngine for StrongswanEngine {
             return SteadyStateHealth::TunVanished;
         }
 
-        let env = self.env_prefix();
-        // `--ike <conn>` scopes the query to this line. Without it the shared
-        // daemon reports every line's SAs, and another line's healthy
-        // CHILD_SA would mask this line's missing one.
-        //
-        // Bounded: a vici call that never returns would otherwise freeze this
-        // line's supervision loop while the reporter thread keeps heartbeating
-        // the last (healthy) state. A timeout reads as a broken vici.
-        let secs = STEADY_LIST_SAS_TIMEOUT_SECS.to_string();
-        let sas_output = match runner.run(&[
-            "timeout",
-            &secs,
-            "env",
-            &env,
-            "swanctl",
-            "--list-sas",
-            "--ike",
-            &self.conn_name,
-        ]) {
-            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
-            _ => {
-                println!(
-                    "[supervise] line {}: swanctl --list-sas failed (vici connection broken)",
-                    self.idx
-                );
-                return SteadyStateHealth::ViciBroken;
-            }
+        // Bounded and scoped to this line: see `list_sas`.
+        let Some(sas_output) = self.list_sas(runner) else {
+            println!(
+                "[supervise] line {}: swanctl --list-sas failed (vici connection broken)",
+                self.idx
+            );
+            return SteadyStateHealth::ViciBroken;
         };
         if !list_sas_has_ike_sa(&sas_output, &self.conn_name) {
             println!(
@@ -1232,26 +1286,102 @@ mod tests {
             );
         }
 
-        #[test]
-        fn terminate_is_forced_and_bounded() {
-            let runner = MockCommandRunner::new();
-            strongswan_engine().terminate(&runner);
-            let calls = runner.run_calls.lock().unwrap();
-            let want: Vec<String> = [
+        const ENV: &str = "STRONGSWAN_CONF=/etc/strongswan-shared.conf";
+        const LIST_KEY: &str = "timeout 10 env STRONGSWAN_CONF=/etc/strongswan-shared.conf swanctl --list-sas --ike ims0";
+
+        fn argv(parts: &[&str]) -> Vec<String> {
+            parts.iter().map(|p| p.to_string()).collect()
+        }
+
+        fn graceful_argv() -> Vec<String> {
+            argv(&[
+                "timeout",
+                "8",
+                "env",
+                ENV,
+                "swanctl",
+                "--terminate",
+                "--ike",
+                "ims0",
+                "--timeout",
+                "5",
+            ])
+        }
+
+        fn forced_argv() -> Vec<String> {
+            argv(&[
                 "timeout",
                 "10",
                 "env",
-                "STRONGSWAN_CONF=/etc/strongswan-shared.conf",
+                ENV,
                 "swanctl",
                 "--terminate",
                 "--ike",
                 "ims0",
                 "--force",
-            ]
-            .map(String::from)
-            .to_vec();
-            assert_eq!(calls.iter().filter(|c| **c == want).count(), 1);
-            assert!(!calls.iter().any(|c| c.contains(&"--timeout".to_string())));
+            ])
+        }
+
+        fn seed_list(runner: &MockCommandRunner, status: i32, stdout: &str) {
+            use std::os::unix::process::ExitStatusExt;
+            runner.set_run_output(
+                LIST_KEY,
+                std::process::Output {
+                    status: std::process::ExitStatus::from_raw(status),
+                    stdout: stdout.as_bytes().to_vec(),
+                    stderr: Vec::new(),
+                },
+            );
+        }
+
+        fn assert_terminate_invariants(runner: &MockCommandRunner) {
+            let calls = runner.run_calls.lock().unwrap();
+            assert!(
+                !calls
+                    .iter()
+                    .any(|c| c.contains(&"--force".to_string())
+                        && c.contains(&"--timeout".to_string())),
+                "--timeout cancels --force's no-wait behaviour"
+            );
+            assert!(
+                runner.sleeps.lock().unwrap().is_empty(),
+                "teardown waits on the ePDG's acknowledgement, never a fixed delay"
+            );
+        }
+
+        #[test]
+        fn an_acknowledged_graceful_terminate_is_not_forced() {
+            let runner = MockCommandRunner::new();
+            seed_list(&runner, 0, "");
+            strongswan_engine().terminate(&runner);
+            let calls = runner.run_calls.lock().unwrap();
+            assert_eq!(calls[0], graceful_argv());
+            assert!(!calls.contains(&forced_argv()));
+            drop(calls);
+            assert_terminate_invariants(&runner);
+        }
+
+        #[test]
+        fn an_unacknowledged_graceful_terminate_is_forced() {
+            let runner = MockCommandRunner::new();
+            seed_list(&runner, 0, "ims0: #1, ESTABLISHED, IKEv2, aa_i* bb_r\n");
+            strongswan_engine().terminate(&runner);
+            let calls = runner.run_calls.lock().unwrap();
+            assert_eq!(calls[0], graceful_argv());
+            assert_eq!(calls.iter().filter(|c| **c == forced_argv()).count(), 1);
+            drop(calls);
+            assert_terminate_invariants(&runner);
+        }
+
+        #[test]
+        fn a_failed_presence_query_is_forced() {
+            let runner = MockCommandRunner::new();
+            seed_list(&runner, 256, "");
+            strongswan_engine().terminate(&runner);
+            let calls = runner.run_calls.lock().unwrap();
+            assert_eq!(calls.iter().filter(|c| **c == forced_argv()).count(), 1);
+            drop(calls);
+            assert_terminate_invariants(&runner);
         }
 
         #[test]

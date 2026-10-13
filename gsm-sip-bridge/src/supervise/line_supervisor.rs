@@ -164,8 +164,10 @@ pub trait TunnelEngine {
     /// Is this line's primary process (charon / the swu dialer) still alive?
     fn is_process_alive(&self, runner: &dyn CommandRunner) -> bool;
     /// Terminates the current negotiation without restarting the process
-    /// (strongswan: `swanctl --terminate --ike <this line's connection> --force`,
-    /// non-waiting and bounded by a 10s outer timeout;
+    /// (strongswan: a graceful `swanctl --terminate --ike <this line's
+    /// connection>` waiting up to 5s for the ePDG's acknowledgement, then
+    /// `--force` only if the IKE_SA is still listed, each bounded by an outer
+    /// timeout;
     /// swu: no-op — no in-place terminate exists for this engine). Scoped to
     /// one connection: every line's connection lives in one shared charon, so
     /// a bare `ims` would tear down every line at once.
