@@ -879,6 +879,8 @@ fn volte_bridge_single_line(
         card_id,
         settings,
         msisdn: args.msisdn.clone(),
+        // The diagnostic single-line path has no `[[volte.line]]` to read.
+        reg_rejected_cooldown_sec: None,
         sip_leg_port: discovery::sip_leg_port(0),
         control_port: discovery::control_port(0),
         status_port: discovery::status_port(0),
@@ -950,6 +952,7 @@ pub(crate) fn volte_bridge_manifest_lines(
             } else {
                 Some(entry.msisdn.clone())
             },
+            reg_rejected_cooldown_sec: entry.reg_rejected_cooldown_sec,
             sip_leg_port: entry.sip_leg_port,
             control_port: entry.control_port,
             status_port: entry.status_port,
@@ -1164,6 +1167,7 @@ pub(crate) fn handle_volte_carrier_agent_command(
         } else {
             Some(entry.msisdn.clone())
         },
+        reg_rejected_cooldown_sec: entry.reg_rejected_cooldown_sec,
         sip_leg_port: entry.sip_leg_port,
         control_port: entry.control_port,
         status_port: entry.status_port,

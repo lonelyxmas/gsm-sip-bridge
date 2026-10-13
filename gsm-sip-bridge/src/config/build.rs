@@ -22,6 +22,10 @@ use super::*;
 use crate::error::{BridgeError, BridgeResult};
 
 /// Rejects a value outside its documented range, naming the key and the range.
+/// `reg_rejected_cooldown_sec`'s accepted range (specs/089 contracts/config.md):
+/// the floor keeps an operator from configuring the #124 loop back in.
+const REG_REJECTED_COOLDOWN_RANGE: std::ops::RangeInclusive<u64> = 60..=86400;
+
 fn in_range<T>(value: T, key: &str, range: std::ops::RangeInclusive<T>) -> BridgeResult<T>
 where
     T: PartialOrd + std::fmt::Display + Copy,
@@ -679,6 +683,16 @@ fn build_vowifi(raw: RawVowifi) -> BridgeResult<VowifiConfig> {
             imei_override: l.imei_override,
             pcsc_reader: l.pcsc_reader,
             msisdn: l.msisdn,
+            reg_rejected_cooldown_sec: l
+                .reg_rejected_cooldown_sec
+                .map(|v| {
+                    in_range(
+                        v,
+                        "vowifi.line.reg_rejected_cooldown_sec",
+                        REG_REJECTED_COOLDOWN_RANGE,
+                    )
+                })
+                .transpose()?,
         });
     }
 
@@ -740,6 +754,11 @@ fn build_vowifi(raw: RawVowifi) -> BridgeResult<VowifiConfig> {
         respond_on_client: raw.respond_on_client,
         sms_delivery_report: raw.sms_delivery_report,
         respect_caller_privacy: raw.respect_caller_privacy,
+        reg_rejected_cooldown_sec: in_range(
+            raw.reg_rejected_cooldown_sec,
+            "vowifi.reg_rejected_cooldown_sec",
+            REG_REJECTED_COOLDOWN_RANGE,
+        )?,
         originating_headers: {
             let mut set = crate::config::OriginatingHeaders::default();
             for token in &raw.originating_headers {
@@ -815,6 +834,16 @@ fn build_volte(raw: RawVolte, vowifi: &VowifiConfig) -> BridgeResult<VolteConfig
             pcscf: l.pcscf,
             iface: l.iface,
             msisdn: l.msisdn,
+            reg_rejected_cooldown_sec: l
+                .reg_rejected_cooldown_sec
+                .map(|v| {
+                    in_range(
+                        v,
+                        "volte.line.reg_rejected_cooldown_sec",
+                        REG_REJECTED_COOLDOWN_RANGE,
+                    )
+                })
+                .transpose()?,
         });
     }
 
@@ -847,6 +876,18 @@ fn build_volte(raw: RawVolte, vowifi: &VowifiConfig) -> BridgeResult<VolteConfig
         respect_caller_privacy: raw
             .respect_caller_privacy
             .unwrap_or(vowifi.respect_caller_privacy),
+        // Absent inherits [vowifi], for the same reason as the two above.
+        reg_rejected_cooldown_sec: raw
+            .reg_rejected_cooldown_sec
+            .map(|v| {
+                in_range(
+                    v,
+                    "volte.reg_rejected_cooldown_sec",
+                    REG_REJECTED_COOLDOWN_RANGE,
+                )
+            })
+            .transpose()?
+            .unwrap_or(vowifi.reg_rejected_cooldown_sec),
         ..d
     })
 }

@@ -146,13 +146,13 @@ All paths are relative to the repo root. `session.rs` means `gsm-sip-bridge/src/
 
 ### Configuration (FR-010)
 
-- [ ] T018 [P] [US2] Write failing config tests in the existing config build test module (`gsm-sip-bridge/src/config/`):
+- [X] T018 [P] [US2] Write failing config tests in the existing config build test module (`gsm-sip-bridge/src/config/`):
   - The default is 1800.
   - `[vowifi].reg_rejected_cooldown_sec = 600` is used, and a `[[vowifi.line]]` override wins.
   - `[volte]` absent inherits `[vowifi]`, and a `[[volte.line]]` override wins.
   - 59 and 86401 are rejected with an error naming the key.
   - An unknown-key typo is still rejected (strict parsing).
-- [ ] T019 [US2] Implement the key per `contracts/config.md`:
+- [X] T019 [US2] Implement the key per `contracts/config.md`:
   - Raw fields in `gsm-sip-bridge/src/config/raw.rs` (`RawVowifi`, `RawVowifiLine`, `RawVolte` as `Option<u64>`, `RawVolteLine`).
   - Validation and inheritance in `gsm-sip-bridge/src/config/build.rs`, and resolved fields on `VowifiConfig`, `VolteConfig` and `VolteLineOverride` in `gsm-sip-bridge/src/config/mod.rs`.
   - Thread it to `DispatchParams.reg_rejected_cooldown`: through `InboundParams` in `agent/mod.rs` from the VoWiFi per-line config, and from `gsm-sip-bridge/src/volte/carrier_agent.rs` using the line override or `[volte]`.

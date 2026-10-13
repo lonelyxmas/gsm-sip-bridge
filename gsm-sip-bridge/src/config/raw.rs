@@ -419,6 +419,9 @@ section! {
         pub epdg_ip: Option<String>,
         pub src_addr: Option<String>,
         pub keepalive_interval_sec: u64,
+        /// How long a reg-event `rejected` holds registration off. See
+        /// `VowifiConfig::reg_rejected_cooldown_sec`.
+        pub reg_rejected_cooldown_sec: u64,
         pub tunnel_engine: String,
         pub vpcd_host: String,
         pub vpcd_port: u16,
@@ -453,6 +456,7 @@ impl Default for RawVowifi {
             epdg_ip: None,
             src_addr: None,
             keepalive_interval_sec: 20,
+            reg_rejected_cooldown_sec: crate::config::DEFAULT_REG_REJECTED_COOLDOWN_SEC,
             tunnel_engine: "strongswan".to_string(),
             vpcd_host: "127.0.0.1".to_string(),
             vpcd_port: 15963,
@@ -474,6 +478,8 @@ section! {
         pub pcsc_reader: bool,
         /// specs/034-alert-identity: `[[vowifi.line]].msisdn`.
         pub msisdn: Option<String>,
+        /// Overrides `[vowifi].reg_rejected_cooldown_sec` for this line.
+        pub reg_rejected_cooldown_sec: Option<u64>,
     }
 }
 
@@ -507,6 +513,9 @@ section! {
         /// `None` inherits `[vowifi]`'s value for the same reason as
         /// `sms_delivery_report` above.
         pub respect_caller_privacy: Option<bool>,
+        /// Same meaning as `RawVowifi::reg_rejected_cooldown_sec`. `None`
+        /// inherits `[vowifi]`'s value, like `sms_delivery_report` above.
+        pub reg_rejected_cooldown_sec: Option<u64>,
         /// `[[volte.line]]` — see [`RawVowifi::line`] on the naming.
         pub line: Vec<RawVolteLine>,
     }
@@ -531,6 +540,7 @@ impl Default for RawVolte {
             respond_on_client: true,
             sms_delivery_report: None,
             respect_caller_privacy: None,
+            reg_rejected_cooldown_sec: None,
             line: Vec::new(),
         }
     }
@@ -546,6 +556,8 @@ section! {
         pub pcscf: Option<String>,
         pub iface: Option<String>,
         pub msisdn: Option<String>,
+        /// Overrides `[volte].reg_rejected_cooldown_sec` for this line.
+        pub reg_rejected_cooldown_sec: Option<u64>,
     }
 }
 

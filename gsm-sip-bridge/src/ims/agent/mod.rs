@@ -364,6 +364,9 @@ fn run_inner(
         respond_on_client: config.respond_on_client,
         sms_delivery_report: config.sms_delivery_report,
         respect_caller_privacy: config.respect_caller_privacy,
+        // Already this line's value: discovery applied any `[[vowifi.line]]`
+        // override to the per-line config.
+        reg_rejected_cooldown: Duration::from_secs(config.reg_rejected_cooldown_sec),
         // The Wi-Fi path keeps its long-standing answer ordering (FR-020) and
         // has no attachment of its own to refresh.
         answer_preference: sdp::AnswerPreference::legacy(),
@@ -704,6 +707,9 @@ pub(crate) struct InboundParams<'a> {
     /// `config::VolteConfig::respect_caller_privacy` — each caller supplies
     /// its own section's copy, same as `respond_on_client` above.
     pub respect_caller_privacy: bool,
+    /// This line's resolved `reg_rejected_cooldown_sec` (specs/089) — each
+    /// caller resolves its own section and per-line override.
+    pub reg_rejected_cooldown: Duration,
     pub answer_preference: sdp::AnswerPreference,
     /// Port the telephone-side half dials for its leg. The two halves must
     /// agree; see `inbound::handle_invite`.
@@ -765,6 +771,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         respond_on_client,
         sms_delivery_report,
         respect_caller_privacy,
+        reg_rejected_cooldown,
         answer_preference,
         veth_sip_port,
         pre_renewal,
@@ -928,9 +935,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             pbx_registered: pbx_registered.as_ref(),
             obs: &obs,
             progress: &progress,
-            reg_rejected_cooldown: Duration::from_secs(
-                crate::config::DEFAULT_REG_REJECTED_COOLDOWN_SEC,
-            ),
+            reg_rejected_cooldown,
         },
         place_call_rx,
     );
