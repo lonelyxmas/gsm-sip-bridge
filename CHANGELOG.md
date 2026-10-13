@@ -31,6 +31,16 @@ across releases.
 
 ### Fixed
 
+- **Carrier-deleted IKE_SA recovered, with its cause.** The supervisor now
+  tells a lost IKE_SA from a lost CHILD_SA, re-initiates, and restarts the
+  IMS agent once, logging `carrier DELETE`, `dead-peer timeout` or `unknown`.
+  The P-CSCF is taken from the new negotiation (waiting up to 20s) rather than
+  the previous one, teardown deletes gracefully before forcing, and leaked Gm
+  IPsec state is cleared before each agent start (strongSwan engine).
+  `[alerts.tunnel_failure]` also fires on 3 or more rebuilds within
+  `unhealthy_sec` and names the last loss cause
+  ([#106](https://github.com/selvakn/gsm-sip-bridge/issues/106)).
+
 - **Network-initiated deregistration missed when the binding is listed
   under several AORs.** A reg-event NOTIFY listing the bridge's contact under
   both a SIP and a `tel:` AOR with no IMEI echo was treated as unattributable

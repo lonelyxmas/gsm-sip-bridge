@@ -84,7 +84,10 @@ unhealthy_sec = 300               # range: 30-3600
 
 [alerts.tunnel_failure]
 # A VoWiFi line's ePDG/IPsec tunnel non-established, or its IPsec CHILD_SA missing,
-# continuously for unhealthy_sec. One alert per outage.
+# continuously for unhealthy_sec. One alert per outage. It also fires when the
+# line's tunnel is rebuilt 3 or more times within unhealthy_sec (a flapping
+# tunnel), and the alert text names the last IKE_SA loss cause (carrier DELETE,
+# dead-peer timeout or unknown).
 enabled = false
 unhealthy_sec = 300               # range: 30-3600
 
