@@ -1769,4 +1769,57 @@ mod tests {
         assert_eq!(verdict.own.retired.len(), 1);
         assert_eq!(verdict.deregistration, None);
     }
+
+    /// Story 3, scenario 1 (FR-015): the identity itself is deregistered.
+    #[test]
+    fn a_terminated_registration_is_an_identity_deregistration() {
+        let body = reginfo(
+            "terminated",
+            &[imei_contact("new", "terminated", "deactivated", CURRENT)],
+        );
+        let d = classify_reg_notify(&body, "active", IMEI, addr(CURRENT))
+            .deregistration
+            .expect("a deregistration");
+        assert_eq!(d.scope, DeregScope::IdentityDeregistered);
+        assert_eq!(d.event, DeregEvent::Deactivated);
+    }
+
+    /// Story 3, scenario 2: the identity stays registered through another
+    /// device; only our binding was removed.
+    #[test]
+    fn our_binding_removed_while_the_identity_stays_registered() {
+        let body = reginfo(
+            "active",
+            &[
+                imei_contact("new", "terminated", "rejected", CURRENT),
+                r#"<contact id="other" state="active" event="registered"><uri>sip:u@192.0.2.7:5060</uri></contact>"#
+                    .to_string(),
+            ],
+        );
+        let d = classify_reg_notify(&body, "active", IMEI, addr(CURRENT))
+            .deregistration
+            .expect("a deregistration");
+        assert_eq!(d.scope, DeregScope::BindingRemoved);
+        assert_eq!(d.event, DeregEvent::Rejected);
+    }
+
+    /// Issue #117's body: both registrations holding our binding terminated.
+    #[test]
+    fn both_aors_terminated_is_an_identity_deregistration() {
+        let d = classify_reg_notify(ISSUE_117_BODY, "active", IMEI, addr("198.51.100.10:42934"))
+            .deregistration
+            .expect("a deregistration");
+        assert_eq!(d.scope, DeregScope::IdentityDeregistered);
+    }
+
+    /// A contact not nested in any `<registration>` says nothing about the
+    /// identity, so only the binding is known to be gone.
+    #[test]
+    fn a_bare_contact_is_a_removed_binding() {
+        let body = r#"<reginfo><contact id="c1" state="terminated" event="probation"/></reginfo>"#;
+        let d = classify_reg_notify(body, "active", "", addr(CURRENT))
+            .deregistration
+            .expect("a deregistration");
+        assert_eq!(d.scope, DeregScope::BindingRemoved);
+    }
 }
