@@ -48,7 +48,41 @@ pub fn charon_log_shows_established(charon_log: &str, conn_name: &str) -> bool {
 /// imported, since this crate has no shared "bash-parity log parsers" module
 /// yet — both read the identical `received P-CSCF server IP ...` marker.
 pub fn extract_latest_pcscf(charon_log: &str, conn_name: &str) -> Option<String> {
-    pick_stable_pcscf(&latest_pcscf_batch(charon_log, conn_name))
+    pick_stable_pcscf(&latest_pcscf_batch(charon_log, conn_name).0)
+}
+
+/// The P-CSCF of a negotiation that started **after** byte offset `mark` of the
+/// charon log, or `None` while there is none yet (specs/087, research R4).
+///
+/// `mark` is the log's length taken before a recovery was issued, so only the
+/// new negotiation can answer. Only a *closed* batch (ended by a `CHILD_SA ...
+/// established` line) counts, so a half-logged negotiation is never accepted.
+/// If the log is shorter than `mark` (truncated or rotated) the whole log is
+/// read; a `mark` landing mid-line or off a char boundary is snapped forward
+/// to the next line start.
+pub fn extract_pcscf_after(charon_log: &str, conn_name: &str, mark: usize) -> Option<String> {
+    let slice = if mark > charon_log.len() {
+        charon_log
+    } else {
+        let mut at = mark;
+        while !charon_log.is_char_boundary(at) {
+            at += 1;
+        }
+        // Mid-line: the rest of that line belongs to the old batch.
+        if at > 0 && charon_log.as_bytes()[at - 1] != b'\n' {
+            match charon_log[at..].find('\n') {
+                Some(nl) => at += nl + 1,
+                None => at = charon_log.len(),
+            }
+        }
+        &charon_log[at..]
+    };
+    let (batch, closed) = latest_pcscf_batch(slice, conn_name);
+    if closed {
+        pick_stable_pcscf(&batch)
+    } else {
+        None
+    }
 }
 
 fn is_valid_pcscf_addr(s: &str) -> bool {
@@ -64,8 +98,9 @@ fn is_valid_pcscf_addr(s: &str) -> bool {
 /// lines in a row (Jio sends four: two IPv6, two IPv4) followed by the
 /// `CHILD_SA ... established` line. So a batch is the run of addresses since
 /// the last establishment: seeing an establishment closes the current batch,
-/// and the next address starts a fresh one.
-fn latest_pcscf_batch(charon_log: &str, conn_name: &str) -> Vec<String> {
+/// and the next address starts a fresh one. Also reports whether the returned
+/// batch has been closed by its establishment.
+fn latest_pcscf_batch(charon_log: &str, conn_name: &str) -> (Vec<String>, bool) {
     const MARKER: &str = "received P-CSCF server IP ";
     let mut batch: Vec<String> = Vec::new();
     let mut closed = false;
@@ -95,7 +130,7 @@ fn latest_pcscf_batch(charon_log: &str, conn_name: &str) -> Vec<String> {
             closed = true;
         }
     }
-    batch
+    (batch, closed)
 }
 
 /// Choose one P-CSCF from a batch, as a **deterministic function of the set**
@@ -117,6 +152,13 @@ fn pick_stable_pcscf(batch: &[String]) -> Option<String> {
     let v4 = batch.iter().filter(|a| !a.contains(':')).min();
     v4.or_else(|| batch.iter().min()).cloned()
 }
+
+/// How long, after a recovery that restarts the agent, to wait for the new
+/// negotiation's P-CSCF before restarting the agent with the old one (R4).
+/// Measured live: a rebuild logs its P-CSCF batch within a few seconds.
+pub const POST_RECOVERY_PCSCF_WAIT: Duration = Duration::from_secs(20);
+/// Poll interval for that wait.
+pub const POST_RECOVERY_PCSCF_POLL: Duration = Duration::from_secs(1);
 
 /// Outer bound on a steady-state IKE_SA teardown. #107's teardown waited 52s on
 /// an exchange the ePDG would never answer; `shutdown.rs`'s
@@ -382,6 +424,24 @@ pub struct StrongswanEngine {
 impl StrongswanEngine {
     fn env_prefix(&self) -> String {
         self.shared.env_prefix()
+    }
+
+    /// The charon log's current length, taken before a recovery is issued so
+    /// [`Self::fresh_pcscf_since`] can tell the new negotiation from the old.
+    /// `0` if the log cannot be read, which makes any closed batch count.
+    pub fn log_mark(&self, runner: &dyn CommandRunner) -> usize {
+        runner
+            .read_file(&self.shared.charon_log)
+            .map(|c| c.len())
+            .unwrap_or(0)
+    }
+
+    /// The P-CSCF of a negotiation logged after `mark`, if one has completed.
+    pub fn fresh_pcscf_since(&self, runner: &dyn CommandRunner, mark: usize) -> Option<String> {
+        runner
+            .read_file(&self.shared.charon_log)
+            .ok()
+            .and_then(|c| extract_pcscf_after(&c, &self.conn_name, mark))
     }
 
     /// Backgrounded `swanctl` invocation — matches the bash calls that end
@@ -930,6 +990,43 @@ mod tests {
         for (i, (log, want)) in cases.iter().enumerate() {
             assert_eq!(ike_sa_loss_cause(log, "ims0"), *want, "case {i}: {log}");
         }
+    }
+
+    #[test]
+    fn extract_pcscf_after_only_accepts_a_closed_batch_logged_after_the_mark() {
+        let old = "[CFG] <ims0|1> received P-CSCF server IP 192.0.2.10\n[IKE] <ims0|1> CHILD_SA ims0{3} established with SPIs a_i b_o\n";
+        let new_open = "[CFG] <ims0|2> received P-CSCF server IP 192.0.2.11\n";
+        let new_close = "[IKE] <ims0|2> CHILD_SA ims0{4} established with SPIs c_i d_o\n";
+        let mark = old.len();
+        // Nothing new yet.
+        assert_eq!(extract_pcscf_after(old, "ims0", mark), None);
+        // New batch, not yet closed.
+        let open = format!("{old}{new_open}");
+        assert_eq!(extract_pcscf_after(&open, "ims0", mark), None);
+        // New batch, closed.
+        let closed = format!("{old}{new_open}{new_close}");
+        assert_eq!(
+            extract_pcscf_after(&closed, "ims0", mark),
+            Some("192.0.2.11".to_string())
+        );
+        // Truncated log: the whole log is read.
+        assert_eq!(
+            extract_pcscf_after(&closed, "ims0", closed.len() + 100),
+            Some("192.0.2.11".to_string())
+        );
+        // Another connection's batch does not count.
+        let other = format!("{old}{}", closed[old.len()..].replace("ims0", "ims1"));
+        assert_eq!(extract_pcscf_after(&other, "ims0", mark), None);
+    }
+
+    #[test]
+    fn extract_pcscf_after_never_panics_on_an_awkward_mark() {
+        let log = "[CFG] <ims0|1> received P-CSCF server IP 192.0.2.10\n[IKE] <ims0|1> CHILD_SA ims0{3} established é\n";
+        for mark in 0..=log.len() + 2 {
+            let _ = extract_pcscf_after(log, "ims0", mark);
+        }
+        // A mark mid-line skips the rest of that line.
+        assert_eq!(extract_pcscf_after(log, "ims0", 10), None);
     }
 
     #[test]

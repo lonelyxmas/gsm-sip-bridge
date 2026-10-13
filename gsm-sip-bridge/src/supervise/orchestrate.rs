@@ -24,6 +24,7 @@ use crate::config::AppConfig;
 use crate::vowifi::discovery::LineResolutionEntry;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -1623,7 +1624,17 @@ fn start_vowifi_line_strongswan(
     report_child_sa(true);
     let _ = runner.write_file(Path::new(&line.pcscf_source_path), &pcscf);
 
-    start_line_tail(ctx, idx, &netns, line, &usim_holder, pcscf.clone());
+    // Shared with the agent loop: set while a rebuild is syncing the P-CSCF.
+    let rebuild_gate = Arc::new(AtomicBool::new(false));
+    start_line_tail(
+        ctx,
+        idx,
+        &netns,
+        line,
+        &usim_holder,
+        pcscf.clone(),
+        Arc::clone(&rebuild_gate),
+    );
 
     // Rebuilt rather than threaded out of `establish_line_tunnel`: a plain
     // value struct over `ctx.shared_charon` (an `Arc`, cheap to re-derive),
@@ -1668,6 +1679,9 @@ fn start_vowifi_line_strongswan(
         if *guard {
             return;
         }
+        // Taken before the tick: a recovery inside it renegotiates, and only a
+        // negotiation logged after this point can carry the new P-CSCF.
+        let mark = engine.log_mark(runner.as_ref());
         let outcome = line_supervisor::tick_steady_state(
             &engine,
             runner.as_ref(),
@@ -1724,29 +1738,47 @@ fn start_vowifi_line_strongswan(
                 }
                 drop(guard);
                 // A recovery that renegotiates the tunnel comes back with a
-                // *fresh* P-CSCF pool — the carrier assigns a different set
-                // per IKE_SA, along with a new virtual IP — so the recorded
-                // value is stale the instant the recovery finishes. Sync it
-                // here, before the agent restarts below, rather than leaving
-                // it for the next steady-state tick to notice.
+                // *fresh* P-CSCF pool -- the carrier assigns a different set per
+                // IKE_SA, along with a new virtual IP -- so the recorded value is
+                // stale once the rebuild lands, and a stale value makes the next
+                // tick log `P-CSCF changed` for a rebuild we caused ourselves and
+                // kill a healthy registration (Jio, 2026-08-14).
                 //
-                // Leaving it caused a self-inflicted teardown, measured on
-                // Jio 2026-08-14: the `tun23-0 missing; recreating and
-                // forcing reinitiate` path renegotiated at T+0, the agent
-                // restarted and *registered successfully* at T+8s, and then
-                // the steady-state tick at T+30s compared the new pool
-                // against the pre-recovery value, logged `P-CSCF changed`
-                // for a reinitiate we had caused ourselves, and killed a
-                // healthy registration.
-                if let Some(latest) = engine.latest_pcscf(runner.as_ref()) {
-                    if latest != current_pcscf {
-                        let _ = runner.write_file(Path::new(&line.pcscf_source_path), &latest);
-                        current_pcscf = latest;
-                    }
-                }
+                // The recovery only *starts* the negotiation (`--initiate` is
+                // detached), so reading the log right here returns the previous
+                // one (#106 triage). Wait for a negotiation logged after `mark`,
+                // record its P-CSCF, then restart the agent exactly once. The
+                // gate keeps the agent loop from respawning in between.
+                //
+                // A bare CHILD_SA re-initiate neither restarts the agent nor
+                // can change the P-CSCF, so it syncs nothing.
                 if line_supervisor::recovery_restarts_agent(reason) {
+                    rebuild_gate.store(true, Ordering::SeqCst);
+                    let stop = || *shutting_down.read().unwrap();
+                    let fresh = await_fresh_pcscf(
+                        runner.as_ref(),
+                        super::engines::POST_RECOVERY_PCSCF_WAIT,
+                        super::engines::POST_RECOVERY_PCSCF_POLL,
+                        &stop,
+                        &|| engine.fresh_pcscf_since(runner.as_ref(), mark),
+                    );
+                    match fresh {
+                        Some(p) => {
+                            println!(
+                                "[supervise] line {idx}: P-CSCF synced from new negotiation: {p}"
+                            );
+                            let _ = runner.write_file(Path::new(&line.pcscf_source_path), &p);
+                            current_pcscf = p;
+                        }
+                        None if !stop() => println!(
+                            "[supervise] line {idx}: no new negotiation within {}s; restarting agent with P-CSCF {current_pcscf}",
+                            super::engines::POST_RECOVERY_PCSCF_WAIT.as_secs()
+                        ),
+                        None => {}
+                    }
                     let _ =
                         runner.run(&["pkill", "-f", &format!("vowifi-ims-agent --line {idx}$")]);
+                    rebuild_gate.store(false, Ordering::SeqCst);
                 }
             }
         }
@@ -1779,6 +1811,53 @@ fn repair_line_veth(runner: &dyn CommandRunner, idx: u32, netns: &str, line: &Li
     }
 }
 
+/// Waits up to `wait` for a negotiation newer than a log marker to report its
+/// P-CSCF, polling `fresh` every `poll` (specs/087, research R4). Reads first,
+/// then sleeps, so a negotiation that is already logged costs no delay. Gives up
+/// early (`None`) when `stop()` says the container is shutting down.
+fn await_fresh_pcscf(
+    runner: &dyn CommandRunner,
+    wait: Duration,
+    poll: Duration,
+    stop: &dyn Fn() -> bool,
+    fresh: &dyn Fn() -> Option<String>,
+) -> Option<String> {
+    let polls = (wait.as_millis() / poll.as_millis().max(1)) as u32;
+    for i in 0..=polls {
+        if stop() {
+            return None;
+        }
+        if let Some(p) = fresh() {
+            return Some(p);
+        }
+        if i < polls {
+            runner.sleep(poll);
+        }
+    }
+    None
+}
+
+/// Holds the agent loop's next spawn while a tunnel rebuild is in flight
+/// (specs/087, research R5): without it the old agent can exit on its own
+/// during the P-CSCF wait and be respawned with the stale address, and the
+/// post-sync `pkill` would then restart it a second time. Bounded by `bound`,
+/// so a bug elsewhere can never wedge the line, and abandoned on `stop()`.
+fn wait_for_rebuild_gate(
+    flag: &AtomicBool,
+    runner: &dyn CommandRunner,
+    bound: Duration,
+    stop: &dyn Fn() -> bool,
+) {
+    let poll = Duration::from_secs(1);
+    let polls = bound.as_secs();
+    for _ in 0..polls {
+        if !flag.load(Ordering::SeqCst) || stop() {
+            return;
+        }
+        runner.sleep(poll);
+    }
+}
+
 /// Veth pair + this line's vowifi-ims-agent (with per-incident USIM
 /// auto-recovery) + the idle-tunnel keepalive — 1:1 port of
 /// `start_line_tail` and its keepalive sibling. Both supervision loops run
@@ -1791,6 +1870,7 @@ fn start_line_tail(
     line: &LineResolutionEntry,
     usim_holder: &Arc<Mutex<Option<Arc<ChildHandle>>>>,
     initial_pcscf: String,
+    rebuild_gate: Arc<AtomicBool>,
 ) {
     let runner = ctx.runner;
     let bin = ctx.bin;
@@ -1827,6 +1907,7 @@ fn start_line_tail(
         let usim_holder = Arc::clone(usim_holder);
         let started = Arc::clone(started);
         let shutting_down = Arc::clone(shutting_down);
+        let rebuild_gate = Arc::clone(&rebuild_gate);
         let alert_ctx = alert_ctx.cloned();
         let line_id = line.card_id.clone();
         // specs/034-alert-identity: resolve this line's number before the
@@ -1851,6 +1932,16 @@ fn start_line_tail(
             // previous run's netns still holds the tunnel's XFRM if_id).
             let mut had_restart = false;
             loop {
+                // Held while a tunnel rebuild is syncing the P-CSCF, so the
+                // agent is not respawned against the stale address in between
+                // (specs/087, R5). Before taking the shutdown guard, which it
+                // must not hold while waiting.
+                wait_for_rebuild_gate(
+                    &rebuild_gate,
+                    runner.as_ref(),
+                    super::engines::POST_RECOVERY_PCSCF_WAIT + Duration::from_secs(5),
+                    &|| *shutting_down.read().unwrap(),
+                );
                 let guard = shutting_down.read().unwrap();
                 if *guard {
                     return;
@@ -2124,7 +2215,15 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
     }
 
     let usim_holder: Arc<Mutex<Option<Arc<ChildHandle>>>> = Arc::new(Mutex::new(None));
-    start_line_tail(ctx, idx, &netns, line, &usim_holder, pcscf.clone());
+    start_line_tail(
+        ctx,
+        idx,
+        &netns,
+        line,
+        &usim_holder,
+        pcscf.clone(),
+        Arc::new(AtomicBool::new(false)),
+    );
 
     let mut current_pcscf = pcscf;
     let mut tracking = line_supervisor::SteadyTracking::default();
@@ -2842,5 +2941,90 @@ mod tests {
             modem_line(0, "/dev/ttyUSB0"),
             pcsc_line(1)
         ]));
+    }
+
+    mod rebuild_sync_tests {
+        use super::*;
+        use crate::supervise::runner::MockCommandRunner;
+        use std::cell::Cell;
+
+        // MOCK JUSTIFICATION (constitution Principle I): the runner stands in
+        // for the real clock and charon log, which CI cannot provide. The
+        // waiting logic under test is the real production code.
+
+        const WAIT: Duration = Duration::from_secs(20);
+        const POLL: Duration = Duration::from_secs(1);
+
+        #[test]
+        fn a_negotiation_that_appears_on_the_third_read_is_returned_after_two_sleeps() {
+            let runner = MockCommandRunner::new();
+            let reads = Cell::new(0);
+            let got = await_fresh_pcscf(&runner, WAIT, POLL, &|| false, &|| {
+                reads.set(reads.get() + 1);
+                (reads.get() == 3).then(|| "192.0.2.11".to_string())
+            });
+            assert_eq!(got, Some("192.0.2.11".to_string()));
+            assert_eq!(runner.sleeps.lock().unwrap().len(), 2);
+        }
+
+        #[test]
+        fn no_negotiation_gives_up_after_the_bound() {
+            let runner = MockCommandRunner::new();
+            assert_eq!(
+                await_fresh_pcscf(&runner, WAIT, POLL, &|| false, &|| None),
+                None
+            );
+            assert_eq!(runner.sleeps.lock().unwrap().len(), 20);
+        }
+
+        #[test]
+        fn shutdown_abandons_the_wait_at_once() {
+            let runner = MockCommandRunner::new();
+            let reads = Cell::new(0);
+            let got = await_fresh_pcscf(&runner, WAIT, POLL, &|| true, &|| {
+                reads.set(reads.get() + 1);
+                None
+            });
+            assert_eq!(got, None);
+            assert_eq!(reads.get(), 0);
+            assert!(runner.sleeps.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn the_gate_returns_immediately_when_clear() {
+            let runner = MockCommandRunner::new();
+            wait_for_rebuild_gate(&AtomicBool::new(false), &runner, WAIT, &|| false);
+            assert!(runner.sleeps.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn the_gate_returns_once_the_flag_clears() {
+            let runner = MockCommandRunner::new();
+            let flag = AtomicBool::new(true);
+            // Clear it from inside `stop`, which is polled once per iteration.
+            let polls = Cell::new(0);
+            wait_for_rebuild_gate(&flag, &runner, WAIT, &|| {
+                polls.set(polls.get() + 1);
+                if polls.get() == 2 {
+                    flag.store(false, Ordering::SeqCst);
+                }
+                false
+            });
+            assert_eq!(runner.sleeps.lock().unwrap().len(), 2);
+        }
+
+        #[test]
+        fn the_gate_gives_up_at_the_bound_even_if_never_cleared() {
+            let runner = MockCommandRunner::new();
+            wait_for_rebuild_gate(&AtomicBool::new(true), &runner, WAIT, &|| false);
+            assert_eq!(runner.sleeps.lock().unwrap().len(), 20);
+        }
+
+        #[test]
+        fn the_gate_is_abandoned_on_shutdown() {
+            let runner = MockCommandRunner::new();
+            wait_for_rebuild_gate(&AtomicBool::new(true), &runner, WAIT, &|| true);
+            assert!(runner.sleeps.lock().unwrap().is_empty());
+        }
     }
 }

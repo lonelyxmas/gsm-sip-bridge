@@ -101,18 +101,18 @@ All paths are relative to the repo root. `supervise/` means `gsm-sip-bridge/src/
 
 ### Tests for User Story 2
 
-- [ ] T012 [P] [US2] Write failing tests in `gsm-sip-bridge/src/supervise/engines.rs` for `pub fn extract_pcscf_after(charon_log: &str, conn_name: &str, mark: usize) -> Option<String>`:
+- [x] T012 [P] [US2] Write failing tests in `gsm-sip-bridge/src/supervise/engines.rs` for `pub fn extract_pcscf_after(charon_log: &str, conn_name: &str, mark: usize) -> Option<String>`:
   - An old batch before `mark` plus nothing after → `None`.
   - Old batch, then a new batch after `mark` closed by `CHILD_SA ims0{4} established` → the new batch's `pick_stable_pcscf` (IPv4 preferred, minimum).
   - A new batch after `mark` *not yet closed* → `None`.
   - `mark > log.len()` (truncated) with a closed batch → found.
   - Another connection's batch after `mark` → `None`.
   - `mark` landing mid-line or on a non-char boundary must not panic: snap to the next `\n`, or use `get(mark..)` falling back to the whole log.
-- [ ] T013 [P] [US2] Write failing tests in `gsm-sip-bridge/src/supervise/orchestrate.rs` (`#[cfg(test)]`, `MockCommandRunner`) for a new helper `fn await_fresh_pcscf(engine: &StrongswanEngine, runner: &dyn CommandRunner, mark: usize, wait: Duration, poll: Duration, stop: &dyn Fn() -> bool) -> Option<String>`. The mock's charon-log reads return a growing log; mock `sleep` returns immediately and is counted. Cases:
+- [x] T013 [P] [US2] Write failing tests in `gsm-sip-bridge/src/supervise/orchestrate.rs` (`#[cfg(test)]`, `MockCommandRunner`) for a new helper `fn await_fresh_pcscf(engine: &StrongswanEngine, runner: &dyn CommandRunner, mark: usize, wait: Duration, poll: Duration, stop: &dyn Fn() -> bool) -> Option<String>`. The mock's charon-log reads return a growing log; mock `sleep` returns immediately and is counted. Cases:
   - The new batch appears on the 3rd read → `Some(addr)` after 2 sleeps.
   - Never appears → `None` after `wait / poll` sleeps.
   - `stop()` true → returns `None` at once.
-- [ ] T014 [P] [US2] Write failing tests for the agent-loop spawn gate in `gsm-sip-bridge/src/supervise/orchestrate.rs`. Extract the wait as `fn wait_for_rebuild_gate(flag: &AtomicBool, runner: &dyn CommandRunner, bound: Duration, stop: &dyn Fn() -> bool)`. Cases:
+- [x] T014 [P] [US2] Write failing tests for the agent-loop spawn gate in `gsm-sip-bridge/src/supervise/orchestrate.rs`. Extract the wait as `fn wait_for_rebuild_gate(flag: &AtomicBool, runner: &dyn CommandRunner, bound: Duration, stop: &dyn Fn() -> bool)`. Cases:
   - Returns immediately when clear.
   - Returns once the flag clears.
   - Returns at the bound even if the flag never clears.
@@ -120,16 +120,16 @@ All paths are relative to the repo root. `supervise/` means `gsm-sip-bridge/src/
 
 ### Implementation for User Story 2
 
-- [ ] T015 [US2] In `gsm-sip-bridge/src/supervise/engines.rs`:
+- [x] T015 [US2] In `gsm-sip-bridge/src/supervise/engines.rs`:
   - Change `latest_pcscf_batch` to also report whether the batch was closed (e.g. return `(Vec<String>, bool)`). Keep `extract_latest_pcscf` behaviour identical.
   - Implement `extract_pcscf_after` (T012).
   - Add inherent methods on `StrongswanEngine`: `pub fn log_mark(&self, runner) -> usize` (the charon log's `len()`, 0 on error) and `pub fn fresh_pcscf_since(&self, runner, mark) -> Option<String>`.
   - Add constants `POST_RECOVERY_PCSCF_WAIT: Duration = 20s` and `POST_RECOVERY_PCSCF_POLL: Duration = 1s`, with a doc citing research R4.
-- [ ] T016 [US2] In `gsm-sip-bridge/src/supervise/orchestrate.rs`:
+- [x] T016 [US2] In `gsm-sip-bridge/src/supervise/orchestrate.rs`:
   - Implement `await_fresh_pcscf` (T013) and `wait_for_rebuild_gate` (T014).
   - Create one `Arc<AtomicBool>` "rebuild in progress" per strongswan line. Pass it to both the steady loop and the agent loop (the closure/thread around line 1845). Find where the two are spawned for the line and thread it through the same context they already share.
   - In the agent loop, call `wait_for_rebuild_gate(&flag, runner, POST_RECOVERY_PCSCF_WAIT + 5s, &|| *shutting_down.read().unwrap())` immediately before the spawn. Do not hold the shutdown guard while waiting: take it only after the wait, as the loop does today.
-- [ ] T017 [US2] In the strongswan steady loop in `gsm-sip-bridge/src/supervise/orchestrate.rs`:
+- [x] T017 [US2] In the strongswan steady loop in `gsm-sip-bridge/src/supervise/orchestrate.rs`:
   - Take `let mark = engine.log_mark(runner.as_ref());` before `tick_steady_state`.
   - In the `Recovered` arm, after `drop(guard)`, when `recovery_restarts_agent(reason)`:
     1. Set the flag.
