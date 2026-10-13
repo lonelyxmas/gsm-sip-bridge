@@ -91,6 +91,11 @@ pub enum ControlMessage {
         /// `unknown` rather than claiming health it was not told about.
         #[serde(default)]
         gm_connection: String,
+        /// While a reg-event `rejected` holds registration off, when the next
+        /// attempt goes out (unix seconds) — specs/089 FR-017. `None` when no
+        /// cooldown is running, and from an older peer that omits it.
+        #[serde(default)]
+        rejection_cooldown_until: Option<u64>,
     },
     /// Agent B → `vowifi-status`. Recent call outcomes, newest first.
     CallHistoryReply { calls: Vec<CallRecord> },
@@ -259,6 +264,10 @@ pub mod reason {
     /// [`ATTACHMENT_LOST`]/[`TRANSPORT_ERROR`] so it is diagnosable after
     /// the fact rather than looking like an ordinary hangup.
     pub const SESSION_TIMER_EXPIRED: &str = "session_timer_expired";
+    /// A reg-event NOTIFY reported our registration `rejected`: the network
+    /// has released every session bound to it (TS 24.229 §5.4.1.5), so a
+    /// call in progress or being placed is ended (specs/089 FR-009).
+    pub const REGISTRATION_REJECTED: &str = "registration_rejected";
 }
 
 /// Read one newline-terminated JSON `ControlMessage` from `reader`, blocking
@@ -607,6 +616,7 @@ mod tests {
             can_answer: true,
             blocked_reason: None,
             gm_connection: "up".to_string(),
+            rejection_cooldown_until: None,
         };
         assert_eq!(roundtrip(&msg), msg);
     }
@@ -621,6 +631,7 @@ mod tests {
             can_answer: false,
             blocked_reason: Some("not registered".to_string()),
             gm_connection: "reconnecting since 2026-08-07T10:14:03+00:00 (attempt 2)".to_string(),
+            rejection_cooldown_until: Some(1_700_001_800),
         };
         assert_eq!(roundtrip(&msg), msg);
     }
@@ -633,8 +644,14 @@ mod tests {
         let older = r#"{"event":"registration_status_reply","state":"Registered","registered_at":1700000000,"expires_at":1700003600,"last_failure":null,"can_answer":true,"blocked_reason":null}"#;
         let parsed: ControlMessage = serde_json::from_str(older).unwrap();
         match parsed {
-            ControlMessage::RegistrationStatusReply { gm_connection, .. } => {
+            ControlMessage::RegistrationStatusReply {
+                gm_connection,
+                rejection_cooldown_until,
+                ..
+            } => {
                 assert_eq!(gm_connection, "");
+                // specs/089: nor does it know of the rejection cooldown.
+                assert_eq!(rejection_cooldown_until, None);
             }
             other => panic!("unexpected variant: {other:?}"),
         }

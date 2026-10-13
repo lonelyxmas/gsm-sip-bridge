@@ -17,6 +17,9 @@ const LOGGING_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
 
 const DEFAULT_SMS_DB_PATH: &str = "/var/lib/gsm-sip-bridge/store.db";
 pub const DEFAULT_CONTROL_SOCKET: &str = "/tmp/gsm-sip-bridge.sock";
+/// How long a reg-event `rejected` holds registration off by default
+/// (`reg_rejected_cooldown_sec`, specs/089 FR-010).
+pub const DEFAULT_REG_REJECTED_COOLDOWN_SEC: u64 = 1800;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SipTransport {

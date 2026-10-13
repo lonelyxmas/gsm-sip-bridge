@@ -461,6 +461,12 @@ impl PendingOrigination {
         self.stop_early_relay();
     }
 
+    /// Whether a CANCEL for this attempt is still outstanding — it must then
+    /// be kept, so a racing answer is ACKed and BYEd rather than leaked.
+    pub(super) fn awaiting_cancel(&self) -> bool {
+        matches!(self.step, OriginationStep::AwaitingCancel { .. })
+    }
+
     /// Stops a relay already running from early media (specs/037-p-early-media),
     /// if one is. A no-op when none was ever started. Every termination path
     /// that drops this `PendingOrigination` without reaching
@@ -1294,6 +1300,24 @@ fn abandon_origination(p: &mut PendingOrigination, session: &mut crate::ims::Reg
             hangup_pending_carrier_leg(p, session, reason::CALLER_HANGUP);
         }
         // Already cancelling — a duplicate `CallEnded`; nothing more to do.
+        OriginationStep::AwaitingCancel { .. } => {}
+    }
+}
+
+/// End an attempt this side has to give up on — not one Agent B abandoned, so
+/// unlike [`abandon_origination`] Agent B is told, with `reason`, via
+/// `CallFailed`. Then the same per-step teardown: CANCEL a pending INVITE
+/// (the attempt stays in `AwaitingCancel` so a racing answer is still
+/// cleaned up), or BYE an already-answered leg.
+pub(super) fn fail_origination(
+    p: &mut PendingOrigination,
+    session: &mut crate::ims::RegisteredSession,
+    reason: &str,
+) {
+    p.fail(reason);
+    match &p.step {
+        OriginationStep::AwaitingCarrier => p.begin_cancel(session),
+        OriginationStep::AwaitingVeth { .. } => hangup_pending_carrier_leg(p, session, reason),
         OriginationStep::AwaitingCancel { .. } => {}
     }
 }
@@ -2295,5 +2319,101 @@ mod tests {
                 "if the call finalized, it must be running a freshly built relay, not the old PCMU one"
             );
         }
+    }
+
+    /// The `CallFailed` Agent B reads on its end of the control connection,
+    /// past any progress (`CallPlaced`) reported before it.
+    fn read_call_failed(server: TcpStream) -> (String, String) {
+        server
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut reader = std::io::BufReader::new(server);
+        loop {
+            match crate::vowifi::control::read_msg(&mut reader).expect("a control message") {
+                ControlMessage::CallFailed { call_id, reason } => return (call_id, reason),
+                ControlMessage::CallPlaced { .. } => {}
+                other => panic!("expected CallFailed, got {other:?}"),
+            }
+        }
+    }
+
+    fn peer_session() -> (crate::ims::RegisteredSession, UdpSocket) {
+        let mut session = test_session();
+        let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        session.transport = Some(
+            crate::ims::sip_client::SipTransport::connect(peer.local_addr().unwrap(), false)
+                .unwrap(),
+        );
+        (session, peer)
+    }
+
+    /// specs/089 FR-009: an attempt still ringing is told why it failed and
+    /// CANCELled, and kept so a racing answer is still cleaned up.
+    #[test]
+    fn failing_a_ringing_origination_reports_it_and_cancels() {
+        let call_id = "out-rejected-1";
+        let (control, server) = control_pair();
+        let (mut session, peer) = peer_session();
+        let (mut p, _ctrl_tx) = test_pending(call_id, control);
+
+        fail_origination(&mut p, &mut session, reason::REGISTRATION_REJECTED);
+
+        assert_eq!(
+            read_call_failed(server),
+            (
+                call_id.to_string(),
+                reason::REGISTRATION_REJECTED.to_string()
+            )
+        );
+        let mut buf = [0u8; 4096];
+        let n = peer.recv(&mut buf).expect("CANCEL was not sent");
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("CANCEL "));
+        assert!(p.awaiting_cancel());
+    }
+
+    /// An attempt the carrier already answered is told why, and its leg BYEd.
+    #[test]
+    fn failing_an_answered_origination_reports_it_and_byes() {
+        let call_id = "out-rejected-2";
+        let (control, server) = control_pair();
+        let (mut session, peer) = peer_session();
+        let (mut p, _ctrl_tx) = test_pending(call_id, control);
+        let ok = SipResponse {
+            status: 200,
+            reason: "OK".to_string(),
+            headers: vec![
+                ("Call-ID".to_string(), call_id.to_string()),
+                ("CSeq".to_string(), "1 INVITE".to_string()),
+                (
+                    "To".to_string(),
+                    "<sip:9000000001@example.test>;tag=totag".to_string(),
+                ),
+                (
+                    "Contact".to_string(),
+                    "<sip:9000000001@192.0.2.1:6000>".to_string(),
+                ),
+            ],
+            body: "v=0\r\nc=IN IP4 127.0.0.1\r\nm=audio 40000 RTP/AVP 0\r\n".to_string(),
+        };
+        let _ = p.on_carrier_response(&ok, &mut session);
+        assert!(matches!(p.step, OriginationStep::AwaitingVeth { .. }));
+        let mut buf = [0u8; 4096];
+        let n = peer.recv(&mut buf).expect("ACK was not sent");
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("ACK "));
+
+        fail_origination(&mut p, &mut session, reason::REGISTRATION_REJECTED);
+
+        assert_eq!(
+            read_call_failed(server),
+            (
+                call_id.to_string(),
+                reason::REGISTRATION_REJECTED.to_string()
+            )
+        );
+        let n = peer.recv(&mut buf).expect("BYE was not sent");
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("BYE "));
+        assert!(!p.awaiting_cancel());
     }
 }

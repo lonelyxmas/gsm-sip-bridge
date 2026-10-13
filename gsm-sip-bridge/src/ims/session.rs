@@ -815,13 +815,8 @@ pub(crate) fn classify_reg_notify(
 /// receive nothing until the next scheduled renewal, up to an hour later
 /// (specs/041 conformance review, MT-09).
 ///
-/// This bridge always retries rather than giving up outright — the
-/// same philosophy `GmConnectionState::Failed` already follows (not
-/// terminal, keeps retrying on backoff) — so `rejected`/`unregistered` are
-/// handled the same as `deactivated`/`probation`: force a fresh attempt, and
-/// let the renewal-failure backoff take over if the network keeps refusing
-/// the bindings it has just accepted (the caller's
-/// `on_network_deregistration`).
+/// What the line does about each event is the caller's policy
+/// (`on_network_deregistration`, TS 24.229 §5.1.1.7).
 pub(crate) fn handle_notify(
     session: &super::RegisteredSession,
     sink: &SipSink,

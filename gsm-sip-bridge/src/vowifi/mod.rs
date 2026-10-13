@@ -2197,6 +2197,7 @@ pub fn print_status(_config: &VowifiConfig) -> ExitCode {
                 can_answer,
                 blocked_reason,
                 gm_connection,
+                rejection_cooldown_until,
             }) => {
                 println!("    state: {state}");
                 println!("    registered_at: {}", format_unix(registered_at));
@@ -2218,6 +2219,10 @@ pub fn print_status(_config: &VowifiConfig) -> ExitCode {
                     } else {
                         &gm_connection
                     }
+                );
+                println!(
+                    "    rejection_cooldown: {}",
+                    format_rejection_cooldown(rejection_cooldown_until, unix_now())
                 );
                 match last_failure {
                     Some((t, msg)) => println!("    last_failure: {} {msg}", format_unix(Some(t))),
@@ -2317,6 +2322,32 @@ pub fn format_expires_in(expires_at: Option<u64>, now: u64) -> String {
     }
 }
 
+/// The reg-event `rejected` cooldown for status output (specs/089 FR-017):
+/// `none`, or when it ends and how long that is from `now`.
+pub fn format_rejection_cooldown(until: Option<u64>, now: u64) -> String {
+    match until {
+        None => "none".to_string(),
+        Some(until) => {
+            let at = i64::try_from(until)
+                .ok()
+                .and_then(|t| chrono::DateTime::<chrono::Utc>::from_timestamp(t, 0))
+                .map_or_else(|| until.to_string(), |t| t.to_rfc3339());
+            format!(
+                "until {at} (next attempt in {}s)",
+                until.saturating_sub(now)
+            )
+        }
+    }
+}
+
+/// Seconds since the unix epoch, `0` if the clock is before it.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Connects to `addr` (`host:port`), sends `StatusQuery`, and returns
 /// whatever single reply comes back. Used against both Agent A's status
 /// port and Agent B's control port — each answers with the reply variant
@@ -2336,6 +2367,24 @@ pub fn query_status(addr: &str) -> BridgeResult<ControlMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejection_cooldown_reads_none_when_not_running() {
+        assert_eq!(format_rejection_cooldown(None, 1_700_000_000), "none");
+    }
+
+    #[test]
+    fn rejection_cooldown_reads_when_it_ends_and_how_long_until_then() {
+        assert_eq!(
+            format_rejection_cooldown(Some(1_700_001_712), 1_700_000_000),
+            "until 2023-11-14T22:41:52+00:00 (next attempt in 1712s)"
+        );
+        // A stale reply read just after the cooldown ended never goes negative.
+        assert!(
+            format_rejection_cooldown(Some(1_700_000_000), 1_700_000_005)
+                .ends_with("(next attempt in 0s)")
+        );
+    }
     use std::io::Write;
 
     /// specs/084 FR-001: the telephone side's final status, not merely the

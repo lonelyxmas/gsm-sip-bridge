@@ -50,7 +50,8 @@ use crate::ims::sdp;
 use crate::ims::session::{
     attempt_renewal, extract_caller, header_uri, map_registration_error,
     map_registration_status_code, next_backoff, respond, send_sms_delivery_report, start_inbound,
-    subscribe_reg_event, to_unix, unresolved_caller_diagnostic, Inbound,
+    subscribe_reg_event, to_unix, unresolved_caller_diagnostic, DeregEvent, Deregistration,
+    Inbound,
 };
 use crate::ims::sip_client::{
     build_200_ok_message, build_415_unsupported_media, build_486_busy_here,
@@ -927,6 +928,9 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             pbx_registered: pbx_registered.as_ref(),
             obs: &obs,
             progress: &progress,
+            reg_rejected_cooldown: Duration::from_secs(
+                crate::config::DEFAULT_REG_REJECTED_COOLDOWN_SEC,
+            ),
         },
         place_call_rx,
     );
@@ -1011,6 +1015,7 @@ fn run_status_listener(
                     can_answer: health.can_answer(),
                     blocked_reason: health.blocked_reason().map(str::to_string),
                     gm_connection: snapshot.gm_connection.render(),
+                    rejection_cooldown_until: snapshot.rejected_until.and_then(to_unix),
                 };
                 let _ = write_msg(&mut stream, &reply);
             }
@@ -1692,6 +1697,10 @@ struct DispatchParams<'a> {
     /// Publishes which phase the loop is in, so the watchdog can tell a line
     /// that is working from one that has stopped (specs/039-at-stall-watchdog).
     progress: &'a Arc<watchdog::Progress>,
+    /// How long a reg-event `rejected` holds registration off — see
+    /// `config::VowifiConfig::reg_rejected_cooldown_sec`; consumed by
+    /// [`LoopState::on_network_deregistration`].
+    reg_rejected_cooldown: Duration,
 }
 
 impl DispatchParams<'_> {
@@ -1716,6 +1725,14 @@ impl DispatchParams<'_> {
             originating_headers: self.originating_headers,
         }
     }
+}
+
+/// A reg-event `rejected` cooldown: no registration is attempted before
+/// `until`. `until_wall` is the same moment, for status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RejectionCooldown {
+    until: Instant,
+    until_wall: SystemTime,
 }
 
 /// The state the dispatch loop carries across iterations.
@@ -1774,6 +1791,10 @@ struct LoopState {
     /// as a failure — a registrar can report the same loss in more than one
     /// NOTIFY, and only the first may move the ladder.
     early_loss_counted: bool,
+    /// Set while a reg-event `rejected` holds registration off
+    /// ([`Self::on_network_deregistration`]); cleared when the cooldown's one
+    /// attempt starts, and by any successful renewal.
+    rejection: Option<RejectionCooldown>,
     /// The renewal budget was spent by a loss reported mid-call, where exiting
     /// would have torn the call down. Owed to the supervisor as soon as the
     /// line is idle — checked before any renewal can run and clear the count.
@@ -1805,6 +1826,7 @@ impl LoopState {
             last_registered: Instant::now(),
             ladder_before_success: (RETRY_INITIAL_BACKOFF, 0),
             early_loss_counted: false,
+            rejection: None,
             budget_exit_owed: None,
             unreadable_caller_warned: None,
             recent_declines: RecentDeclines::default(),
@@ -1873,21 +1895,35 @@ impl LoopState {
         self.ladder_before_success = (self.backoff, self.consecutive_renewal_failures);
         self.last_registered = Instant::now();
         self.early_loss_counted = false;
+        self.rejection = None;
         self.backoff = RETRY_INITIAL_BACKOFF;
         self.consecutive_renewal_failures = 0;
         self.next_renewal_attempt = None;
     }
 
-    /// A reg-event NOTIFY reported our binding deregistered: re-register.
+    /// A reg-event NOTIFY reported our current binding deregistered: apply
+    /// TS 24.229 §5.1.1.7's response for its event (§5.4.1.5 on the network
+    /// side). `cooldown` is this line's `reg_rejected_cooldown_sec`.
+    ///
+    /// | Event | Response |
+    /// |---|---|
+    /// | `deactivated` | re-register at once |
+    /// | `unregistered` / `probation` | re-register on the backoff ladder, never sooner than the network's `retry-after` |
+    /// | `rejected` | hold off for `max(cooldown, retry-after)`, then try once |
     ///
     /// A binding that had been live for [`REGISTRATION_SETTLE`] or longer was
-    /// dropped by something new on the network's side, so the re-registration
-    /// goes out at once, as it always has. One dropped sooner means the
-    /// registration that created it did not really succeed: the ladder it
-    /// cleared is put back and this counts as one more failure on it, so a
-    /// network that keeps rejecting fresh bindings gets the same backoff, and
-    /// eventually the same exit to the supervisor, as one that refuses the
-    /// REGISTER outright (issue #117).
+    /// dropped by something new on the network's side. One dropped sooner
+    /// means the registration that created it did not really succeed: the
+    /// ladder it cleared is put back and this counts as one more failure on
+    /// it, so a network that keeps dropping fresh bindings gets the same
+    /// backoff, and eventually the same exit to the supervisor, as one that
+    /// refuses the REGISTER outright (issue #117). A `deactivated` early loss
+    /// on a clean ladder still goes out at once; it is counted all the same.
+    ///
+    /// `rejected` never counts against the budget: the network has said not
+    /// to come back for a while, and exiting to the supervisor would only
+    /// come back sooner. The cooldown is a far-off `next_renewal_attempt` that
+    /// [`Self::schedule_renewal_retry`] never touches (FR-012).
     ///
     /// Counted once per registration: a repeat NOTIFY about the same loss
     /// leaves the pending retry, and any renewal failure counted since, alone.
@@ -1897,19 +1933,93 @@ impl LoopState {
     /// already held it for any call in progress; a NOTIFY can arrive mid-call.
     /// A loss that spends the budget then is still counted, and the exit is
     /// owed until the call ends — see [`Self::take_owed_budget_exit`].
-    fn on_network_deregistration(&mut self, now: Instant, busy: bool) -> BridgeResult<()> {
+    fn on_network_deregistration(
+        &mut self,
+        now: Instant,
+        busy: bool,
+        deregistration: &Deregistration,
+        cooldown: Duration,
+    ) -> BridgeResult<()> {
         self.force_renewal = true;
         let age = now.saturating_duration_since(self.last_registered);
-        if age >= REGISTRATION_SETTLE || self.early_loss_counted {
-            return Ok(());
+        let early = age < REGISTRATION_SETTLE;
+        match deregistration.event {
+            DeregEvent::Rejected => {
+                let hold = cooldown.max(deregistration.retry_after.unwrap_or_default());
+                let until = now + hold;
+                let until_wall = SystemTime::now() + hold;
+                // A failure of the one attempt after the cooldown starts the
+                // normal ladder clean (FR-011).
+                self.backoff = RETRY_INITIAL_BACKOFF;
+                self.consecutive_renewal_failures = 0;
+                self.early_loss_counted = true;
+                self.rejection = Some(RejectionCooldown { until, until_wall });
+                self.next_renewal_attempt = Some(until);
+                tracing::warn!(
+                    cooldown_secs = hold.as_secs(),
+                    retry_after_secs = deregistration.retry_after.map(|r| r.as_secs()),
+                    next_attempt_at = %chrono::DateTime::<Utc>::from(until_wall).to_rfc3339(),
+                    "the network rejected our registration; holding off"
+                );
+                Ok(())
+            }
+            DeregEvent::Deactivated => {
+                if !early || self.early_loss_counted {
+                    tracing::warn!(
+                        registered_secs_ago = age.as_secs(),
+                        counted = false,
+                        "re-registering now: the network deactivated our binding"
+                    );
+                    return Ok(());
+                }
+                self.early_loss_counted = true;
+                (self.backoff, self.consecutive_renewal_failures) = self.ladder_before_success;
+                let clean = self.consecutive_renewal_failures == 0;
+                let result = self.count_loss(busy);
+                if clean {
+                    self.next_renewal_attempt = None;
+                    tracing::warn!(
+                        registered_secs_ago = age.as_secs(),
+                        counted = true,
+                        "re-registering now: the network deactivated our binding"
+                    );
+                } else {
+                    self.log_backoff_retry(deregistration.event, age, now);
+                }
+                result
+            }
+            DeregEvent::Unregistered | DeregEvent::Probation => {
+                if self.early_loss_counted {
+                    return Ok(());
+                }
+                self.early_loss_counted = true;
+                if early {
+                    (self.backoff, self.consecutive_renewal_failures) = self.ladder_before_success;
+                }
+                let result = self.count_loss(busy);
+                if let Some(floor) = deregistration.retry_after.map(|r| now + r) {
+                    self.next_renewal_attempt = self.next_renewal_attempt.max(Some(floor));
+                }
+                self.log_backoff_retry(deregistration.event, age, now);
+                result
+            }
         }
-        self.early_loss_counted = true;
-        (self.backoff, self.consecutive_renewal_failures) = self.ladder_before_success;
+    }
+
+    fn log_backoff_retry(&self, event: DeregEvent, age: Duration, now: Instant) {
         tracing::warn!(
+            event = %event,
             registered_secs_ago = age.as_secs(),
-            retry_in_secs = self.backoff.as_secs(),
-            "the network dropped a registration it had only just accepted; retrying on backoff"
+            retry_in_secs = self
+                .next_renewal_attempt
+                .map_or(0, |t| t.saturating_duration_since(now).as_secs()),
+            "the network dropped our binding; retrying on backoff"
         );
+    }
+
+    /// One registration loss counted against the renewal budget, on the
+    /// ladder as it stands. Never `Err` while `busy` — the exit is owed.
+    fn count_loss(&mut self, busy: bool) -> BridgeResult<()> {
         match self.schedule_renewal_retry() {
             Err(e) if busy => {
                 tracing::warn!(
@@ -2107,6 +2217,7 @@ impl LoopState {
         // Reported Gm connection health (specs/028), kept current for a
         // `vowifi-status`/`volte-status` query the same way `busy` is.
         guard.gm_connection = self.gm_conn;
+        guard.rejected_until = self.rejection.map(|r| r.until_wall);
     }
 
     /// A hangup can start on *either* side. The carrier's arrives as a BYE;
@@ -2622,31 +2733,53 @@ impl LoopState {
     }
 
     /// Drives the registration state off a reg-event `NOTIFY` — see
-    /// `session::handle_notify`'s docs for what makes it report a
-    /// deregistration. Reuses the exact escalation path
+    /// `session::handle_notify` for what counts as our current binding being
+    /// deregistered, and [`Self::on_network_deregistration`] for the policy
+    /// each event gets. Reuses the escalation path
     /// `ping::probe_gm_connection` already uses for a dead Gm connection
     /// (`force_renewal`, honoured by `on_idle_tick`'s next pass) rather than
     /// adding a second way to force a re-registration. `Err` only when the
-    /// renewal budget is spent — see [`Self::on_network_deregistration`].
+    /// renewal budget is spent.
+    ///
+    /// On `rejected` the network has already released every session bound to
+    /// the contact (TS 24.229 §5.4.1.5), so a call in progress, or one being
+    /// placed, is ended here rather than left to discover that on its own.
     fn handle_reg_notify(
         &mut self,
-        session: &crate::ims::RegisteredSession,
+        session: &mut crate::ims::RegisteredSession,
         p: &DispatchParams,
         req: &SipRequest,
         sink: &SipSink,
     ) -> BridgeResult<()> {
         let deregistration = crate::ims::session::handle_notify(session, sink, req);
+        if deregistration.is_some_and(|d| d.event == DeregEvent::Rejected) {
+            self.end_calls_on_rejection(session, &|call| report_answered_call_ended(p.obs, call));
+        }
         let busy = self.busy();
-        if !self.on_reg_notify(Instant::now(), busy, deregistration.as_ref())? {
+        if !self.on_reg_notify(
+            Instant::now(),
+            busy,
+            deregistration.as_ref(),
+            p.reg_rejected_cooldown,
+        )? {
             return Ok(());
         }
+        let reason = match (&deregistration, &self.rejection) {
+            (Some(d), Some(r)) if d.event == DeregEvent::Rejected => format!(
+                "the network rejected our registration (reg-event rejected); next attempt at {}",
+                chrono::DateTime::<Utc>::from(r.until_wall).to_rfc3339()
+            ),
+            (Some(d), _) => format!(
+                "the network deregistered our binding (reg-event {})",
+                d.event
+            ),
+            (None, _) => unreachable!("on_reg_notify applied nothing without a deregistration"),
+        };
         {
             let mut guard = p.status.lock().unwrap_or_else(|e| e.into_inner());
             guard.state = crate::ims::RegistrationState::Failed;
-            guard.last_failure = Some((
-                SystemTime::now(),
-                "reg-event NOTIFY reported our own binding deregistered".to_string(),
-            ));
+            guard.last_failure = Some((SystemTime::now(), reason));
+            guard.rejected_until = self.rejection.map(|r| r.until_wall);
         }
         p.obs.set_registered(false);
         Ok(())
@@ -2660,13 +2793,48 @@ impl LoopState {
         &mut self,
         now: Instant,
         busy: bool,
-        deregistration: Option<&crate::ims::session::Deregistration>,
+        deregistration: Option<&Deregistration>,
+        cooldown: Duration,
     ) -> BridgeResult<bool> {
-        if deregistration.is_none() {
+        let Some(d) = deregistration else {
             return Ok(false);
-        }
-        self.on_network_deregistration(now, busy)?;
+        };
+        self.on_network_deregistration(now, busy, d, cooldown)?;
         Ok(true)
+    }
+
+    /// FR-009: end the bridged call and fail any origination in progress,
+    /// stating why. `report` records the ended call (the observability report
+    /// in production).
+    fn end_calls_on_rejection(
+        &mut self,
+        session: &mut crate::ims::RegisteredSession,
+        report: &dyn Fn(&ActiveCall),
+    ) {
+        if let Some(mut call) = self.active_call.take() {
+            tracing::warn!(
+                call_id = %call.call_id,
+                "ending call: the network rejected our registration"
+            );
+            call.lifecycle.end(EndedBy::RegistrationLost);
+            // See `handle_pbx_hangup`: stop the media threads before reading
+            // what they published.
+            call.stop.store(true, Ordering::Relaxed);
+            report(&call);
+            call::end_call_best_effort(session, call, reason::REGISTRATION_REJECTED);
+            self.maintenance.release();
+            self.watch = AttachmentWatch::default();
+        }
+        if let Some(mut o) = self.origination.take() {
+            origination::fail_origination(&mut o, session, reason::REGISTRATION_REJECTED);
+            // Kept while its CANCEL is outstanding, so a racing answer is still
+            // ACKed and BYEd; otherwise it is over.
+            if o.awaiting_cancel() {
+                self.origination = Some(o);
+            } else {
+                self.maintenance.release();
+            }
+        }
     }
 
     fn handle_carrier_response(
@@ -2834,6 +3002,11 @@ impl LoopState {
             if Instant::now() < next_attempt {
                 return Ok(());
             }
+        }
+        // The rejection cooldown's one attempt (FR-011): from here on a
+        // failure lands on the ordinary ladder, which the rejection reset.
+        if self.rejection.take().is_some() {
+            tracing::info!("rejection cooldown over; trying to register once");
         }
         // Everything from here to the end of this function is the renewal, and
         // all of it can block: acquiring the modem lock (which the SMS sweep
@@ -4390,9 +4563,11 @@ mod tests {
         assert!(st.schedule_renewal_retry().is_err());
     }
 
-    /// Issue #117: REGISTER `200 OK`, then the binding `terminated/rejected`
-    /// 8s later. Counted as that renewal failing, the retry waits on the
-    /// ladder it would have been on, instead of going out at once.
+    /// Issue #117: REGISTER `200 OK`, then the binding dropped 8s later.
+    /// Counted as that renewal failing, the retry waits on the ladder it would
+    /// have been on, instead of going out at once. (#117's event was
+    /// `rejected`, which specs/089 now answers with a cooldown instead; these
+    /// early-loss tests use `deactivated`, which still counts.)
     #[test]
     fn a_binding_dropped_right_after_registering_retries_on_backoff() {
         let mut st = LoopState::new();
@@ -4400,8 +4575,13 @@ mod tests {
         st.on_renewal_success();
         assert_eq!(st.consecutive_renewal_failures, 0);
 
-        st.on_network_deregistration(st.last_registered + Duration::from_secs(8), false)
-            .expect("still below the budget");
+        st.on_network_deregistration(
+            st.last_registered + Duration::from_secs(8),
+            false,
+            &dereg(DeregEvent::Deactivated),
+            COOLDOWN,
+        )
+        .expect("still below the budget");
         assert!(st.force_renewal);
         assert!(
             st.next_renewal_attempt.is_some(),
@@ -4420,12 +4600,22 @@ mod tests {
     fn bindings_rejected_every_time_exhaust_the_renewal_budget() {
         let mut st = LoopState::new();
         for n in 1..MAX_CONSECUTIVE_RENEWAL_FAILURES {
-            st.on_network_deregistration(st.last_registered + Duration::from_secs(8), false)
-                .unwrap_or_else(|e| panic!("rejection {n} should still retry in-process: {e}"));
+            st.on_network_deregistration(
+                st.last_registered + Duration::from_secs(8),
+                false,
+                &dereg(DeregEvent::Deactivated),
+                COOLDOWN,
+            )
+            .unwrap_or_else(|e| panic!("rejection {n} should still retry in-process: {e}"));
             st.on_renewal_success();
         }
         let err = st
-            .on_network_deregistration(st.last_registered + Duration::from_secs(8), false)
+            .on_network_deregistration(
+                st.last_registered + Duration::from_secs(8),
+                false,
+                &dereg(DeregEvent::Deactivated),
+                COOLDOWN,
+            )
             .expect_err("the retry budget is spent; the agent must exit for the supervisor");
         assert!(
             err.to_string()
@@ -4441,7 +4631,7 @@ mod tests {
     fn a_repeated_notice_of_the_same_loss_counts_once() {
         let mut st = LoopState::new();
         let first = st.last_registered + Duration::from_secs(8);
-        st.on_network_deregistration(first, false)
+        st.on_network_deregistration(first, false, &dereg(DeregEvent::Deactivated), COOLDOWN)
             .expect("below the budget");
         let retry_at = st.next_renewal_attempt;
         st.schedule_renewal_retry()
@@ -4453,8 +4643,13 @@ mod tests {
         );
         assert_ne!(retry_after_failure, retry_at);
 
-        st.on_network_deregistration(first + Duration::from_secs(5), false)
-            .expect("below the budget");
+        st.on_network_deregistration(
+            first + Duration::from_secs(5),
+            false,
+            &dereg(DeregEvent::Deactivated),
+            COOLDOWN,
+        )
+        .expect("below the budget");
         assert_eq!(st.consecutive_renewal_failures, failures);
         assert_eq!(st.backoff, backoff);
         assert_eq!(st.next_renewal_attempt, retry_after_failure);
@@ -4467,17 +4662,27 @@ mod tests {
     fn a_loss_that_spends_the_budget_mid_call_exits_once_the_call_ends() {
         let mut st = LoopState::new();
         for _ in 1..MAX_CONSECUTIVE_RENEWAL_FAILURES {
-            st.on_network_deregistration(st.last_registered + Duration::from_secs(8), false)
-                .expect("below the budget");
+            st.on_network_deregistration(
+                st.last_registered + Duration::from_secs(8),
+                false,
+                &dereg(DeregEvent::Deactivated),
+                COOLDOWN,
+            )
+            .expect("below the budget");
             st.on_renewal_success();
         }
         let during_call = st.last_registered + Duration::from_secs(8);
-        st.on_network_deregistration(during_call, true)
+        st.on_network_deregistration(during_call, true, &dereg(DeregEvent::Deactivated), COOLDOWN)
             .expect("never an exit while a call is up");
         // A repeat notice mid-call changes nothing.
         let retry_at = st.next_renewal_attempt;
-        st.on_network_deregistration(during_call + Duration::from_secs(5), true)
-            .expect("never an exit while a call is up");
+        st.on_network_deregistration(
+            during_call + Duration::from_secs(5),
+            true,
+            &dereg(DeregEvent::Deactivated),
+            COOLDOWN,
+        )
+        .expect("never an exit while a call is up");
         assert_eq!(st.next_renewal_attempt, retry_at);
         assert_eq!(
             st.consecutive_renewal_failures,
@@ -4502,8 +4707,13 @@ mod tests {
     #[test]
     fn a_settled_binding_dropped_re_registers_at_once() {
         let mut st = LoopState::new();
-        st.on_network_deregistration(st.last_registered + REGISTRATION_SETTLE, false)
-            .expect("never an exit");
+        st.on_network_deregistration(
+            st.last_registered + REGISTRATION_SETTLE,
+            false,
+            &dereg(DeregEvent::Deactivated),
+            COOLDOWN,
+        )
+        .expect("never an exit");
         assert!(st.force_renewal);
         assert_eq!(st.next_renewal_attempt, None);
         assert_eq!(st.consecutive_renewal_failures, 0);
@@ -4573,11 +4783,255 @@ mod tests {
                 st.last_registered + Duration::from_secs(1),
                 false,
                 verdict.deregistration.as_ref(),
+                COOLDOWN,
             )
             .expect("never an exit");
         assert!(!applied);
         assert!(!st.force_renewal);
         assert_eq!(st.next_renewal_attempt, None);
         assert_eq!(st.consecutive_renewal_failures, 0);
+    }
+
+    const COOLDOWN: Duration = Duration::from_secs(1800);
+
+    fn dereg(event: DeregEvent) -> Deregistration {
+        Deregistration {
+            event,
+            retry_after: None,
+            scope: crate::ims::session::DeregScope::BindingRemoved,
+        }
+    }
+
+    fn dereg_after(event: DeregEvent, secs: u64) -> Deregistration {
+        Deregistration {
+            retry_after: Some(Duration::from_secs(secs)),
+            ..dereg(event)
+        }
+    }
+
+    /// `next_renewal_attempt` lands `expected` after the call, give or take
+    /// the time the test itself took.
+    fn assert_retry_in(st: &LoopState, expected: Duration) {
+        let at = st.next_renewal_attempt.expect("a retry is scheduled");
+        let now = Instant::now();
+        assert!(at <= now + expected, "{:?} > {expected:?}", at - now);
+        assert!(
+            at + Duration::from_secs(2) >= now + expected,
+            "{:?} < {expected:?}",
+            at.saturating_duration_since(now)
+        );
+    }
+
+    /// Story 2, scenario 1: a mature binding deactivated re-registers at once,
+    /// uncounted.
+    #[test]
+    fn a_mature_binding_deactivated_re_registers_at_once_uncounted() {
+        let mut st = LoopState::new();
+        st.on_network_deregistration(
+            st.last_registered + REGISTRATION_SETTLE,
+            false,
+            &dereg(DeregEvent::Deactivated),
+            COOLDOWN,
+        )
+        .expect("never an exit");
+        assert!(st.force_renewal);
+        assert_eq!(st.next_renewal_attempt, None);
+        assert_eq!(st.consecutive_renewal_failures, 0);
+    }
+
+    /// Story 2, scenario 2 (clarification Q2): an early deactivated on a clean
+    /// ladder goes out at once but is counted; a second one after the next
+    /// success waits on the ladder.
+    #[test]
+    fn an_early_deactivated_goes_out_at_once_but_is_counted() {
+        let mut st = LoopState::new();
+        st.on_network_deregistration(
+            st.last_registered + Duration::from_secs(8),
+            false,
+            &dereg(DeregEvent::Deactivated),
+            COOLDOWN,
+        )
+        .expect("below the budget");
+        assert_eq!(
+            st.next_renewal_attempt, None,
+            "the first attempt is immediate"
+        );
+        assert_eq!(st.consecutive_renewal_failures, 1);
+
+        st.on_renewal_success();
+        st.on_network_deregistration(
+            st.last_registered + Duration::from_secs(8),
+            false,
+            &dereg(DeregEvent::Deactivated),
+            COOLDOWN,
+        )
+        .expect("below the budget");
+        assert_retry_in(&st, Duration::from_secs(10));
+        assert_eq!(st.consecutive_renewal_failures, 2);
+    }
+
+    /// Story 2, scenario 3: unregistered waits on the ladder even on a mature
+    /// binding, counted once.
+    #[test]
+    fn unregistered_on_a_mature_binding_retries_on_backoff() {
+        let mut st = LoopState::new();
+        let now = st.last_registered + REGISTRATION_SETTLE;
+        st.on_network_deregistration(now, false, &dereg(DeregEvent::Unregistered), COOLDOWN)
+            .expect("below the budget");
+        assert!(st.force_renewal);
+        assert_retry_in(&st, RETRY_INITIAL_BACKOFF);
+        assert_eq!(st.consecutive_renewal_failures, 1);
+
+        // The same loss reported again is not counted again.
+        st.on_network_deregistration(now, false, &dereg(DeregEvent::Unregistered), COOLDOWN)
+            .expect("below the budget");
+        assert_eq!(st.consecutive_renewal_failures, 1);
+    }
+
+    /// Story 2, scenario 4: probation never retries before the network's
+    /// retry-after.
+    #[test]
+    fn probation_waits_at_least_the_networks_retry_after() {
+        let mut st = LoopState::new();
+        let now = Instant::now();
+        st.last_registered = now - REGISTRATION_SETTLE;
+        st.on_network_deregistration(
+            now,
+            false,
+            &dereg_after(DeregEvent::Probation, 600),
+            COOLDOWN,
+        )
+        .expect("below the budget");
+        assert!(st.next_renewal_attempt >= Some(now + Duration::from_secs(600)));
+        assert_eq!(st.consecutive_renewal_failures, 1);
+    }
+
+    /// Story 2, scenario 5 (SC-003): rejected holds off for the cooldown,
+    /// without spending the failure budget, then tries once.
+    #[test]
+    fn rejected_holds_off_for_the_cooldown_uncounted() {
+        let mut st = LoopState::new();
+        st.schedule_renewal_retry().expect("below the budget");
+        st.on_renewal_success();
+        let now = st.last_registered + Duration::from_secs(1);
+        st.on_network_deregistration(now, false, &dereg(DeregEvent::Rejected), COOLDOWN)
+            .expect("never an exit");
+        let rejection = st.rejection.expect("a cooldown is running");
+        assert_eq!(rejection.until, now + COOLDOWN);
+        assert_eq!(st.next_renewal_attempt, Some(rejection.until));
+        assert_eq!(st.consecutive_renewal_failures, 0);
+        assert_eq!(st.backoff, RETRY_INITIAL_BACKOFF);
+        assert!(st.force_renewal);
+    }
+
+    /// The network's retry-after wins when it is longer than the cooldown.
+    #[test]
+    fn rejected_with_a_longer_retry_after_waits_for_it() {
+        let mut st = LoopState::new();
+        let now = st.last_registered + Duration::from_secs(1);
+        st.on_network_deregistration(
+            now,
+            false,
+            &dereg_after(DeregEvent::Rejected, 3600),
+            COOLDOWN,
+        )
+        .expect("never an exit");
+        assert_eq!(
+            st.next_renewal_attempt,
+            Some(now + Duration::from_secs(3600))
+        );
+    }
+
+    /// A rejection replaces a ladder retry already pending.
+    #[test]
+    fn rejected_replaces_a_pending_ladder_retry() {
+        let mut st = LoopState::new();
+        st.schedule_renewal_retry().expect("below the budget");
+        let now = Instant::now();
+        st.on_network_deregistration(now, false, &dereg(DeregEvent::Rejected), COOLDOWN)
+            .expect("never an exit");
+        assert_eq!(st.next_renewal_attempt, Some(now + COOLDOWN));
+        assert_eq!(st.consecutive_renewal_failures, 0);
+    }
+
+    /// SC-004: a network that rejects us every time it accepts us — about 24h
+    /// of it at a 30-minute cooldown — never exits the agent.
+    #[test]
+    fn a_day_of_repeated_rejections_never_spends_the_budget() {
+        let mut st = LoopState::new();
+        for n in 0..48 {
+            let now = st.last_registered + Duration::from_secs(1);
+            st.on_network_deregistration(now, false, &dereg(DeregEvent::Rejected), COOLDOWN)
+                .unwrap_or_else(|e| panic!("rejection {n} exited the agent: {e}"));
+            assert_eq!(st.consecutive_renewal_failures, 0, "rejection {n}");
+            // The cooldown elapses, its one attempt succeeds, and the network
+            // rejects the new binding again.
+            st.rejection.take();
+            st.on_renewal_success();
+        }
+        assert_eq!(st.consecutive_renewal_failures, 0);
+    }
+
+    /// FR-011: if the attempt after the cooldown fails, the ordinary ladder
+    /// takes over from a clean start.
+    #[test]
+    fn a_failed_attempt_after_the_cooldown_lands_on_a_clean_ladder() {
+        let mut st = LoopState::new();
+        st.on_network_deregistration(
+            st.last_registered + Duration::from_secs(1),
+            false,
+            &dereg(DeregEvent::Rejected),
+            COOLDOWN,
+        )
+        .expect("never an exit");
+        st.rejection.take();
+        st.schedule_renewal_retry().expect("below the budget");
+        assert_retry_in(&st, RETRY_INITIAL_BACKOFF);
+        assert_eq!(st.consecutive_renewal_failures, 1);
+    }
+
+    #[test]
+    fn a_successful_renewal_clears_the_rejection() {
+        let mut st = LoopState::new();
+        st.on_network_deregistration(
+            st.last_registered + Duration::from_secs(1),
+            false,
+            &dereg(DeregEvent::Rejected),
+            COOLDOWN,
+        )
+        .expect("never an exit");
+        st.on_renewal_success();
+        assert_eq!(st.rejection, None);
+        assert_eq!(st.next_renewal_attempt, None);
+    }
+
+    /// Story 2, scenario 6 (FR-009): a rejection ends the call in progress and
+    /// still starts the cooldown.
+    #[test]
+    fn rejected_ends_the_call_in_progress() {
+        let mut st = LoopState::new();
+        st.active_call = Some(test_active_call(
+            "call-1",
+            "totag",
+            "<sip:+919000000001@ims.example>;tag=a",
+        ));
+        let mut session =
+            crate::ims::test_session_with_sa(None, "127.0.0.1:5060".parse().unwrap(), None);
+        let reported = std::cell::Cell::new(0);
+        st.end_calls_on_rejection(&mut session, &|_| reported.set(reported.get() + 1));
+        assert!(st.active_call.is_none());
+        assert_eq!(reported.get(), 1);
+
+        let busy = st.busy();
+        let applied = st
+            .on_reg_notify(
+                Instant::now(),
+                busy,
+                Some(&dereg(DeregEvent::Rejected)),
+                COOLDOWN,
+            )
+            .expect("never an exit");
+        assert!(applied);
+        assert!(st.rejection.is_some());
     }
 }

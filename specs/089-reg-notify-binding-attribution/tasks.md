@@ -100,7 +100,7 @@ All paths are relative to the repo root. `session.rs` means `gsm-sip-bridge/src/
 
 ### Policy core
 
-- [ ] T012 [US2] Write failing tests in `agent/mod.rs`'s test module, next to `a_binding_dropped_right_after_registering_retries_on_backoff`. The deregistration handler now takes `(now, busy, &Deregistration, cooldown)`.
+- [X] T012 [US2] Write failing tests in `agent/mod.rs`'s test module, next to `a_binding_dropped_right_after_registering_retries_on_backoff`. The deregistration handler now takes `(now, busy, &Deregistration, cooldown)`.
   - **Deactivated (scenarios 1 and 2):**
     - On a mature binding, `next_renewal_attempt == None` and the attempt is uncounted.
     - On an early loss with a clean ladder, `next_renewal_attempt == None` but `consecutive_renewal_failures == 1`.
@@ -117,14 +117,14 @@ All paths are relative to the repo root. `session.rs` means `gsm-sip-bridge/src/
   - **SC-004:** loop 48 × (rejected → cooldown elapses → `on_renewal_success` → rejected), about 24h with a 30-minute cooldown. It never returns `Err` and `consecutive_renewal_failures` stays 0.
   - **FR-011:** a failure of the post-cooldown attempt (`schedule_renewal_retry`) lands on a 5s backoff with count 1.
   - `on_renewal_success` clears `rejection`.
-- [ ] T013 [US2] Implement the policy in `agent/mod.rs` per research R4:
+- [X] T013 [US2] Implement the policy in `agent/mod.rs` per research R4:
   - Add `RejectionCooldown { until: Instant, until_wall: SystemTime }` and `LoopState.rejection`.
   - Branch `on_network_deregistration` on `DeregEvent`.
   - Apply the retry-after floor for Unregistered and Probation.
   - `on_renewal_success` clears `rejection`.
   - Rewrite the method's doc comment to describe the per-event table and to cite TS 24.229 §5.1.1.7 and §5.4.1.5. Also remove `handle_notify`'s old "always retries … rejected handled the same" paragraph in `session.rs`.
   - Keep the never-`Err`-while-busy rule for every counted path.
-- [ ] T014 [US2] In `handle_reg_notify` in `agent/mod.rs`:
+- [X] T014 [US2] In `handle_reg_notify` in `agent/mod.rs`:
   - Set `last_failure` to a reason that names the event. For rejected, use "the network rejected our registration (reg-event rejected); next attempt at <RFC 3339>".
   - Write `status.rejected_until` (T020 adds the field; do T020 first if working strictly in order).
   - Log the policy decisions from `contracts/observability.md`.
@@ -133,11 +133,11 @@ All paths are relative to the repo root. `session.rs` means `gsm-sip-bridge/src/
 
 ### Ending calls on `rejected` (FR-009, scenario 6)
 
-- [ ] T015 [P] [US2] Add `pub const REGISTRATION_REJECTED: &str = "registration_rejected";` to the `reason` module in `gsm-sip-bridge/src/vowifi/control.rs`, with a doc comment
-- [ ] T016 [US2] In `gsm-sip-bridge/src/ims/agent/origination.rs`, add `pub(super) fn fail_origination(p: &mut PendingOrigination, session: &mut RegisteredSession, reason: &str)`. It runs `p.fail(reason)` followed by `abandon_origination`'s per-step teardown (research R5). Test it in the existing origination test module:
+- [X] T015 [P] [US2] Add `pub const REGISTRATION_REJECTED: &str = "registration_rejected";` to the `reason` module in `gsm-sip-bridge/src/vowifi/control.rs`, with a doc comment
+- [X] T016 [US2] In `gsm-sip-bridge/src/ims/agent/origination.rs`, add `pub(super) fn fail_origination(p: &mut PendingOrigination, session: &mut RegisteredSession, reason: &str)`. It runs `p.fail(reason)` followed by `abandon_origination`'s per-step teardown (research R5). Test it in the existing origination test module:
   - An `AwaitingCarrier` attempt sends `CallFailed` with that reason and moves to `AwaitingCancel`.
   - An `AwaitingVeth` attempt sends `CallFailed` and a BYE.
-- [ ] T017 [US2] Change `handle_reg_notify` in `agent/mod.rs` to take `&mut RegisteredSession` and update its call site (around line 2048). On `Rejected`:
+- [X] T017 [US2] Change `handle_reg_notify` in `agent/mod.rs` to take `&mut RegisteredSession` and update its call site (around line 2048). On `Rejected`:
   - With an active call, end it using the `handle_attachment_loss` sequence with `reason::REGISTRATION_REJECTED`, and add an `EndedBy` variant if the lifecycle needs a distinct cause.
   - With a pending origination, call `fail_origination`.
   - Then apply the cooldown with `busy == false`.
@@ -160,10 +160,10 @@ All paths are relative to the repo root. `session.rs` means `gsm-sip-bridge/src/
 
 ### Status (FR-017)
 
-- [ ] T020 [P] [US2] Add `rejected_until: Option<SystemTime>` to `RegistrationStatus` in `gsm-sip-bridge/src/ims/mod.rs`. It is in-memory only, like `gm_connection`; update the field docs and `Default`. Add `#[serde(default)] rejection_cooldown_until: Option<u64>` to `RegistrationStatusReply` in `gsm-sip-bridge/src/vowifi/control.rs`. Tests:
+- [X] T020 [P] [US2] Add `rejected_until: Option<SystemTime>` to `RegistrationStatus` in `gsm-sip-bridge/src/ims/mod.rs`. It is in-memory only, like `gm_connection`; update the field docs and `Default`. Add `#[serde(default)] rejection_cooldown_until: Option<u64>` to `RegistrationStatusReply` in `gsm-sip-bridge/src/vowifi/control.rs`. Tests:
   - It round-trips.
   - An older reply without it parses as `None`; extend `registration_status_reply_from_an_older_peer_omitting_gm_connection_parses` or add a sibling test.
-- [ ] T021 [US2] Fill the reply in the `StatusQuery` arm of `agent/mod.rs` (around line 1004). Print `rejection_cooldown: none | until <rfc3339> (next attempt in <N>s)` in both:
+- [X] T021 [US2] Fill the reply in the `StatusQuery` arm of `agent/mod.rs` (around line 1004). Print `rejection_cooldown: none | until <rfc3339> (next attempt in <N>s)` in both:
   - `vowifi-status` (`gsm-sip-bridge/src/vowifi/mod.rs`, after `gm_connection`);
   - `volte-status` (`print_line_live_status` in `gsm-sip-bridge/src/volte/bridge.rs`).
 
