@@ -2635,9 +2635,11 @@ impl LoopState {
         req: &SipRequest,
         sink: &SipSink,
     ) -> BridgeResult<()> {
-        let Some(_deregistration) = crate::ims::session::handle_notify(session, sink, req) else {
+        let deregistration = crate::ims::session::handle_notify(session, sink, req);
+        let busy = self.busy();
+        if !self.on_reg_notify(Instant::now(), busy, deregistration.as_ref())? {
             return Ok(());
-        };
+        }
         {
             let mut guard = p.status.lock().unwrap_or_else(|e| e.into_inner());
             guard.state = crate::ims::RegistrationState::Failed;
@@ -2647,8 +2649,24 @@ impl LoopState {
             ));
         }
         p.obs.set_registered(false);
-        let busy = self.busy();
-        self.on_network_deregistration(Instant::now(), busy)
+        Ok(())
+    }
+
+    /// The loop's half of a reg-event NOTIFY, once it is classified: nothing
+    /// for a NOTIFY that did not deregister our current binding (a retired
+    /// previous binding, another device, `expired`), else the deregistration
+    /// policy. `Ok(true)` when the registration was lost.
+    fn on_reg_notify(
+        &mut self,
+        now: Instant,
+        busy: bool,
+        deregistration: Option<&crate::ims::session::Deregistration>,
+    ) -> BridgeResult<bool> {
+        if deregistration.is_none() {
+            return Ok(false);
+        }
+        self.on_network_deregistration(now, busy)?;
+        Ok(true)
     }
 
     fn handle_carrier_response(
@@ -4527,5 +4545,39 @@ mod tests {
             spent <= Duration::from_secs(600),
             "{spent:?} of in-process retrying is long enough to be the old bug again"
         );
+    }
+
+    /// SC-002 (issue #124): a renewal moved us to a new port, and the network
+    /// retires the old binding a second later. The line must stay as it was —
+    /// no forced renewal, nothing scheduled, nothing counted.
+    #[test]
+    fn a_retired_binding_right_after_renewing_changes_nothing() {
+        let body = r#"<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="7" state="full">
+  <registration aor="sip:+919000000000@ims.example" id="a1" state="active">
+    <contact id="old" state="terminated" event="rejected">
+      <uri>sip:+919000000000@10.0.0.1:5064;transport=tcp</uri>
+      <unknown-param name="+sip.instance">"&lt;urn:gsma:imei:860000000000000&gt;"</unknown-param>
+    </contact>
+  </registration>
+</reginfo>"#;
+        let verdict = crate::ims::session::classify_reg_notify(
+            body,
+            "active;expires=600000",
+            "860000000000000",
+            "10.0.0.1:5070".parse().unwrap(),
+        );
+        let mut st = LoopState::new();
+        st.on_renewal_success();
+        let applied = st
+            .on_reg_notify(
+                st.last_registered + Duration::from_secs(1),
+                false,
+                verdict.deregistration.as_ref(),
+            )
+            .expect("never an exit");
+        assert!(!applied);
+        assert!(!st.force_renewal);
+        assert_eq!(st.next_renewal_attempt, None);
+        assert_eq!(st.consecutive_renewal_failures, 0);
     }
 }

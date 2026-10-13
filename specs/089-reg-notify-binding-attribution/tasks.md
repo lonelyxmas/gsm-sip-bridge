@@ -68,7 +68,7 @@ All paths are relative to the repo root. `session.rs` means `gsm-sip-bridge/src/
 
 **Independent test**: the #124 fixture produces no deregistration and one retired entry, and every #117 fixture is unchanged.
 
-- [ ] T008 [US1] Write failing tests in `session.rs`, one per row of the research R1 table:
+- [X] T008 [US1] Write failing tests in `session.rs`, one per row of the research R1 table:
   - **Scenario 1 (#124 fixture):** current `10.0.0.1:5070`, body with `<contact>` `sip:+919000000000@10.0.0.1:5064` `terminated/rejected` that echoes IMEI `860000000000000`. Expect `own.entries` empty, `own.retired.len() == 1`, `deregistration == None`, `matched_by == Attribution::None`.
   - **Scenario 2:** a full-state body with old `:5064` `terminated/unregistered` and new `:5070` `active/registered`, both IMEI-echoing. Expect one current entry (`active`), one retired, no deregistration, `matched_by == ContactAddr`.
   - **Scenario 3:** `:5070` `terminated/deactivated` (IMEI echoed). Expect `Deactivated` with `matched_by == ContactAddr`.
@@ -76,17 +76,17 @@ All paths are relative to the repo root. `session.rs` means `gsm-sip-bridge/src/
   - An IMEI-echoing entry with no `<uri>`, alongside a foreign contact, is current with `matched_by == Imei`.
   - A foreign address without the IMEI is neither current nor retired.
   - IPv6 current address match; a `;Hpt=…` suffix is ignored.
-- [ ] T009 [US1] Rewrite `find_own_contacts` in `session.rs` to the research R1 rules:
+- [X] T009 [US1] Rewrite `find_own_contacts` in `session.rs` to the research R1 rules:
   - Add `OwnContacts.retired`.
   - The label prefers `ContactAddr` when any current entry matched by address.
   - Keep the sole-contact fallback exactly as it is (FR-003).
   - Rewrite the doc comment: the old "either identifier is enough" reasoning is now the #124 bug, so cite TS 24.229 §5.1.1.4.1 NOTE 10 and §5.4.2.1.2 NOTE 2.
   - Review every existing `find_own_contacts` test. Any test that asserted IMEI attribution of an entry *at a different address* encoded the bug: change its expectation and say why in the test's comment. Every #117 case must pass unchanged (SC-005).
-- [ ] T010 [US1] Update the logging in `handle_notify` in `session.rs` to match `contracts/observability.md`:
+- [X] T010 [US1] Update the logging in `handle_notify` in `session.rs` to match `contracts/observability.md`:
   - The single per-NOTIFY line gets `attribution`, `contact_addr`, `own_entries`, `retired_entries`, `contact_states`, `applied`, `subscription_state` and `body`.
   - Add one `INFO` "replaced binding retired" line per terminated retired entry, with `retired_addr`, `state`, `event` and `contact_addr` (FR-005).
   - Remove the old "terminated state, but not attributably" `WARN` for the retired case, which is now explained.
-- [ ] T011 [US1] Add a test in `agent/mod.rs` for SC-002. Feed the #124 verdict (no deregistration) through the path `handle_reg_notify` takes, at `last_registered + 1s`. Assert `force_renewal == false`, `next_renewal_attempt == None`, and `consecutive_renewal_failures == 0`. If `handle_reg_notify` is hard to drive directly, extract the post-classification body into a `LoopState` method that takes `Option<Deregistration>` and test that. Then run the full check and commit: `fix(ims): attribute reg-event contacts by address, ignore retired bindings (#124)`.
+- [X] T011 [US1] Add a test in `agent/mod.rs` for SC-002. Feed the #124 verdict (no deregistration) through the path `handle_reg_notify` takes, at `last_registered + 1s`. Assert `force_renewal == false`, `next_renewal_attempt == None`, and `consecutive_renewal_failures == 0`. If `handle_reg_notify` is hard to drive directly, extract the post-classification body into a `LoopState` method that takes `Option<Deregistration>` and test that. Then run the full check and commit: `fix(ims): attribute reg-event contacts by address, ignore retired bindings (#124)`.
 
 **Checkpoint**: the #124 loop is closed. This is shippable on its own as the MVP.
 
