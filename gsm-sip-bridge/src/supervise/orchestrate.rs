@@ -1605,23 +1605,33 @@ fn start_vowifi_line_strongswan(
         line.card_id.clone(),
         Duration::from_secs(ctx.config.metrics.agent_report_interval_seconds),
     );
-    let report_child_sa = |up: bool| {
+    // Every report carries the whole supervisor signal (CHILD_SA, flapping, last
+    // IKE_SA loss cause) so ingest never has to infer one from another.
+    let report_tunnel = |s: TunnelSignal| {
         child_sa_reporter.report(
             crate::control::protocol::AgentState {
-                child_sa_up: Some(up),
+                child_sa_up: Some(s.child_sa_up),
+                tunnel_flapping: Some(s.flapping),
+                ike_sa_loss_cause: s.loss_cause,
                 ..Default::default()
             },
             Vec::new(),
         );
     };
-    report_child_sa(false);
+    let mut signal = TunnelSignal {
+        child_sa_up: false,
+        flapping: false,
+        loss_cause: None,
+    };
+    report_tunnel(signal);
 
     let Some((pcscf, usim_holder)) = establish_line_tunnel(ctx, line, mcc, mnc, None) else {
         return;
     };
 
     println!("[supervise] line {idx}: tunnel UP. P-CSCF: {pcscf}");
-    report_child_sa(true);
+    signal.child_sa_up = true;
+    report_tunnel(signal);
     let _ = runner.write_file(Path::new(&line.pcscf_source_path), &pcscf);
 
     // Shared with the agent loop: set while a rebuild is syncing the P-CSCF.
@@ -1658,8 +1668,11 @@ fn start_vowifi_line_strongswan(
         child_sa_usable: true,
         ..Default::default()
     };
-    // The reporter heartbeats the last state, so only changes need sending.
-    let mut reported_usable = true;
+    // IKE_SA rebuilds inside the tunnel-failure window; latching means flapping.
+    let mut rebuilds = line_supervisor::RebuildWindow::new(Duration::from_secs(
+        ctx.config.alerts.tunnel_failure_thresholds.unhealthy_sec,
+    ));
+    let mut last_loss_cause = None;
     loop {
         runner.sleep(line_supervisor::STEADY_STATE_POLL_INTERVAL);
         // Held across the whole tick_steady_state call, not just a one-off
@@ -1689,10 +1702,16 @@ fn start_vowifi_line_strongswan(
             &mut tracking,
             line_supervisor::STEADY_STATE_POLL_INTERVAL,
         );
-        if tracking.child_sa_usable != reported_usable {
-            reported_usable = tracking.child_sa_usable;
-            report_child_sa(reported_usable);
+        if rebuilds.tick(std::time::Instant::now()) {
+            println!("[supervise] line {idx}: tunnel no longer flapping");
         }
+        sync_tunnel_signal(
+            &mut signal,
+            &tracking,
+            &rebuilds,
+            last_loss_cause,
+            &report_tunnel,
+        );
         match outcome {
             line_supervisor::SteadyOutcome::StillUp => {
                 // Under the shutdown guard: a repair racing teardown would
@@ -1717,9 +1736,12 @@ fn start_vowifi_line_strongswan(
                 // heavy (terminate + reinitiate, and a re-registration behind
                 // it) has to say so.
                 match ike_sa_loss_cause {
-                    Some(cause) => println!(
-                        "[supervise] line {idx}: recovered from {reason:?} (cause: {cause})"
-                    ),
+                    Some(cause) => {
+                        last_loss_cause = Some(cause);
+                        println!(
+                            "[supervise] line {idx}: recovered from {reason:?} (cause: {cause})"
+                        )
+                    }
                     None => println!("[supervise] line {idx}: recovered from {reason:?}"),
                 }
                 if let Some(new_handle) = engine.shared.current_handle() {
@@ -1779,7 +1801,30 @@ fn start_vowifi_line_strongswan(
                     let _ =
                         runner.run(&["pkill", "-f", &format!("vowifi-ims-agent --line {idx}$")]);
                     rebuild_gate.store(false, Ordering::SeqCst);
+                    if rebuilds.record(std::time::Instant::now()) {
+                        println!(
+                            "[supervise] line {idx}: tunnel flapping ({} rebuilds within {}s)",
+                            line_supervisor::FLAP_REBUILDS,
+                            ctx.config.alerts.tunnel_failure_thresholds.unhealthy_sec
+                        );
+                    }
+                    sync_tunnel_signal(
+                        &mut signal,
+                        &tracking,
+                        &rebuilds,
+                        last_loss_cause,
+                        &report_tunnel,
+                    );
                 }
+                // A recovery that left the agent alone still changes CHILD_SA
+                // usability (`tracking` was updated by the tick).
+                sync_tunnel_signal(
+                    &mut signal,
+                    &tracking,
+                    &rebuilds,
+                    last_loss_cause,
+                    &report_tunnel,
+                );
             }
         }
     }
@@ -1855,6 +1900,34 @@ fn wait_for_rebuild_gate(
             return;
         }
         runner.sleep(poll);
+    }
+}
+
+/// What the supervisor reports about one line's tunnel (specs/086, 087).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TunnelSignal {
+    child_sa_up: bool,
+    flapping: bool,
+    loss_cause: Option<crate::control::protocol::IkeSaLossCause>,
+}
+
+/// Reports the tunnel signal if, and only if, it differs from the last one
+/// sent; the reporter heartbeats the last state, so only changes need sending.
+fn sync_tunnel_signal(
+    signal: &mut TunnelSignal,
+    tracking: &line_supervisor::SteadyTracking,
+    rebuilds: &line_supervisor::RebuildWindow,
+    loss_cause: Option<crate::control::protocol::IkeSaLossCause>,
+    report: &dyn Fn(TunnelSignal),
+) {
+    let now = TunnelSignal {
+        child_sa_up: tracking.child_sa_usable,
+        flapping: rebuilds.is_flapping(),
+        loss_cause,
+    };
+    if now != *signal {
+        *signal = now;
+        report(now);
     }
 }
 
@@ -3168,6 +3241,42 @@ mod tests {
         fn only_the_strongswan_engine_clears_gm_state() {
             assert!(should_clear_gm_state("strongswan"));
             assert!(!should_clear_gm_state("swu"));
+        }
+    }
+
+    mod tunnel_signal_tests {
+        use super::*;
+        use crate::control::protocol::IkeSaLossCause;
+        use std::cell::RefCell;
+
+        #[test]
+        fn only_a_changed_signal_is_reported() {
+            let sent = RefCell::new(Vec::new());
+            let report = |s: TunnelSignal| sent.borrow_mut().push(s);
+            let mut signal = TunnelSignal {
+                child_sa_up: true,
+                flapping: false,
+                loss_cause: None,
+            };
+            let rebuilds = line_supervisor::RebuildWindow::new(Duration::from_secs(300));
+            let mut tracking = line_supervisor::SteadyTracking {
+                child_sa_usable: true,
+                ..Default::default()
+            };
+            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, None, &report);
+            assert!(sent.borrow().is_empty(), "nothing changed");
+            // A new loss cause alone is a change worth reporting.
+            let cause = Some(IkeSaLossCause::CarrierDelete);
+            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, cause, &report);
+            assert_eq!(sent.borrow().len(), 1);
+            assert_eq!(sent.borrow()[0].loss_cause, cause);
+            // ...and the same state again is not.
+            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, cause, &report);
+            assert_eq!(sent.borrow().len(), 1);
+            tracking.child_sa_usable = false;
+            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, cause, &report);
+            assert_eq!(sent.borrow().len(), 2);
+            assert!(!sent.borrow()[1].child_sa_up);
         }
     }
 }

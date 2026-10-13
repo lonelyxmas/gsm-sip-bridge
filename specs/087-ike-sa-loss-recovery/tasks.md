@@ -205,17 +205,17 @@ All paths are relative to the repo root. `supervise/` means `gsm-sip-bridge/src/
 
 ### Tests
 
-- [ ] T023 [P] [US1] Write failing tests in `gsm-sip-bridge/src/supervise/line_supervisor.rs` for `pub struct RebuildWindow` (data-model), all with explicit `Instant`s:
+- [x] T023 [P] [US1] Write failing tests in `gsm-sip-bridge/src/supervise/line_supervisor.rs` for `pub struct RebuildWindow` (data-model), all with explicit `Instant`s:
   - 2 records within the window → not latched.
   - A 3rd within the window → `record` returns `true` (changed) and latches.
   - A 4th → stays latched, returns `false`.
   - `tick` before the newest entry is `window` old → stays latched.
   - `tick` after → unlatches, returns `true`.
   - 3 records spread wider than the window → never latches.
-- [ ] T024 [P] [US1] Write failing tests in `gsm-sip-bridge/src/control/protocol.rs`:
+- [x] T024 [P] [US1] Write failing tests in `gsm-sip-bridge/src/control/protocol.rs`:
   - A supervisor `AgentState { tunnel_flapping: Some(true), ike_sa_loss_cause: Some(CarrierDelete), .. }` round-trips with JSON keys `"tunnel_flapping":true` and `"ike_sa_loss_cause":"carrier_delete"`.
   - Both fields are omitted when `None`, and absent keys deserialize to `None`. Mirror `supervisor_report_round_trips_child_sa_up` / `child_sa_up_is_optional_on_the_wire`.
-- [ ] T025 [P] [US1] Write failing tests in `gsm-sip-bridge/src/metrics/ingest.rs`, at `apply_report` level, reusing `child_sa_report`, `tunnel_cfg()` (unhealthy_sec = 300) and the existing alert-capture helpers used by `a_missing_child_sa_alone_alerts_once`:
+- [x] T025 [P] [US1] Write failing tests in `gsm-sip-bridge/src/metrics/ingest.rs`, at `apply_report` level, reusing `child_sa_report`, `tunnel_cfg()` (unhealthy_sec = 300) and the existing alert-capture helpers used by `a_missing_child_sa_alone_alerts_once`:
   - (a) A supervisor report with `child_sa_up: true, tunnel_flapping: true` → exactly one TunnelFailure Failure is decided on that report, and its description contains `rebuilt repeatedly` and `last IKE_SA loss: carrier DELETE` when the cause was reported.
   - (b) A further flapping report → no second Failure.
   - (c) `tunnel_flapping: false` with `child_sa_up: true` → one Recovered.
@@ -226,14 +226,14 @@ All paths are relative to the repo root. `supervise/` means `gsm-sip-bridge/src/
 
 ### Implementation
 
-- [ ] T026 [US1] Implement `RebuildWindow` and `pub const FLAP_REBUILDS: usize = 3` in `gsm-sip-bridge/src/supervise/line_supervisor.rs` (T023), with docs citing research R7 and spec clarification Q2
-- [ ] T027 [US1] Add `tunnel_flapping: Option<bool>` and `ike_sa_loss_cause: Option<IkeSaLossCause>` to `AgentState` in `gsm-sip-bridge/src/control/protocol.rs`, both `#[serde(skip_serializing_if = "Option::is_none", default)]`, with docs (contracts/observability.md). Fix every `AgentState { .. }` literal across the workspace that does not use `..Default::default()` (`cargo build` will list them)
-- [ ] T028 [US1] In `gsm-sip-bridge/src/metrics/ingest.rs`, per research R7/R8 and data-model "Ingest":
+- [x] T026 [US1] Implement `RebuildWindow` and `pub const FLAP_REBUILDS: usize = 3` in `gsm-sip-bridge/src/supervise/line_supervisor.rs` (T023), with docs citing research R7 and spec clarification Q2
+- [x] T027 [US1] Add `tunnel_flapping: Option<bool>` and `ike_sa_loss_cause: Option<IkeSaLossCause>` to `AgentState` in `gsm-sip-bridge/src/control/protocol.rs`, both `#[serde(skip_serializing_if = "Option::is_none", default)]`, with docs (contracts/observability.md). Fix every `AgentState { .. }` literal across the workspace that does not use `..Default::default()` (`cargo build` will list them)
+- [x] T028 [US1] In `gsm-sip-bridge/src/metrics/ingest.rs`, per research R7/R8 and data-model "Ingest":
   - Add `tunnel_flapping: bool`, `last_ike_sa_loss_cause: Option<IkeSaLossCause>` and `streak_opened_by_flapping: bool` to `AgentRecord` (~line 92) and its constructors and test literals.
   - In `apply_state`'s supervisor branch (~line 715): update the stored flapping and cause from `Some(..)` values; the supervisor's health is `child_sa_up && !tunnel_flapping`. On becoming unhealthy because of flapping with no open streak, set `tunnel_unhealthy_since = Some(now - tunnel_threshold)` and `streak_opened_by_flapping = true`; any other unhealthy start opens at `now`; on healthy, clear both. `apply_state` needs the tunnel threshold, so pass it in from `apply_report_with`, where `cfg` is available (~line 228).
   - In `build_alert` (~line 525), produce the two Failure texts from contracts/observability.md using the supervisor record's `streak_opened_by_flapping` and `last_ike_sa_loss_cause`. Look the record up by key under the liveness lock, or pass the values in from `dispatch_transition`'s caller.
   - Make T024/T025 pass.
-- [ ] T029 [US1] In `gsm-sip-bridge/src/supervise/orchestrate.rs`, strongswan steady loop:
+- [x] T029 [US1] In `gsm-sip-bridge/src/supervise/orchestrate.rs`, strongswan steady loop:
   - Create `RebuildWindow::new(Duration::from_secs(ctx.config.alerts.tunnel_failure_thresholds.unhealthy_sec))` per line.
   - In the `Recovered` arm, when `recovery_restarts_agent(reason)`, call `rebuilds.record(Instant::now())`.
   - Call `rebuilds.tick(Instant::now())` once per loop iteration.
@@ -247,8 +247,8 @@ All paths are relative to the repo root. `supervise/` means `gsm-sip-bridge/src/
 
 ## Phase 8: Polish & Cross-Cutting
 
-- [ ] T030 [P] Add Unreleased entries to `RELEASE_NOTES.md` and `CHANGELOG.md`, in the existing style: bold only the summary (memory: release-notes bold scope). Cover IKE_SA-loss recovery with cause, the P-CSCF sync fix, graceful-first teardown, Gm state cleanup, and the flapping alert. Reference #106 and #120 (out of scope). Commit with T031
-- [ ] T031 [P] In `config.toml.example` under `[alerts.tunnel_failure]` (~line 85), extend the comment: it also fires when a line's tunnel is rebuilt 3+ times within `unhealthy_sec`, and the alert text names the last IKE_SA loss cause. No new keys. Run `make format && make lint && make test` and commit: `docs: release notes and config note for IKE_SA-loss recovery`
+- [x] T030 [P] Add Unreleased entries to `RELEASE_NOTES.md` and `CHANGELOG.md`, in the existing style: bold only the summary (memory: release-notes bold scope). Cover IKE_SA-loss recovery with cause, the P-CSCF sync fix, graceful-first teardown, Gm state cleanup, and the flapping alert. Reference #106 and #120 (out of scope). Commit with T031
+- [x] T031 [P] In `config.toml.example` under `[alerts.tunnel_failure]` (~line 85), extend the comment: it also fires when a line's tunnel is rebuilt 3+ times within `unhealthy_sec`, and the alert text names the last IKE_SA loss cause. No new keys. Run `make format && make lint && make test` and commit: `docs: release notes and config note for IKE_SA-loss recovery`
 - [ ] T032 Run the live gate in `specs/087-ike-sa-loss-recovery/quickstart.md` §2 (steps 2a–2f, 2g if it happens) on the local Vodafone line. Recreate, don't restart. Fill in the §3 results table, redacted. If 2a shows `CONNECTING` is **not** listed, stop and revisit research R1 before merging
 - [ ] T033 Final pass: `make format && make lint && make test` on the branch tip. Confirm every FR/SC in the mapping table below is covered. Open the PR referencing #106 (and noting #120 and #107 as out of scope), ending with the Claude Code attribution line
 

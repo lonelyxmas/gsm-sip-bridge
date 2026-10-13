@@ -334,6 +334,73 @@ pub struct SteadyTracking {
 /// `ChildSaMissing`, so 2 is about 60s. No backoff between repeated rebuilds.
 pub const CHILD_SA_MISSING_STRIKES: u32 = 2;
 
+/// IKE_SA rebuilds within the tunnel-failure window that count as flapping.
+pub const FLAP_REBUILDS: usize = 3;
+
+/// Sliding window over agent-restarting recoveries (IKE_SA rebuilds), latching
+/// "flapping" once [`FLAP_REBUILDS`] land within `window` (specs/087, R7).
+///
+/// Computed here, where the rebuilds happen, so no timestamps cross the process
+/// boundary: the supervisor reports only the latch. Methods take `now` for
+/// testability and return whether the latch changed.
+#[derive(Debug, Clone)]
+pub struct RebuildWindow {
+    window: Duration,
+    rebuilds: std::collections::VecDeque<std::time::Instant>,
+    latched: bool,
+}
+
+impl RebuildWindow {
+    pub fn new(window: Duration) -> Self {
+        Self {
+            window,
+            rebuilds: std::collections::VecDeque::new(),
+            latched: false,
+        }
+    }
+
+    pub fn is_flapping(&self) -> bool {
+        self.latched
+    }
+
+    fn prune(&mut self, now: std::time::Instant) {
+        while self
+            .rebuilds
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= self.window)
+        {
+            self.rebuilds.pop_front();
+        }
+    }
+
+    /// Records a rebuild at `now`; true if this latched flapping.
+    pub fn record(&mut self, now: std::time::Instant) -> bool {
+        self.prune(now);
+        self.rebuilds.push_back(now);
+        if !self.latched && self.rebuilds.len() >= FLAP_REBUILDS {
+            self.latched = true;
+            return true;
+        }
+        false
+    }
+
+    /// Ages the window; true if it unlatched, which needs a full quiet
+    /// `window` since the newest rebuild.
+    pub fn tick(&mut self, now: std::time::Instant) -> bool {
+        let quiet = self
+            .rebuilds
+            .back()
+            .is_none_or(|t| now.saturating_duration_since(*t) >= self.window);
+        self.prune(now);
+        if self.latched && quiet {
+            self.latched = false;
+            self.rebuilds.clear();
+            return true;
+        }
+        false
+    }
+}
+
 /// Advances the steady-state state machine by one tick. 1:1 port of both
 /// engines' steady-state supervisor loop bodies (see module docs) — the
 /// order of checks matches the bash exactly: process-alive first, then
@@ -1208,6 +1275,40 @@ mod tests {
         tracking: &mut SteadyTracking,
     ) -> SteadyOutcome {
         tick_steady_state(engine, runner, "10.0.0.1", tracking)
+    }
+
+    #[test]
+    fn rebuild_window_latches_on_the_third_rebuild_within_the_window() {
+        use std::time::Instant;
+        let w = Duration::from_secs(300);
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut r = RebuildWindow::new(w);
+        assert!(!r.record(at(0)));
+        assert!(!r.record(at(10)));
+        assert!(!r.is_flapping());
+        assert!(
+            r.record(at(20)),
+            "the third latches, and reports the change"
+        );
+        assert!(r.is_flapping());
+        assert!(!r.record(at(30)), "a fourth stays latched, no change");
+        // Not yet a full window since the newest rebuild.
+        assert!(!r.tick(at(30 + 299)));
+        assert!(r.is_flapping());
+        assert!(r.tick(at(30 + 300)), "a full quiet window unlatches");
+        assert!(!r.is_flapping());
+    }
+
+    #[test]
+    fn rebuilds_spread_wider_than_the_window_never_latch() {
+        use std::time::Instant;
+        let t0 = Instant::now();
+        let mut r = RebuildWindow::new(Duration::from_secs(300));
+        for i in 0..6 {
+            assert!(!r.record(t0 + Duration::from_secs(i * 200)));
+        }
+        assert!(!r.is_flapping());
     }
 
     #[test]

@@ -53,6 +53,8 @@ async fn test_observe_report_lands_in_scraped_metrics() {
             sip_server_ring_registered: None,
             registration_expires_at: None,
             child_sa_up: None,
+            tunnel_flapping: None,
+            ike_sa_loss_cause: None,
         },
         events: vec![ObservedEvent::CallCompleted {
             status: CallStatus::Answered,

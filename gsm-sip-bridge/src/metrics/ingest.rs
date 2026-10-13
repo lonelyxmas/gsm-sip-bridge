@@ -13,7 +13,8 @@ use crate::alerts::discord::DiscordClient;
 use crate::alerts::{AlertCategory, AlertOutcome, CriticalEvent, CriticalEventKind};
 use crate::config::AlertsConfig;
 use crate::control::protocol::{
-    AgentKind, AgentReport, AgentState, CallStatus, ObservedEvent, QualitySource, SmsOutcome,
+    AgentKind, AgentReport, AgentState, CallStatus, IkeSaLossCause, ObservedEvent, QualitySource,
+    SmsOutcome,
 };
 use crate::metrics;
 use std::collections::HashMap;
@@ -110,6 +111,16 @@ struct AgentRecord {
     /// specs/086. State of the folded tunnel decision; only ever set on the
     /// supervisor's record, which owns it. See [`FoldedTunnel`].
     tunnel_fold: FoldedTunnel,
+    /// specs/087. Supervisor records only: the supervisor's last-reported
+    /// `tunnel_flapping`. A flapping tunnel counts as unhealthy even while the
+    /// CHILD_SA is up, so a line rebuilt every few minutes still alerts.
+    tunnel_flapping: bool,
+    /// The most recent IKE_SA loss cause the supervisor reported, for alert text.
+    last_ike_sa_loss_cause: Option<IkeSaLossCause>,
+    /// Whether the open tunnel streak was opened by flapping (backdated by the
+    /// threshold so it alerts at once) rather than by an outage. Picks the alert
+    /// wording.
+    streak_opened_by_flapping: bool,
     /// Same pair, for `gm_connection_up` (specs/028-gm-tcp-reconnect).
     gm_connection_unhealthy_since: Option<Instant>,
     gm_connection_alert_phase: AlertPhase,
@@ -185,6 +196,9 @@ fn apply_report_with(
         existing.map_or(AlertPhase::Idle, |r| r.registered_alert_phase);
     let mut tunnel_alert_phase = existing.map_or(AlertPhase::Idle, |r| r.tunnel_alert_phase);
     let mut tunnel_fold = existing.map_or_else(FoldedTunnel::default, |r| r.tunnel_fold);
+    let mut tunnel_flapping = existing.is_some_and(|r| r.tunnel_flapping);
+    let mut last_ike_sa_loss_cause = existing.and_then(|r| r.last_ike_sa_loss_cause);
+    let mut streak_opened_by_flapping = existing.is_some_and(|r| r.streak_opened_by_flapping);
     let mut gm_connection_alert_phase =
         existing.map_or(AlertPhase::Idle, |r| r.gm_connection_alert_phase);
     let mut registered_unhealthy_since = existing.and_then(|r| r.registered_unhealthy_since);
@@ -211,6 +225,23 @@ fn apply_report_with(
             &mut gm_connection_unhealthy_since,
             &mut registration_expires_at,
         );
+
+        if report.agent == AgentKind::Supervisor {
+            if let Some(cause) = report.state.ike_sa_loss_cause {
+                last_ike_sa_loss_cause = Some(cause);
+            }
+            if let Some(flapping) = report.state.tunnel_flapping {
+                tunnel_flapping = flapping;
+            }
+            fold_flapping_into_tunnel_streak(
+                &mut tunnel_unhealthy_since,
+                existing.and_then(|r| r.tunnel_unhealthy_since),
+                tunnel_flapping,
+                &report.state,
+                alerts.map(|c| Duration::from_secs(c.tunnel_failure_thresholds.unhealthy_sec)),
+                &mut streak_opened_by_flapping,
+            );
+        }
 
         for event in &report.events {
             apply_event(report.agent, module_id, event);
@@ -347,6 +378,9 @@ fn apply_report_with(
             tunnel_unhealthy_since,
             tunnel_alert_phase,
             tunnel_fold,
+            tunnel_flapping,
+            last_ike_sa_loss_cause,
+            streak_opened_by_flapping,
             gm_connection_unhealthy_since,
             gm_connection_alert_phase,
             registration_expires_at,
@@ -354,6 +388,73 @@ fn apply_report_with(
     );
     drop(guard);
     pending_transitions
+}
+
+/// specs/087: widens the supervisor's "unhealthy" from `!child_sa_up` to
+/// `!child_sa_up || tunnel_flapping`, on top of what `apply_state` already did
+/// with `child_sa_up`.
+///
+/// `prev_since` is the streak as it stood before this report. A flapping tunnel
+/// whose CHILD_SA is up has no outage of its own, so its streak is opened
+/// *backdated by the threshold* and the existing folded decision alerts on this
+/// very report; a streak already open (an outage that overlaps flapping, or the
+/// flapping streak itself) is kept, so overlapping time shares one episode and
+/// one alert. The streak closes only when the CHILD_SA is up and flapping has
+/// unlatched.
+fn fold_flapping_into_tunnel_streak(
+    since: &mut Option<Instant>,
+    prev_since: Option<Instant>,
+    flapping: bool,
+    state: &AgentState,
+    threshold: Option<Duration>,
+    opened_by_flapping: &mut bool,
+) {
+    if flapping {
+        if since.is_none() {
+            *since = prev_since.or_else(|| {
+                *opened_by_flapping = true;
+                let now = Instant::now();
+                Some(threshold.and_then(|t| now.checked_sub(t)).unwrap_or(now))
+            });
+        }
+    } else if state.tunnel_flapping == Some(false)
+        && state.child_sa_up.is_none()
+        && *opened_by_flapping
+    {
+        // Unlatched on a report that says nothing about the CHILD_SA: the only
+        // thing keeping this streak open was the flapping.
+        *since = None;
+    }
+    if since.is_none() {
+        *opened_by_flapping = false;
+    } else if prev_since.is_none() && !flapping {
+        // A fresh streak that flapping did not open.
+        *opened_by_flapping = false;
+    }
+}
+
+/// The text of a tunnel-failure `Failure` alert (specs/087, contracts/
+/// observability.md). `cause` is omitted when none was ever reported.
+fn tunnel_failure_description(
+    subject: &str,
+    unhealthy_sec: u64,
+    flapping: bool,
+    cause: Option<IkeSaLossCause>,
+) -> String {
+    match (flapping, cause) {
+        (false, None) => {
+            format!("{subject} line's tunnel non-established for over {unhealthy_sec}s")
+        }
+        (false, Some(c)) => format!(
+            "{subject} line's tunnel non-established for over {unhealthy_sec}s (last IKE_SA loss: {c})"
+        ),
+        (true, None) => format!(
+            "{subject} line's tunnel rebuilt repeatedly (3+ times within {unhealthy_sec}s)"
+        ),
+        (true, Some(c)) => format!(
+            "{subject} line's tunnel rebuilt repeatedly (3+ times within {unhealthy_sec}s; last IKE_SA loss: {c})"
+        ),
+    }
 }
 
 /// The pure per-signal decision: given the current unhealthy streak and
@@ -522,11 +623,21 @@ fn build_alert(
         // The supervisor and the IMS agent share one folded alert (specs/086),
         // so both read as the VoWiFi line rather than naming whichever kind
         // happened to own the decision.
-        (AlertCategory::TunnelFailure, CriticalEventKind::Failure) => format!(
-            "{} line's tunnel non-established for over {}s",
-            tunnel_alert_subject(key.0),
-            cfg.tunnel_failure_thresholds.unhealthy_sec
-        ),
+        (AlertCategory::TunnelFailure, CriticalEventKind::Failure) => {
+            let (flapping, cause) = liveness()
+                .lock()
+                .unwrap()
+                .get(key)
+                .map_or((false, None), |r| {
+                    (r.streak_opened_by_flapping, r.last_ike_sa_loss_cause)
+                });
+            tunnel_failure_description(
+                tunnel_alert_subject(key.0),
+                cfg.tunnel_failure_thresholds.unhealthy_sec,
+                flapping,
+                cause,
+            )
+        }
         (AlertCategory::TunnelFailure, CriticalEventKind::Recovered) => {
             format!(
                 "{} line's tunnel re-established",
@@ -1435,6 +1546,9 @@ mod tests {
                 tunnel_unhealthy_since: None,
                 tunnel_alert_phase: AlertPhase::Idle,
                 tunnel_fold: FoldedTunnel::default(),
+                tunnel_flapping: false,
+                last_ike_sa_loss_cause: None,
+                streak_opened_by_flapping: false,
                 gm_connection_unhealthy_since: None,
                 gm_connection_alert_phase: AlertPhase::Idle,
                 registration_expires_at: None,
@@ -1638,6 +1752,9 @@ mod tests {
                         generation: Some(generation),
                         ended: false,
                     },
+                    tunnel_flapping: false,
+                    last_ike_sa_loss_cause: None,
+                    streak_opened_by_flapping: false,
                     gm_connection_unhealthy_since: None,
                     gm_connection_alert_phase: AlertPhase::Idle,
                     registration_expires_at: None,
@@ -1854,5 +1971,147 @@ mod tests {
             tunnel_events(&t),
             vec![(AgentKind::Ims, CriticalEventKind::Failure)]
         );
+    }
+
+    // specs/087: flapping widens the supervisor's "unhealthy".
+
+    fn sup_state_report(
+        cfg: &AlertsConfig,
+        module_id: &str,
+        seq: u64,
+        state: AgentState,
+    ) -> Vec<PendingTransition> {
+        apply_report_with(
+            &AgentReport {
+                agent: AgentKind::Supervisor,
+                module_id: module_id.to_string(),
+                epoch: 7,
+                seq,
+                state,
+                events: vec![],
+                dropped: 0,
+            },
+            Some(cfg),
+        )
+    }
+
+    fn flap_state(child_sa_up: bool, flapping: bool) -> AgentState {
+        AgentState {
+            child_sa_up: Some(child_sa_up),
+            tunnel_flapping: Some(flapping),
+            ..AgentState::default()
+        }
+    }
+
+    #[test]
+    fn a_flapping_tunnel_alerts_once_while_its_child_sa_is_up_and_recovers_when_it_settles() {
+        let m = "test-flapping-alert";
+        let cfg = tunnel_cfg();
+        let sup_key = (AgentKind::Supervisor, m.to_string());
+        assert!(tunnel_events(&sup_state_report(&cfg, m, 1, flap_state(true, false))).is_empty());
+        // The third rebuild latches: one Failure, on that same report.
+        let t = sup_state_report(&cfg, m, 2, flap_state(true, true));
+        assert_eq!(
+            tunnel_events(&t),
+            vec![(AgentKind::Supervisor, CriticalEventKind::Failure)]
+        );
+        assert!(
+            liveness().lock().unwrap()[&sup_key].streak_opened_by_flapping,
+            "the alert text must say rebuilt-repeatedly"
+        );
+        // Still flapping: nothing more.
+        assert!(tunnel_events(&sup_state_report(&cfg, m, 3, flap_state(true, true))).is_empty());
+        // Settled: the failure notice lands, then the all-clear.
+        liveness()
+            .lock()
+            .unwrap()
+            .get_mut(&sup_key)
+            .unwrap()
+            .tunnel_alert_phase = AlertPhase::Alerted;
+        let t = sup_state_report(&cfg, m, 4, flap_state(true, false));
+        assert_eq!(
+            tunnel_events(&t),
+            vec![(AgentKind::Supervisor, CriticalEventKind::Recovered)]
+        );
+        assert!(!liveness().lock().unwrap()[&sup_key].streak_opened_by_flapping);
+    }
+
+    #[test]
+    fn an_outage_overlapping_flapping_alerts_exactly_once() {
+        let m = "test-flapping-overlaps-outage";
+        let cfg = tunnel_cfg();
+        let sup_key = (AgentKind::Supervisor, m.to_string());
+        let mut failures = 0;
+        let mut seq = 0;
+        let mut go = |state: AgentState| {
+            seq += 1;
+            failures += tunnel_events(&sup_state_report(&cfg, m, seq, state))
+                .iter()
+                .filter(|(_, k)| *k == CriticalEventKind::Failure)
+                .count();
+        };
+        go(flap_state(true, true));
+        liveness()
+            .lock()
+            .unwrap()
+            .get_mut(&sup_key)
+            .unwrap()
+            .tunnel_alert_phase = AlertPhase::Alerted;
+        // The CHILD_SA now drops too, past the threshold: still the one episode.
+        go(flap_state(false, true));
+        backdate_tunnel(AgentKind::Supervisor, m, 400);
+        go(flap_state(false, true));
+        assert_eq!(failures, 1);
+    }
+
+    #[test]
+    fn an_ims_report_never_sets_or_clears_flapping() {
+        let m = "test-flapping-ims-untouched";
+        let cfg = tunnel_cfg();
+        sup_state_report(&cfg, m, 1, flap_state(true, true));
+        fold_report(&cfg, AgentKind::Ims, m, 1, true);
+        let g = liveness().lock().unwrap();
+        assert!(g[&(AgentKind::Supervisor, m.to_string())].tunnel_flapping);
+        assert!(!g[&(AgentKind::Ims, m.to_string())].tunnel_flapping);
+    }
+
+    #[test]
+    fn the_loss_cause_is_remembered_and_named_in_the_alert_text() {
+        let m = "test-loss-cause-sticks";
+        let cfg = tunnel_cfg();
+        sup_state_report(
+            &cfg,
+            m,
+            1,
+            AgentState {
+                child_sa_up: Some(false),
+                ike_sa_loss_cause: Some(IkeSaLossCause::CarrierDelete),
+                ..AgentState::default()
+            },
+        );
+        // A later report that does not mention the cause leaves it alone.
+        sup_state_report(&cfg, m, 2, flap_state(false, false));
+        let cause = liveness().lock().unwrap()[&(AgentKind::Supervisor, m.to_string())]
+            .last_ike_sa_loss_cause;
+        assert_eq!(cause, Some(IkeSaLossCause::CarrierDelete));
+    }
+
+    #[test]
+    fn tunnel_failure_text_per_cause_and_streak_kind() {
+        use IkeSaLossCause::*;
+        assert_eq!(
+            tunnel_failure_description("VoWiFi", 300, false, None),
+            "VoWiFi line's tunnel non-established for over 300s"
+        );
+        assert_eq!(
+            tunnel_failure_description("VoWiFi", 300, false, Some(DeadPeer)),
+            "VoWiFi line's tunnel non-established for over 300s (last IKE_SA loss: dead-peer timeout)"
+        );
+        assert_eq!(
+            tunnel_failure_description("VoWiFi", 300, true, Some(CarrierDelete)),
+            "VoWiFi line's tunnel rebuilt repeatedly (3+ times within 300s; last IKE_SA loss: carrier DELETE)"
+        );
+        let no_cause = tunnel_failure_description("VoWiFi", 300, true, None);
+        assert!(no_cause.contains("rebuilt repeatedly") && !no_cause.contains("last IKE_SA loss"));
     }
 }
