@@ -469,8 +469,44 @@ fn dispatch_transition(
     kind: CriticalEventKind,
     generation: Option<Instant>,
 ) {
-    let (Some(cfg), Some(client)) = (ALERTS_CONFIG.get(), ALERTS_CLIENT.get()) else {
+    let Some((cfg, client, event)) = build_alert(&key, category, kind) else {
         return;
+    };
+
+    tokio::spawn(async move {
+        let outcome = crate::alerts::dispatch(&client, &cfg, event).await;
+        if kind == CriticalEventKind::Failure {
+            let success = matches!(outcome, AlertOutcome::Sent(_));
+            // `generation` is always `Some` here — only `Failure`
+            // transitions reach this branch, and `decide_transition` only
+            // ever produces one from `Some(since)`.
+            if let Some(generation) = generation {
+                if record_alert_outcome(&key, category, generation, success) {
+                    // The outage ended while this notice was in flight, so the
+                    // operator is owed the all-clear. It is sent from here, with
+                    // the phase still `Pending`, so a new outage cannot race
+                    // its own Failure ahead of it and then be wiped by this
+                    // older all-clear.
+                    if let Some((cfg, client, event)) =
+                        build_alert(&key, category, CriticalEventKind::Recovered)
+                    {
+                        crate::alerts::dispatch(&client, &cfg, event).await;
+                    }
+                    finish_late_all_clear(&key, category);
+                }
+            }
+        }
+    });
+}
+
+/// Builds the event for one transition, or `None` when alerting is not set up.
+fn build_alert(
+    key: &(AgentKind, String),
+    category: AlertCategory,
+    kind: CriticalEventKind,
+) -> Option<(AlertsConfig, DiscordClient, CriticalEvent)> {
+    let (Some(cfg), Some(client)) = (ALERTS_CONFIG.get(), ALERTS_CLIENT.get()) else {
+        return None;
     };
     let cfg = cfg.clone();
     let client = client.clone();
@@ -521,21 +557,22 @@ fn dispatch_transition(
         at: chrono::Utc::now(),
         kind,
     };
+    Some((cfg, client, event))
+}
 
-    tokio::spawn(async move {
-        let outcome = crate::alerts::dispatch(&client, &cfg, event).await;
-        if kind == CriticalEventKind::Failure {
-            let success = matches!(outcome, AlertOutcome::Sent(_));
-            // `generation` is always `Some` here — only `Failure`
-            // transitions reach this branch, and `decide_transition` only
-            // ever produces one from `Some(since)`.
-            if let Some(generation) = generation {
-                if record_alert_outcome(&key, category, generation, success) {
-                    dispatch_transition(key.clone(), category, CriticalEventKind::Recovered, None);
-                }
-            }
+/// Completes a late all-clear started by [`record_alert_outcome`]: frees the
+/// phase so any outage that began meanwhile is decided fresh.
+fn finish_late_all_clear(key: &(AgentKind, String), category: AlertCategory) {
+    if category != AlertCategory::TunnelFailure {
+        return;
+    }
+    let mut guard = liveness().lock().unwrap();
+    if let Some(record) = guard.get_mut(key) {
+        if record.tunnel_alert_phase == AlertPhase::Pending && record.tunnel_fold.ended {
+            record.tunnel_fold = FoldedTunnel::default();
+            record.tunnel_alert_phase = AlertPhase::Idle;
         }
-    });
+    }
 }
 
 /// Resolves a `Pending` phase once its dispatch completes: `Alerted` on
@@ -589,9 +626,14 @@ fn record_alert_outcome(
     // all-clear if the failure notice actually landed.
     if let Some(fold) = ended {
         if fold.ended {
+            if success {
+                // Stay `Pending` until the all-clear has been sent
+                // (`finish_late_all_clear`), so nothing can be decided in between.
+                return true;
+            }
             *fold = FoldedTunnel::default();
             *phase = AlertPhase::Idle;
-            return success;
+            return false;
         }
     }
     *phase = if success {
@@ -1756,13 +1798,22 @@ mod tests {
             generation,
             true
         ));
+        // The phase is held until the all-clear has gone out, so the ongoing
+        // second outage cannot send a Failure that the older all-clear would
+        // then wipe.
+        assert_eq!(
+            liveness().lock().unwrap()[&sup_key].tunnel_alert_phase,
+            AlertPhase::Pending
+        );
+        assert!(tunnel_events(&fold_report(&cfg, AgentKind::Supervisor, m, 6, false)).is_empty());
+        finish_late_all_clear(&sup_key, AlertCategory::TunnelFailure);
         assert_eq!(
             liveness().lock().unwrap()[&sup_key].tunnel_alert_phase,
             AlertPhase::Idle
         );
 
-        // The ongoing second outage then gets its own Failure.
-        let t = fold_report(&cfg, AgentKind::Supervisor, m, 6, false);
+        // Only now does the ongoing second outage get its own Failure.
+        let t = fold_report(&cfg, AgentKind::Supervisor, m, 7, false);
         assert_eq!(
             tunnel_events(&t),
             vec![(AgentKind::Supervisor, CriticalEventKind::Failure)]
