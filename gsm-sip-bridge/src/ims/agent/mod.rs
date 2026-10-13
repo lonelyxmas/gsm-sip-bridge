@@ -2635,9 +2635,9 @@ impl LoopState {
         req: &SipRequest,
         sink: &SipSink,
     ) -> BridgeResult<()> {
-        if !crate::ims::session::handle_notify(session, sink, req) {
+        let Some(_deregistration) = crate::ims::session::handle_notify(session, sink, req) else {
             return Ok(());
-        }
+        };
         {
             let mut guard = p.status.lock().unwrap_or_else(|e| e.into_inner());
             guard.state = crate::ims::RegistrationState::Failed;
