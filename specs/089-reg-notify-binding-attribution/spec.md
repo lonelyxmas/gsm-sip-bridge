@@ -33,6 +33,7 @@ A second, smaller deviation: the bridge treats every deregistration event the sa
 ### Session 2026-10-14
 
 - Q: When the network reports the line's *current* binding `terminated` with event `rejected`, how should the bridge behave? → A: Long cooldown, then retry. Do not re-register immediately; mark the line failed so the existing registration-loss alert fires; retry once after a long cooldown (default 30 minutes, or the network's retry-after if it gave one), and keep using the cooldown if `rejected` repeats. Not "never retry" (an unattended line must self-heal), not the immediate ladder (that hammers a carrier that said no).
+- Q: Does an immediate re-registration on `deactivated` bypass the issue #117 early-loss accounting? → A: No. The first attempt is immediate (no ladder delay) but still counts as an early loss under the #117 accounting; a repeat `deactivated` within the settle window climbs the ladder, and the existing consecutive-failure exit still applies, so a network-side deactivate loop is throttled rather than unbounded.
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -69,12 +70,13 @@ When the network reports the line's **current** binding terminated, the bridge r
 **Acceptance Scenarios**:
 
 1. **Given** a registered line, **When** its current binding is reported `terminated/deactivated`, **Then** a re-registration is attempted on the next loop pass.
-2. **Given** a registered line, **When** its current binding is reported `terminated/unregistered`, **Then** a re-registration is scheduled on the backoff ladder and counts as one failure towards it, as for any other early loss.
-3. **Given** a registered line, **When** its current binding is reported `terminated/probation` with `retry-after="600"`, **Then** no re-registration is attempted for 600 seconds.
-4. **Given** a registered idle line, **When** its current binding is reported `terminated/rejected`, **Then** the line reports `Failed` and not registered, no re-registration is attempted for the cooldown period, exactly one attempt follows when the cooldown ends, and the agent does not exit.
-5. **Given** a call in progress, **When** the current binding is reported `terminated/rejected`, **Then** the call is ended and the same cooldown applies.
-6. **Given** `rejected` arrives again after the post-cooldown attempt registered, **When** it is processed, **Then** a new cooldown starts; however many times this repeats, the agent never exits because of it.
-7. **Given** a per-line cooldown of 10 minutes is configured, **When** `rejected` arrives with no retry-after, **Then** the next attempt is 10 minutes later.
+2. **Given** a line that re-registered after `deactivated`, **When** the new binding is again reported `terminated/deactivated` before it settles, **Then** the next attempt waits on the backoff ladder and counts one failure towards the exit budget.
+3. **Given** a registered line, **When** its current binding is reported `terminated/unregistered`, **Then** a re-registration is scheduled on the backoff ladder and counts as one failure towards it, as for any other early loss.
+4. **Given** a registered line, **When** its current binding is reported `terminated/probation` with `retry-after="600"`, **Then** no re-registration is attempted for 600 seconds.
+5. **Given** a registered idle line, **When** its current binding is reported `terminated/rejected`, **Then** the line reports `Failed` and not registered, no re-registration is attempted for the cooldown period, exactly one attempt follows when the cooldown ends, and the agent does not exit.
+6. **Given** a call in progress, **When** the current binding is reported `terminated/rejected`, **Then** the call is ended and the same cooldown applies.
+7. **Given** `rejected` arrives again after the post-cooldown attempt registered, **When** it is processed, **Then** a new cooldown starts; however many times this repeats, the agent never exits because of it.
+8. **Given** a per-line cooldown of 10 minutes is configured, **When** `rejected` arrives with no retry-after, **Then** the next attempt is 10 minutes later.
 
 ---
 
@@ -101,6 +103,7 @@ A NOTIFY can say a single binding is gone while the identity stays registered (`
 - A carrier appends URI parameters to `<uri>` (`;transport=tcp`, `;Hpt=…`): ignored for matching, as today.
 - A NOTIFY arrives for the old binding after the renewal swapped sessions but before the new session's NOTIFY: it names the old address, so it is ignored.
 - Several `<contact>` entries for the current address with different events (e.g. `rejected` under one identity, `unregistered` under another): the most restrictive applies (`rejected` > `deactivated` > `probation` > `unregistered`), so a `rejected` is never downgraded into an immediate retry.
+- The network deactivates every new binding shortly after it registers (a carrier-side `deactivated` loop): the first re-registration is immediate, repeats inside the settle window are throttled by the backoff ladder and counted towards the exit budget (FR-006).
 - `rejected` arrives while a renewal attempt is already scheduled: the cooldown replaces the earlier schedule.
 - The agent restarts during a cooldown (e.g. supervisor action): the restarted agent registers normally; the cooldown is not persisted across restarts.
 - `retry-after` larger than the configured cooldown: the larger value wins.
@@ -119,7 +122,7 @@ A NOTIFY can say a single binding is gone while the identity stays registered (`
 
 **Per-event policy for the current binding** (TS 24.229 §5.1.1.7, §5.4.1.5; RFC 3680 §5.2)
 
-- **FR-006**: On `deactivated`, the system MUST attempt a new registration immediately.
+- **FR-006**: On `deactivated`, the system MUST attempt a new registration immediately (no ladder delay), and MUST still count the loss under the existing early-loss accounting (issue #117): a repeat `deactivated` within the registration settle window advances the backoff ladder, and the existing consecutive-renewal-failure exit applies.
 - **FR-007**: On `unregistered`, the system MUST re-register on the existing renewal backoff ladder, with the existing early-loss accounting (issue #117).
 - **FR-008**: On `probation`, the system MUST re-register on the backoff ladder and MUST NOT attempt before the entry's `retry-after` value, if present, has elapsed.
 - **FR-009**: On `rejected`, the system MUST end any call or dialog in progress on the line, report the registration as failed and not registered (so the existing registration-loss alert can fire), and MUST NOT attempt a new registration until the rejection cooldown has elapsed.
