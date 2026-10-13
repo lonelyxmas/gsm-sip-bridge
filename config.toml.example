@@ -83,7 +83,8 @@ enabled = false
 unhealthy_sec = 300               # range: 30-3600
 
 [alerts.tunnel_failure]
-# A VoWiFi line's ePDG/IPsec tunnel non-established continuously for unhealthy_sec.
+# A VoWiFi line's ePDG/IPsec tunnel non-established, or its IPsec CHILD_SA missing,
+# continuously for unhealthy_sec. One alert per outage.
 enabled = false
 unhealthy_sec = 300               # range: 30-3600
 

@@ -392,6 +392,21 @@ pub static VOWIFI_TUNNEL_UP: Lazy<GaugeVec> = Lazy::new(|| {
     .unwrap()
 });
 
+/// 1 if the supervisor's last check found a usable IPsec CHILD_SA for this
+/// line, 0 otherwise (specs/086). Unlike [`VOWIFI_TUNNEL_UP`] -- a
+/// registration-liveness proxy reported by the IMS agent -- this is the SA state
+/// as the supervisor observes it, so it reads 0 from the start of supervision.
+pub static VOWIFI_CHILD_SA_UP: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        opts!(
+            "gsm_sip_bridge_vowifi_child_sa_up",
+            "1 if the supervisor's last check found a usable IPsec CHILD_SA for this VoWiFi line, 0 otherwise"
+        ),
+        &["module"]
+    )
+    .unwrap()
+});
+
 /// 1 if this line's Gm signaling connection is up, 0 otherwise (specs/028).
 /// Retains the `vowifi_` prefix even for VoLTE lines — the `module` label
 /// distinguishes transports — matching the precedent already documented for

@@ -68,7 +68,7 @@ clears — never a repeating stream while a condition stays unhealthy.
 | | `at_worker_unresponsive_sec` | integer | 60 | Range: 5-600 |
 | `[alerts.registration_loss]` | `enabled` | boolean | false | A VoLTE/VoWiFi line's SIP registration lost continuously past `unhealthy_sec` |
 | | `unhealthy_sec` | integer | 300 | Range: 30-3600 |
-| `[alerts.tunnel_failure]` | `enabled` | boolean | false | A VoWiFi line's ePDG/IPsec tunnel non-established continuously past `unhealthy_sec` |
+| `[alerts.tunnel_failure]` | `enabled` | boolean | false | A VoWiFi line's ePDG/IPsec tunnel non-established, or its IPsec CHILD_SA missing, continuously past `unhealthy_sec` |
 | | `unhealthy_sec` | integer | 300 | Range: 30-3600 |
 | `[alerts.missed_call]` | `enabled` | boolean | false | An inbound call that rang out unanswered (never bridged) |
 | `[alerts.line_discovery_failed]` | `enabled` | boolean | false | An explicitly configured VoWiFi line (`modem_port`/`modem_serial`) never resolved even after retrying discovery for it |

@@ -17,6 +17,14 @@ fn staleness_threshold() -> Duration {
     *AGENT_STALENESS_THRESHOLD.get_or_init(|| Duration::from_secs(30))
 }
 
+/// specs/086: the supervisor owns no calls, so only its own gauge is zeroed --
+/// zeroing `active_calls` for this module would wrongly wipe the IMS agent's.
+fn zero_stale_supervisor_gauges(module_id: &str) {
+    super::VOWIFI_CHILD_SA_UP
+        .with_label_values(&[module_id])
+        .set(0.0);
+}
+
 /// Evaluated on every scrape (FR-021a) rather than on a timer, mirroring how
 /// `UPTIME_SECONDS` is already refreshed here: a silent VoWiFi agent's
 /// `AGENT_UP` and the gauges it owns must read correctly even if the daemon
@@ -45,7 +53,9 @@ fn refresh_agent_liveness() {
                 .set(remaining);
         }
 
-        if !state.up {
+        if !state.up && state.agent == crate::control::protocol::AgentKind::Supervisor {
+            zero_stale_supervisor_gauges(&state.module_id);
+        } else if !state.up {
             super::ACTIVE_CALLS
                 .with_label_values(&[&state.module_id, "vowifi"])
                 .set(0.0);
@@ -128,4 +138,33 @@ pub async fn serve(
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stale_supervisor_zeroes_only_its_child_sa_gauge() {
+        let m = "test-server-stale-supervisor";
+        super::super::VOWIFI_CHILD_SA_UP
+            .with_label_values(&[m])
+            .set(1.0);
+        super::super::ACTIVE_CALLS
+            .with_label_values(&[m, "vowifi"])
+            .set(2.0);
+        zero_stale_supervisor_gauges(m);
+        assert_eq!(
+            super::super::VOWIFI_CHILD_SA_UP
+                .with_label_values(&[m])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            super::super::ACTIVE_CALLS
+                .with_label_values(&[m, "vowifi"])
+                .get(),
+            2.0
+        );
+    }
 }

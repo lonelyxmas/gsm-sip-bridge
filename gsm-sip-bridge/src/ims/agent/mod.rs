@@ -792,7 +792,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
     // transport or VoLTE and VoWiFi history collapse into one.
     let transport = match agent_kind {
         AgentKind::Volte | AgentKind::VolteSip => crate::store::Transport::Volte,
-        AgentKind::Ims | AgentKind::Sip => crate::store::Transport::Vowifi,
+        AgentKind::Ims | AgentKind::Sip | AgentKind::Supervisor => crate::store::Transport::Vowifi,
     };
     let obs = observability::AgentObservability::new(
         reporter,

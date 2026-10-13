@@ -117,12 +117,41 @@ fn pick_stable_pcscf(batch: &[String]) -> Option<String> {
     v4.or_else(|| batch.iter().min()).cloned()
 }
 
-/// 1:1 port of `grep -q '^ims:' <<<"$sas_output"`, scoped to one connection —
-/// the shared daemon's unfiltered `--list-sas` would otherwise let one line's
-/// healthy SA mask another's missing one.
+/// Outer bound on a steady-state IKE_SA teardown. #107's teardown waited 52s on
+/// an exchange the ePDG would never answer; `shutdown.rs`'s
+/// `TERMINATE_TIMEOUT_SECS` is the precedent for bounding it.
+const STEADY_TERMINATE_TIMEOUT_SECS: u32 = 10;
+
+/// Outer bound on the steady-state `swanctl --list-sas` query.
+const STEADY_LIST_SAS_TIMEOUT_SECS: u32 = 10;
+
+/// CHILD_SA states that still carry (or are about to carry) traffic. A rekey
+/// briefly shows the old SA as `REKEYED` beside the new `INSTALLED` one, and
+/// `REKEYING`/`UPDATING` are the same SA mid-exchange, so none of them may read
+/// as "lost" or a healthy rekey would trigger recovery.
+const USABLE_CHILD_SA_STATES: &[&str] = &["INSTALLED", "REKEYING", "REKEYED", "UPDATING"];
+
+/// Whether `swanctl --list-sas` shows a usable CHILD_SA for `conn_name`.
+///
+/// This used to be a 1:1 port of `grep -q '^ims:'`, which matched the IKE_SA
+/// *header* line (`ims0: #1, ESTABLISHED, ...`). A CHILD_SA lost under a live
+/// IKE_SA therefore went undetected (#107). A CHILD_SA line is the two-space
+/// indented `  ims0: #N, reqid R, STATE, ...` line, so that is what is matched,
+/// scoped to one connection so another line's healthy SA never masks this
+/// one's missing one.
 pub fn list_sas_has_child_sa(sas_output: &str, conn_name: &str) -> bool {
-    let prefix = format!("{conn_name}:");
-    sas_output.lines().any(|l| l.starts_with(&prefix))
+    let prefix = format!("{conn_name}: #");
+    sas_output.lines().any(|l| {
+        let Some(rest) = l.strip_prefix("  ") else {
+            return false;
+        };
+        if rest.starts_with(' ') || !rest.starts_with(&prefix) {
+            return false;
+        }
+        rest.split(", ")
+            .nth(2)
+            .is_some_and(|state| USABLE_CHILD_SA_STATES.contains(&state))
+    })
 }
 
 /// The single charon daemon shared by every strongswan-engine line.
@@ -317,16 +346,6 @@ impl StrongswanEngine {
         self.shared.env_prefix()
     }
 
-    /// Blocking `swanctl` invocation — matches the bash calls with no
-    /// trailing `&` (`--load-all`, `--terminate`), which the original script
-    /// runs to completion before continuing.
-    fn swanctl(&self, runner: &dyn CommandRunner, args: &[&str]) {
-        let env = self.env_prefix();
-        let mut argv = vec!["env", env.as_str(), "swanctl"];
-        argv.extend_from_slice(args);
-        let _ = runner.run(&argv);
-    }
-
     /// Backgrounded `swanctl` invocation — matches the bash calls that end
     /// in `&` (every `--initiate`). Fire-and-forget: like the bash version,
     /// the spawned process's handle is never tracked or waited on (the
@@ -380,7 +399,23 @@ impl TunnelEngine for StrongswanEngine {
     }
 
     fn terminate(&self, runner: &dyn CommandRunner) {
-        self.swanctl(runner, &["--terminate", "--ike", &self.conn_name]);
+        // `--force` makes charon delete the IKE_SA without waiting on a pending
+        // exchange: without it #107 spent 52s on a stuck CREATE_CHILD_SA. Not
+        // swanctl's own `--timeout`, which disables `--force`'s no-wait
+        // behaviour; the outer `timeout` bounds it instead.
+        let env = self.env_prefix();
+        let secs = STEADY_TERMINATE_TIMEOUT_SECS.to_string();
+        let _ = runner.run(&[
+            "timeout",
+            &secs,
+            "env",
+            &env,
+            "swanctl",
+            "--terminate",
+            "--ike",
+            &self.conn_name,
+            "--force",
+        ]);
     }
 
     fn reinitiate(&self, runner: &dyn CommandRunner) {
@@ -401,7 +436,14 @@ impl TunnelEngine for StrongswanEngine {
         // `--ike <conn>` scopes the query to this line. Without it the shared
         // daemon reports every line's SAs, and another line's healthy
         // CHILD_SA would mask this line's missing one.
+        //
+        // Bounded: a vici call that never returns would otherwise freeze this
+        // line's supervision loop while the reporter thread keeps heartbeating
+        // the last (healthy) state. A timeout reads as a broken vici.
+        let secs = STEADY_LIST_SAS_TIMEOUT_SECS.to_string();
         let sas_output = match runner.run(&[
+            "timeout",
+            &secs,
             "env",
             &env,
             "swanctl",
@@ -757,15 +799,47 @@ mod tests {
         );
     }
 
+    fn ike_header(conn: &str) -> String {
+        format!("{conn}: #1, ESTABLISHED, IKEv2, 0123456789abcdef_i* fedcba9876543210_r\n  local  '001010000000001@nai.epc.mnc001.mcc001.3gppnetwork.org' @ 198.51.100.10[4500]\n")
+    }
+
+    fn child(conn: &str, n: u32, state: &str) -> String {
+        format!("  {conn}: #{n}, reqid 1, {state}, TUNNEL-in-UDP, ESP:AES_CBC-128/HMAC_SHA1_96\n    installed 10 ago\n")
+    }
+
     #[test]
-    fn list_sas_detection_matches_the_grep_pattern() {
-        assert!(list_sas_has_child_sa(
-            "ims0: #1, ESTABLISHED\n  local ...",
-            "ims0"
-        ));
-        assert!(!list_sas_has_child_sa("other: #1, ESTABLISHED\n", "ims0"));
-        // A sibling line's SA must not count as this line's.
-        assert!(!list_sas_has_child_sa("ims1: #1, ESTABLISHED\n", "ims0"));
+    fn list_sas_child_detection_table() {
+        let h = ike_header("ims0");
+        let cases: Vec<(String, bool)> = vec![
+            (h.clone(), false),
+            (h.replace("ESTABLISHED", "CONNECTING"), false),
+            (format!("{h}{}", child("ims0", 4, "INSTALLED")), true),
+            (
+                format!(
+                    "{h}{}{}",
+                    child("ims0", 3, "REKEYED"),
+                    child("ims0", 4, "INSTALLED")
+                ),
+                true,
+            ),
+            (format!("{h}{}", child("ims0", 4, "REKEYING")), true),
+            (format!("{h}{}", child("ims0", 4, "UPDATING")), true),
+            (format!("{h}{}", child("ims0", 4, "INSTALLING")), false),
+            (format!("{h}{}", child("ims0", 4, "DELETING")), false),
+            (format!("{h}{}", child("ims1", 4, "INSTALLED")), false),
+            (
+                format!("{h}    ims0: #4, reqid 1, INSTALLED, TUNNEL\n"),
+                false,
+            ),
+            (
+                format!("{}{}{h}", ike_header("ims1"), child("ims1", 2, "INSTALLED")),
+                false,
+            ),
+            (String::new(), false),
+        ];
+        for (i, (out, want)) in cases.iter().enumerate() {
+            assert_eq!(list_sas_has_child_sa(out, "ims0"), *want, "case {i}: {out}");
+        }
     }
 
     #[test]
@@ -876,6 +950,35 @@ mod tests {
         }
 
         #[test]
+        fn steady_state_health_distinguishes_a_bare_ike_sa_from_one_with_a_child() {
+            use std::os::unix::process::ExitStatusExt;
+            let list_key =
+                "timeout 10 env STRONGSWAN_CONF=/etc/strongswan-shared.conf swanctl --list-sas --ike ims0";
+            let seed = |stdout: &str| {
+                let runner = MockCommandRunner::new();
+                runner.set_run_output(
+                    list_key,
+                    std::process::Output {
+                        status: std::process::ExitStatus::from_raw(0),
+                        stdout: stdout.as_bytes().to_vec(),
+                        stderr: Vec::new(),
+                    },
+                );
+                runner
+            };
+            let engine = strongswan_engine();
+            let bare = seed(
+                "ims0: #1, ESTABLISHED, IKEv2, aa_i* bb_r\n  local  'x' @ 198.51.100.10[4500]\n",
+            );
+            assert_eq!(
+                engine.steady_state_health(&bare),
+                SteadyStateHealth::ChildSaMissing
+            );
+            let healthy = seed("ims0: #1, ESTABLISHED, IKEv2, aa_i* bb_r\n  ims0: #4, reqid 1, INSTALLED, TUNNEL-in-UDP, ESP:AES_CBC-128/HMAC_SHA1_96\n");
+            assert_eq!(engine.steady_state_health(&healthy), SteadyStateHealth::Ok);
+        }
+
+        #[test]
         fn terminate_is_scoped_to_this_lines_connection() {
             let runner = MockCommandRunner::new();
             let engine = strongswan_engine();
@@ -891,6 +994,28 @@ mod tests {
                 !calls.iter().any(|c| c.contains(&"ims".to_string())),
                 "the bare `ims` name would terminate every line's IKE_SA at once"
             );
+        }
+
+        #[test]
+        fn terminate_is_forced_and_bounded() {
+            let runner = MockCommandRunner::new();
+            strongswan_engine().terminate(&runner);
+            let calls = runner.run_calls.lock().unwrap();
+            let want: Vec<String> = [
+                "timeout",
+                "10",
+                "env",
+                "STRONGSWAN_CONF=/etc/strongswan-shared.conf",
+                "swanctl",
+                "--terminate",
+                "--ike",
+                "ims0",
+                "--force",
+            ]
+            .map(String::from)
+            .to_vec();
+            assert_eq!(calls.iter().filter(|c| **c == want).count(), 1);
+            assert!(!calls.iter().any(|c| c.contains(&"--timeout".to_string())));
         }
 
         #[test]

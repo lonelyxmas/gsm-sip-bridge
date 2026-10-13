@@ -31,6 +31,7 @@ Prometheus-compatible metrics are served at `http://<host>:9091/metrics`
 | `gsm_sip_bridge_vowifi_registered` | Gauge | 1 if the VoWiFi IMS registration is currently held |
 | `gsm_sip_bridge_vowifi_registrations_total` | Counter | VoWiFi IMS registration attempts by outcome |
 | `gsm_sip_bridge_vowifi_tunnel_up` | Gauge | 1 if Agent A has a P-CSCF assignment and a live transport to it — a liveness proxy, not raw IKE/ESP SA state |
+| `gsm_sip_bridge_vowifi_child_sa_up` | Gauge | 1 if the supervisor's last check found a usable IPsec CHILD_SA for this VoWiFi line (`INSTALLED`, `REKEYING`, `REKEYED` or `UPDATING`), 0 otherwise. Unlike `vowifi_tunnel_up`, which is reported by the IMS agent and tracks registration liveness, this is the SA state as the supervisor sees it: it reads 0 from the start of supervision (while the tunnel is still establishing), and is zeroed when the supervisor's reports go stale (3× `[metrics].agent_report_interval_seconds`, 45s at the default 15s). Absent for swu-engine and VoLTE lines. Its reports also add an `agent_up{agent="supervisor"}` series per strongSwan line |
 | `gsm_sip_bridge_vowifi_gm_connection_up` | Gauge | 1 if this line's Gm signaling connection is up, 0 while reconnecting or failed. Shared across VoWiFi and VoLTE lines, keyed by `module` (the `vowifi_` prefix is retained for VoLTE, matching `vowifi_tunnel_up`) |
 | `gsm_sip_bridge_vowifi_bridge_failures_total` | Counter | Inbound VoWiFi calls that failed to bridge, by reason |
 | `gsm_sip_bridge_agent_up` | Gauge | 1 if the named VoWiFi agent (`ims` or `sip`) has reported within the last 3 report intervals |
@@ -44,6 +45,8 @@ Prometheus-compatible metrics are served at `http://<host>:9091/metrics`
 | `gsm_sip_bridge_sip_server_requests_total` | Counter | Every request the registrar answered, by **method** and response **status** |
 | `gsm_sip_bridge_sip_server_ring_target_missing_total` | Counter | Inbound calls dropped because no phone was registered to ring |
 | `gsm_sip_bridge_outbound_attempts_total` | Counter | Outbound call attempts (`[outbound]` mode) by **outcome** (`placed`, `refused_no_idle_line`, `refused_invalid_destination`, `refused_network_failure`, `unanswered`) |
+
+The `tunnel_failure` alert fires when **either** the IMS agent's tunnel signal or the CHILD_SA signal (`vowifi_child_sa_up`) has been unhealthy continuously for `unhealthy_sec`, once per outage, and recovers when both are healthy again.
 
 **SIP server mode gauges**: `sip_server_*` appear only when
 `[sip_server].enabled` (see [configuration.md](configuration.md)).
