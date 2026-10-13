@@ -532,22 +532,24 @@ impl OwnContacts {
 
 /// Finds every `<contact>` element in a reg-event NOTIFY body that is *ours*.
 ///
-/// In order:
+/// An element is ours when either of these holds (all such elements are
+/// collected, whichever identified them):
 ///
-/// 1. Elements mentioning our own IMEI — every `Contact` we register carries
+/// 1. It mentions our own IMEI — every `Contact` we register carries
 ///    `+sip.instance="<urn:gsma:imei:...>"`, and some registrars echo it back
 ///    in an `<unknown-param>`.
-/// 2. Elements whose `<uri>` names `contact_addr`, the address our Contact
+/// 2. Its `<uri>` names `contact_addr`, the address our Contact
 ///    advertised. Its port is a fresh ephemeral one per registration, so this
 ///    also leaves out a binding from a session a renewal has replaced. This is
 ///    what identifies us on a carrier that never echoes the IMEI (issue #117:
 ///    the same contact under both a SIP and a tel AOR, which the old
 ///    "exactly one contact" rule could not attribute at all).
-/// 3. The document's only element, but only when it carries no address to
-///    check. A sole contact naming a *different* address is someone else's —
-///    a `state="partial"` NOTIFY about a paired handset carries just that
-///    handset's contact, and reading it as ours would force a
-///    re-registration this line never needed.
+///
+/// Failing both, the document's only element is taken — but only when it
+/// carries no address to check. A sole contact naming a *different* address
+/// is someone else's: a `state="partial"` NOTIFY about a paired handset
+/// carries just that handset's contact, and reading it as ours would force a
+/// re-registration this line never needed.
 ///
 /// Every match is collected, not just the first: one binding appears once
 /// per public identity.
@@ -560,20 +562,22 @@ pub(crate) fn find_own_contacts(body: &str, imei: &str, contact_addr: SocketAddr
             .filter_map(|b| parse_contact_attrs(b))
             .collect()
     };
-    if !imei.is_empty() {
-        let entries = collect(&|b| b.contains(imei));
-        if !entries.is_empty() {
-            return OwnContacts {
-                entries,
-                matched_by: Attribution::Imei,
-            };
-        }
-    }
-    let entries = collect(&|b| contact_uri_addr(b) == Some(contact_addr));
+    // Either identifier is enough, and both are collected together: a
+    // registrar may echo the IMEI under one public identity and not another,
+    // and an entry naming our own address on our own ephemeral port can only
+    // be ours.
+    let by_imei = |b: &str| !imei.is_empty() && b.contains(imei);
+    let by_addr = |b: &str| contact_uri_addr(b) == Some(contact_addr);
+    let entries = collect(&|b| by_imei(b) || by_addr(b));
     if !entries.is_empty() {
+        let matched_by = if contacts.iter().any(|b| by_imei(b)) {
+            Attribution::Imei
+        } else {
+            Attribution::ContactAddr
+        };
         return OwnContacts {
             entries,
-            matched_by: Attribution::ContactAddr,
+            matched_by,
         };
     }
     if let [only] = contacts.as_slice() {
@@ -1182,5 +1186,29 @@ mod tests {
         assert_eq!(contact_uri_addr(&block("sip:u@pcscf.example:5060")), None);
         assert_eq!(contact_uri_addr(&block("tel:+919000000000")), None);
         assert_eq!(contact_uri_addr("<contact state=\"active\"/>"), None);
+    }
+
+    /// The IMEI echoed under one public identity must not hide our entry
+    /// under another that is recognisable only by its address — that one is
+    /// the one reporting the loss here.
+    #[test]
+    fn imei_and_address_matches_are_collected_together() {
+        let body = r#"<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="2" state="full">
+  <registration aor="sip:+919000000000@ims.example" id="a1" state="active">
+    <contact id="c1" state="active" event="registered">
+      <uri>sip:+919000000000@10.0.0.1:5064</uri>
+      <unknown-param name="+sip.instance">"&lt;urn:gsma:imei:860000000000000&gt;"</unknown-param>
+    </contact>
+  </registration>
+  <registration aor="tel:+919000000000" id="a2" state="terminated">
+    <contact id="c1" state="terminated" event="rejected">
+      <uri>sip:+919000000000@10.0.0.1:5064</uri>
+    </contact>
+  </registration>
+</reginfo>"#;
+        let own = find_own_contacts(body, "860000000000000", addr("10.0.0.1:5064"));
+        assert_eq!(own.matched_by, Attribution::Imei);
+        assert_eq!(own.entries.len(), 2);
+        assert!(own.deregistered());
     }
 }

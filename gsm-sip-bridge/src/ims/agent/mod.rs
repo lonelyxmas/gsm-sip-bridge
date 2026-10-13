@@ -1770,6 +1770,10 @@ struct LoopState {
     /// within [`REGISTRATION_SETTLE`] can be counted as that renewal having
     /// failed after all.
     ladder_before_success: (Duration, u32),
+    /// Whether the current registration's early loss has already been counted
+    /// as a failure — a registrar can report the same loss in more than one
+    /// NOTIFY, and only the first may move the ladder.
+    early_loss_counted: bool,
     /// Call-ID of the last INVITE whose caller identity was unreadable and
     /// already logged, so a retransmission of it (our final response lost)
     /// does not repeat the warning — see [`Self::unreadable_caller_to_log`].
@@ -1796,6 +1800,7 @@ impl LoopState {
             consecutive_renewal_failures: 0,
             last_registered: Instant::now(),
             ladder_before_success: (RETRY_INITIAL_BACKOFF, 0),
+            early_loss_counted: false,
             unreadable_caller_warned: None,
             recent_declines: RecentDeclines::default(),
         }
@@ -1862,6 +1867,7 @@ impl LoopState {
     fn on_renewal_success(&mut self) {
         self.ladder_before_success = (self.backoff, self.consecutive_renewal_failures);
         self.last_registered = Instant::now();
+        self.early_loss_counted = false;
         self.backoff = RETRY_INITIAL_BACKOFF;
         self.consecutive_renewal_failures = 0;
         self.next_renewal_attempt = None;
@@ -1877,19 +1883,32 @@ impl LoopState {
     /// network that keeps rejecting fresh bindings gets the same backoff, and
     /// eventually the same exit to the supervisor, as one that refuses the
     /// REGISTER outright (issue #117).
-    fn on_network_deregistration(&mut self, now: Instant) -> BridgeResult<()> {
+    ///
+    /// Counted once per registration: a repeat NOTIFY about the same loss
+    /// leaves the pending retry, and any renewal failure counted since, alone.
+    ///
+    /// Never `Err` while `busy`. Exiting tears the session down, and the
+    /// renewal path only gets to exit because the maintenance policy has
+    /// already held it for any call in progress; a NOTIFY can arrive mid-call.
+    /// A loss that would spend the budget then only schedules the retry, and
+    /// the renewal held until the call ends decides whether the line exits.
+    fn on_network_deregistration(&mut self, now: Instant, busy: bool) -> BridgeResult<()> {
         self.force_renewal = true;
-        if now.saturating_duration_since(self.last_registered) >= REGISTRATION_SETTLE {
+        let age = now.saturating_duration_since(self.last_registered);
+        if age >= REGISTRATION_SETTLE || self.early_loss_counted {
             return Ok(());
         }
         (self.backoff, self.consecutive_renewal_failures) = self.ladder_before_success;
         tracing::warn!(
-            registered_secs_ago = now
-                .saturating_duration_since(self.last_registered)
-                .as_secs(),
+            registered_secs_ago = age.as_secs(),
             retry_in_secs = self.backoff.as_secs(),
             "the network dropped a registration it had only just accepted; retrying on backoff"
         );
+        if busy && self.consecutive_renewal_failures + 1 >= MAX_CONSECUTIVE_RENEWAL_FAILURES {
+            self.next_renewal_attempt = Some(now + self.backoff);
+            return Ok(());
+        }
+        self.early_loss_counted = true;
         self.schedule_renewal_retry()
     }
 
@@ -2604,7 +2623,8 @@ impl LoopState {
             ));
         }
         p.obs.set_registered(false);
-        self.on_network_deregistration(Instant::now())
+        let busy = self.busy();
+        self.on_network_deregistration(Instant::now(), busy)
     }
 
     fn handle_carrier_response(
@@ -4337,7 +4357,7 @@ mod tests {
         st.on_renewal_success();
         assert_eq!(st.consecutive_renewal_failures, 0);
 
-        st.on_network_deregistration(st.last_registered + Duration::from_secs(8))
+        st.on_network_deregistration(st.last_registered + Duration::from_secs(8), false)
             .expect("still below the budget");
         assert!(st.force_renewal);
         assert!(
@@ -4357,12 +4377,12 @@ mod tests {
     fn bindings_rejected_every_time_exhaust_the_renewal_budget() {
         let mut st = LoopState::new();
         for n in 1..MAX_CONSECUTIVE_RENEWAL_FAILURES {
-            st.on_network_deregistration(st.last_registered + Duration::from_secs(8))
+            st.on_network_deregistration(st.last_registered + Duration::from_secs(8), false)
                 .unwrap_or_else(|e| panic!("rejection {n} should still retry in-process: {e}"));
             st.on_renewal_success();
         }
         let err = st
-            .on_network_deregistration(st.last_registered + Duration::from_secs(8))
+            .on_network_deregistration(st.last_registered + Duration::from_secs(8), false)
             .expect_err("the retry budget is spent; the agent must exit for the supervisor");
         assert!(
             err.to_string()
@@ -4371,13 +4391,58 @@ mod tests {
         );
     }
 
+    /// One loss reported in several NOTIFYs is one failure: the repeat must
+    /// neither push the pending retry out nor undo a renewal failure counted
+    /// since.
+    #[test]
+    fn a_repeated_notice_of_the_same_loss_counts_once() {
+        let mut st = LoopState::new();
+        let first = st.last_registered + Duration::from_secs(8);
+        st.on_network_deregistration(first, false)
+            .expect("below the budget");
+        let retry_at = st.next_renewal_attempt;
+        st.schedule_renewal_retry()
+            .expect("a renewal failure in between");
+        let (failures, backoff, retry_after_failure) = (
+            st.consecutive_renewal_failures,
+            st.backoff,
+            st.next_renewal_attempt,
+        );
+        assert_ne!(retry_after_failure, retry_at);
+
+        st.on_network_deregistration(first + Duration::from_secs(5), false)
+            .expect("below the budget");
+        assert_eq!(st.consecutive_renewal_failures, failures);
+        assert_eq!(st.backoff, backoff);
+        assert_eq!(st.next_renewal_attempt, retry_after_failure);
+    }
+
+    /// The loss that would spend the budget arriving mid-call must not end
+    /// the loop under the call: the retry is scheduled, and the renewal held
+    /// for the call decides the exit afterwards.
+    #[test]
+    fn a_loss_that_would_spend_the_budget_never_exits_mid_call() {
+        let mut st = LoopState::new();
+        for _ in 1..MAX_CONSECUTIVE_RENEWAL_FAILURES {
+            st.on_network_deregistration(st.last_registered + Duration::from_secs(8), false)
+                .expect("below the budget");
+            st.on_renewal_success();
+        }
+        st.on_network_deregistration(st.last_registered + Duration::from_secs(8), true)
+            .expect("never an exit while a call is up");
+        assert!(st.force_renewal);
+        assert!(st.next_renewal_attempt.is_some());
+        // The renewal that runs once the call ends spends it, if it fails.
+        assert!(st.schedule_renewal_retry().is_err());
+    }
+
     /// A binding that has been live a while and is then dropped is a new event
     /// on the network's side: re-register at once, as before, without
     /// touching the failure budget.
     #[test]
     fn a_settled_binding_dropped_re_registers_at_once() {
         let mut st = LoopState::new();
-        st.on_network_deregistration(st.last_registered + REGISTRATION_SETTLE)
+        st.on_network_deregistration(st.last_registered + REGISTRATION_SETTLE, false)
             .expect("never an exit");
         assert!(st.force_renewal);
         assert_eq!(st.next_renewal_attempt, None);
