@@ -10,6 +10,17 @@ across releases.
 
 ### Added
 
+- **Caller keypad digits relayed to the phone.** RFC 4733 digits received
+  on the carrier leg of a VoWiFi/VoLTE call are re-sent on the paired phone
+  or PBX leg (the conference bridge between them carries PCM only).
+  Unpaired calls (the GSM bridge) are unaffected
+  ([#113](https://github.com/selvakn/gsm-sip-bridge/issues/113)).
+- **`gsm_sip_bridge_vowifi_child_sa_up` gauge.** Per-line ePDG CHILD_SA
+  state, reported by the supervisor and zeroed when stale (3×
+  `agent_report_interval_seconds`). `[alerts.tunnel_failure]` fires on it as
+  well as on the IMS agent's tunnel signal, once per outage
+  ([#107](https://github.com/selvakn/gsm-sip-bridge/issues/107)).
+
 - **AMR and Opus toward the phone.** The VoWiFi/VoLTE phone or PBX leg can
   now use AMR-WB, AMR-NB or Opus (issue #109). With no configuration change,
   a phone or PBX that prefers one of them can now negotiate it; everything
@@ -19,6 +30,25 @@ across releases.
   circuit-switched path is unchanged.
 
 ### Fixed
+
+- **Network-initiated deregistration missed when the binding is listed
+  under several AORs.** A reg-event NOTIFY listing the bridge's contact under
+  both a SIP and a `tel:` AOR with no IMEI echo was treated as unattributable
+  and ignored. Own entries are now matched by IMEI or by the advertised
+  Contact address, and every matching entry counts; a sole contact naming a
+  different address (a partial NOTIFY about another device) is no longer
+  taken as ours. A binding dropped within `REGISTRATION_SETTLE` (60s) of
+  registering counts as a failed renewal, so persistent rejection rides the
+  backoff and the supervisor-exit budget, deferred until any call ends. A
+  detected deregistration also clears the registered metric. Reported by
+  @mironovlab ([#117](https://github.com/selvakn/gsm-sip-bridge/issues/117)).
+- **Lost ePDG CHILD_SA went undetected for minutes.** The CHILD_SA check
+  matched the IKE_SA header, hiding a dropped CHILD_SA. It now matches the
+  CHILD_SA line and its state; a first miss re-initiates, a second
+  consecutive miss rebuilds the IKE_SA and restarts the agent
+  (`DegradeReason::ChildSaStuck`). Steady-state `swanctl --terminate` is
+  forced under a 10s timeout and `--list-sas` is bounded at 10s
+  ([#107](https://github.com/selvakn/gsm-sip-bridge/issues/107)).
 
 - **A rejected inbound call no longer rings the phone again.** When the
   phone or PBX rejected an incoming VoWiFi/VoLTE call, the bridge told the
