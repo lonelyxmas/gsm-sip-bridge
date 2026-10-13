@@ -180,7 +180,7 @@ All paths are relative to the repo root. `supervise/` means `gsm-sip-bridge/src/
 
 ### Tests for User Story 4
 
-- [ ] T020 [P] [US4] Write failing tests in `gsm-sip-bridge/src/supervise/orchestrate.rs` for a new `fn clear_line_gm_state(runner: &dyn CommandRunner, idx: u32, netns: &str) -> (usize, usize)`, using `MockCommandRunner`:
+- [x] T020 [P] [US4] Write failing tests in `gsm-sip-bridge/src/supervise/orchestrate.rs` for a new `fn clear_line_gm_state(runner: &dyn CommandRunner, idx: u32, netns: &str) -> (usize, usize)`, using `MockCommandRunner`:
   - (a) State and policy dumps with 4 and 8 `src ` entries → `run_in_netns(netns, ["ip","xfrm","state","flush"])` and `["ip","xfrm","policy","flush"]` are both issued, and the function returns `(4, 8)`.
   - (b) Both dumps empty → no flush.
   - (c) A dump query fails → still flush (state unknown, and no agent is running), returning `(0, 0)`.
@@ -188,8 +188,8 @@ All paths are relative to the repo root. `supervise/` means `gsm-sip-bridge/src/
 
 ### Implementation for User Story 4
 
-- [ ] T021 [US4] Implement `clear_line_gm_state` in `gsm-sip-bridge/src/supervise/orchestrate.rs` per research R6. Print `[supervise] line {idx}: cleared {s} stale Gm SAs / {p} policies before agent start` only when nonzero.
-- [ ] T022 [US4] Call `clear_line_gm_state` in the agent loop, immediately before `runner.spawn(... "vowifi-ims-agent" ...)` (~line 1850) and after the rebuild gate from T016. Call it **only for strongswan-engine lines**: find how the loop knows its engine (the line config's engine field, or the caller that sets up this loop) and gate on it. Add a comment that the SWu dialer was not verified to be XFRM-free in the netns (R6).
+- [x] T021 [US4] Implement `clear_line_gm_state` in `gsm-sip-bridge/src/supervise/orchestrate.rs` per research R6. Print `[supervise] line {idx}: cleared {s} stale Gm SAs / {p} policies before agent start` only when nonzero.
+- [x] T022 [US4] Call `clear_line_gm_state` in the agent loop, immediately before `runner.spawn(... "vowifi-ims-agent" ...)` (~line 1850) and after the rebuild gate from T016. Call it **only for strongswan-engine lines**: find how the loop knows its engine (the line config's engine field, or the caller that sets up this loop) and gate on it. Add a comment that the SWu dialer was not verified to be XFRM-free in the netns (R6).
   - Add a test that the SWu path issues no flush. If the loop is not unit-testable, assert at the call-site helper level by passing the engine kind into a small `fn should_clear_gm_state(engine) -> bool`.
   - Run `make format && make lint && make test` and commit: `fix(supervise): clear leaked Gm IPsec state before each agent start`
 

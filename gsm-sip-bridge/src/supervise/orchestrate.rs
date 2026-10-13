@@ -1858,6 +1858,53 @@ fn wait_for_rebuild_gate(
     }
 }
 
+/// Whether to clear a line namespace's XFRM state before each agent spawn.
+///
+/// Strongswan engine only: there the ePDG CHILD_SA lives in the host namespace
+/// (keyed by `if_id`), so the line namespace holds nothing but the IMS agent's
+/// Gm IPsec state. The SWu dialer has not been verified to keep its own tunnel
+/// out of the namespace's XFRM tables, so it is left alone (research R6).
+fn should_clear_gm_state(tunnel_engine: &str) -> bool {
+    tunnel_engine == "strongswan"
+}
+
+/// Flushes the Gm IPsec state a previous `vowifi-ims-agent` left in `netns`,
+/// returning how many states and policies were there (specs/087, FR-012).
+///
+/// The agent has no SIGTERM handler, so a `pkill`ed one never deletes its SAs
+/// and each restart stacks another registration's worth. This runs only when no
+/// agent is alive for the line, so nothing live is cleared. Everything runs
+/// *inside* the namespace; the host's tunnel SAs are never touched. A failed
+/// dump still flushes, since the state is unknown and flushing is harmless.
+fn clear_line_gm_state(runner: &dyn CommandRunner, idx: u32, netns: &str) -> (usize, usize) {
+    let count = |what: &str| {
+        runner
+            .run_in_netns(netns, &["ip", "xfrm", what])
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter(|l| l.starts_with("src "))
+                    .count()
+            })
+    };
+    let states = count("state");
+    let policies = count("policy");
+    if states == Some(0) && policies == Some(0) {
+        return (0, 0);
+    }
+    let _ = runner.run_in_netns(netns, &["ip", "xfrm", "state", "flush"]);
+    let _ = runner.run_in_netns(netns, &["ip", "xfrm", "policy", "flush"]);
+    let (s, p) = (states.unwrap_or(0), policies.unwrap_or(0));
+    if s + p > 0 {
+        println!(
+            "[supervise] line {idx}: cleared {s} stale Gm SAs / {p} policies before agent start"
+        );
+    }
+    (s, p)
+}
+
 /// Veth pair + this line's vowifi-ims-agent (with per-incident USIM
 /// auto-recovery) + the idle-tunnel keepalive — 1:1 port of
 /// `start_line_tail` and its keepalive sibling. Both supervision loops run
@@ -1908,6 +1955,7 @@ fn start_line_tail(
         let started = Arc::clone(started);
         let shutting_down = Arc::clone(shutting_down);
         let rebuild_gate = Arc::clone(&rebuild_gate);
+        let clear_gm_state = should_clear_gm_state(&ctx.config.vowifi.tunnel_engine);
         let alert_ctx = alert_ctx.cloned();
         let line_id = line.card_id.clone();
         // specs/034-alert-identity: resolve this line's number before the
@@ -1945,6 +1993,9 @@ fn start_line_tail(
                 let guard = shutting_down.read().unwrap();
                 if *guard {
                     return;
+                }
+                if clear_gm_state {
+                    clear_line_gm_state(runner.as_ref(), idx, &netns);
                 }
                 let _ = runner.write_file(&agent_log, "");
                 let handle = runner.spawn(
@@ -3025,6 +3076,98 @@ mod tests {
             let runner = MockCommandRunner::new();
             wait_for_rebuild_gate(&AtomicBool::new(true), &runner, WAIT, &|| true);
             assert!(runner.sleeps.lock().unwrap().is_empty());
+        }
+    }
+
+    mod gm_state_tests {
+        use super::*;
+        use crate::supervise::runner::MockCommandRunner;
+        use std::os::unix::process::ExitStatusExt;
+
+        // MOCK JUSTIFICATION (constitution Principle I): root `ip netns exec`
+        // and a populated XFRM table cannot exist in CI. The counting and
+        // flush logic under test is the real production code.
+
+        fn dump(n: usize) -> String {
+            (0..n)
+                .map(|i| format!("src 198.51.100.10 dst 192.0.2.10\n\tproto esp spi 0x{i:08x}\n"))
+                .collect()
+        }
+
+        fn seed(runner: &MockCommandRunner, what: &str, status: i32, out: &str) {
+            runner.set_run_output(
+                &format!("netns:ims0:ip xfrm {what}"),
+                std::process::Output {
+                    status: std::process::ExitStatus::from_raw(status),
+                    stdout: out.as_bytes().to_vec(),
+                    stderr: Vec::new(),
+                },
+            );
+        }
+
+        fn flushes(runner: &MockCommandRunner) -> Vec<Vec<String>> {
+            runner
+                .run_in_netns_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, a)| a.last().is_some_and(|l| l == "flush"))
+                .map(|(_, a)| a.clone())
+                .collect()
+        }
+
+        #[test]
+        fn stale_state_and_policies_are_counted_and_flushed_in_the_namespace() {
+            let runner = MockCommandRunner::new();
+            seed(&runner, "state", 0, &dump(4));
+            seed(&runner, "policy", 0, &dump(8));
+            assert_eq!(clear_line_gm_state(&runner, 0, "ims0"), (4, 8));
+            let f = flushes(&runner);
+            assert!(f.contains(&vec![
+                "ip".into(),
+                "xfrm".into(),
+                "state".into(),
+                "flush".into()
+            ]));
+            assert!(f.contains(&vec![
+                "ip".into(),
+                "xfrm".into(),
+                "policy".into(),
+                "flush".into()
+            ]));
+            assert!(
+                !runner
+                    .run_calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c.contains(&"xfrm".to_string())),
+                "the host namespace's tunnel SAs must never be touched"
+            );
+        }
+
+        #[test]
+        fn an_empty_namespace_is_left_alone() {
+            let runner = MockCommandRunner::new();
+            seed(&runner, "state", 0, "");
+            seed(&runner, "policy", 0, "");
+            assert_eq!(clear_line_gm_state(&runner, 0, "ims0"), (0, 0));
+            assert!(flushes(&runner).is_empty());
+        }
+
+        #[test]
+        fn a_failed_dump_still_flushes() {
+            let runner = MockCommandRunner::new();
+            seed(&runner, "state", 1, "");
+            seed(&runner, "policy", 1, "");
+            assert_eq!(clear_line_gm_state(&runner, 0, "ims0"), (0, 0));
+            assert_eq!(flushes(&runner).len(), 2);
+        }
+
+        #[test]
+        fn only_the_strongswan_engine_clears_gm_state() {
+            assert!(should_clear_gm_state("strongswan"));
+            assert!(!should_clear_gm_state("swu"));
         }
     }
 }
