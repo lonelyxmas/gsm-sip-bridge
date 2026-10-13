@@ -164,12 +164,12 @@ description: "Task list for specs/086-epdg-child-sa-recovery"
 ## Phase 6: Polish, live gate and release
 
 - [X] T028 Run the full `make format && make lint && make test`, and grep for leftovers: `rg -n "unreachable_streak|grep pattern|1:1 port of .grep -q '\^ims:'" gsm-sip-bridge/src` must return nothing stale. Then confirm FR-018 (scope guard): `git diff --stat main -- docker/` must be empty, because no swanctl template, strongSwan build or charon config change is allowed in this feature
-- [ ] T029 Run the SC-008 live gate per `specs/086-epdg-child-sa-recovery/quickstart.md` §2:
+- [X] T029 Run the SC-008 live gate per `specs/086-epdg-child-sa-recovery/quickstart.md` §2:
   - build `gsm-sip-bridge:child-sa-recovery-local`, point `test/docker-compose.yaml` at it, and recreate the container;
   - §2a: gauge 0 during establishment, then 1;
   - §2b: at least one natural CHILD_SA rekey with zero `ChildSa*` recoveries, with the gauge sampled every 30s across it;
   - §2c: `swanctl --terminate --child ims0` is detected within 30s, re-initiated, the gauge goes 0 → 1, the line re-registers, and one inbound test call rings.
-- [ ] T030 Append a "Live gate results" section to `specs/086-epdg-child-sa-recovery/quickstart.md` with timestamps, rekey count, the recovery log lines and gauge samples. Synthesise every identity from `swanctl`/logs and include no IMSI/MSISDN/real IPs. Restore `test/docker-compose.yaml`'s image tag if it shouldn't be committed. Commit: `docs(specs): record the 086 live gate results`
+- [X] T030 Append a "Live gate results" section to `specs/086-epdg-child-sa-recovery/quickstart.md` with timestamps, rekey count, the recovery log lines and gauge samples. Synthesise every identity from `swanctl`/logs and include no IMSI/MSISDN/real IPs. Restore `test/docker-compose.yaml`'s image tag if it shouldn't be committed. Commit: `docs(specs): record the 086 live gate results`
 - [ ] T031 Open the PR against `main` (title e.g. `Detect and recover a lost ePDG CHILD_SA (#107)`). The body summarises A/B/C/E, links spec/plan/quickstart results, and states that the carrier-specific rekey selector fix (strongSwan patch / inner-address-family option) is out of scope. Then draft, **but do not post without the user's approval**, a reply on issue #107 explaining what landed and what remains tracked separately
 
 ---

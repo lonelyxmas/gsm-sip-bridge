@@ -70,3 +70,35 @@ Pass:
 Append a "Live gate results" section to `specs/086-epdg-child-sa-recovery/quickstart.md`.
 Include timestamps, rekey count, recovery log lines and gauge samples. Use **no** IMSI/MSISDN, and
 synthesise any identity that appears in `swanctl` output.
+
+## 3. Live gate results (SC-008), 2026-10-13
+
+Build: `gsm-sip-bridge:child-sa-recovery-local` from branch `086-epdg-child-sa-recovery`
+(head `fix(alerts): hold the phase until a late all-clear has been sent`), run in `test/` on the
+local Vodafone line, strongSwan engine, one line. Container recreated at 01:57:45Z.
+
+| Check | Result |
+|---|---|
+| 2a gauge during establishment | **Pass.** `vowifi_child_sa_up` read 0 at 01:57:50Z (tunnel still establishing), 1 at 01:58:05Z once `tunnel UP`. `agent_up{agent="supervisor"}` appeared and read 1. |
+| 2b natural rekey | **Pass.** The CHILD_SA rekeyed on its own at 02:53:07Z (`ims0{2}` replaced by `ims0{3}`; `closing CHILD_SA` count went 1 → 2). The gauge was sampled every 30s from 01:59:05Z to 03:13:38Z (150 samples): every one read 1, including across 02:53:07Z. No `recovered from ChildSa*` line after the induced one in 2c. |
+| 2c induced CHILD_SA loss | **Pass.** See the timeline below. |
+| 2c inbound call | **Pass.** An inbound carrier call rang the registered test phone, was answered and bridged, ran 20s and ended with a clean BYE; about 20s of audio was recorded each way. |
+
+### 2c timeline (UTC)
+
+```
+01:58:13  swanctl --terminate --child ims0          # IKE_SA left up
+01:58:22  [supervise] line 0: ims0 CHILD_SA missing; re-initiating
+01:58:22  [supervise] line 0: recovered from ChildSaMissing        # 9s after the loss
+01:58:22  gauge 1 -> 0
+01:58:27  CHILD_SA ims0{2} established (new virtual IP, new P-CSCF pool)
+01:58:52  [supervise] line 0: P-CSCF changed (...); refreshing     # next 30s tick
+01:58:52  gauge 0 -> 1
+          vowifi-ims-agent restarted, "registered after restart loop"
+```
+
+Gauge samples around the event, every 3s: `1` (01:58:13 to 01:58:19), `0` from 01:58:22 to 01:58:49, `1` from 01:58:52.
+
+Notes:
+- `ChildSaStuck` did not occur, as expected: Vodafone answered the re-initiate. The escalation is covered by unit tests.
+- The re-initiate negotiated a different P-CSCF pool than the one read at recovery time, so the change was only noticed on the following tick, 30s later. Recovery still completed well inside the one-minute target.
