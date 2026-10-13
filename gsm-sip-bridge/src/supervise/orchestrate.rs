@@ -1695,6 +1695,11 @@ fn start_vowifi_line_strongswan(
         // Taken before the tick: a recovery inside it renegotiates, and only a
         // negotiation logged after this point can carry the new P-CSCF.
         let mark = engine.log_mark(runner.as_ref());
+        // Closed before the tick, not after it: a teardown inside the tick can
+        // take many seconds, and an agent that exits meanwhile must not be
+        // respawned against the old P-CSCF (specs/087 R5). Released below
+        // unless this tick turns out to renegotiate.
+        rebuild_gate.store(true, Ordering::SeqCst);
         let outcome = line_supervisor::tick_steady_state(
             &engine,
             runner.as_ref(),
@@ -1702,6 +1707,14 @@ fn start_vowifi_line_strongswan(
             &mut tracking,
             line_supervisor::STEADY_STATE_POLL_INTERVAL,
         );
+        let renegotiated = matches!(
+            outcome,
+            line_supervisor::SteadyOutcome::Recovered { reason, .. }
+                if line_supervisor::recovery_renegotiates(reason)
+        );
+        if !renegotiated {
+            rebuild_gate.store(false, Ordering::SeqCst);
+        }
         if rebuilds.tick(std::time::Instant::now()) {
             println!("[supervise] line {idx}: tunnel no longer flapping");
         }
@@ -1773,9 +1786,10 @@ fn start_vowifi_line_strongswan(
                 // gate keeps the agent loop from respawning in between.
                 //
                 // A bare CHILD_SA re-initiate neither restarts the agent nor
-                // can change the P-CSCF, so it syncs nothing.
-                if line_supervisor::recovery_restarts_agent(reason) {
-                    rebuild_gate.store(true, Ordering::SeqCst);
+                // can change the P-CSCF, so it syncs nothing; a route repair
+                // restarts the agent but starts no negotiation, so there is
+                // nothing to wait for either.
+                if renegotiated {
                     let stop = || *shutting_down.read().unwrap();
                     let fresh = await_fresh_pcscf(
                         runner.as_ref(),
@@ -1815,6 +1829,9 @@ fn start_vowifi_line_strongswan(
                         last_loss_cause,
                         &report_tunnel,
                     );
+                } else if line_supervisor::recovery_restarts_agent(reason) {
+                    let _ =
+                        runner.run(&["pkill", "-f", &format!("vowifi-ims-agent --line {idx}$")]);
                 }
                 // A recovery that left the agent alone still changes CHILD_SA
                 // usability (`tracking` was updated by the tick).
@@ -1967,9 +1984,27 @@ fn clear_line_gm_state(runner: &dyn CommandRunner, idx: u32, netns: &str) -> (us
     if states == Some(0) && policies == Some(0) {
         return (0, 0);
     }
-    let _ = runner.run_in_netns(netns, &["ip", "xfrm", "state", "flush"]);
-    let _ = runner.run_in_netns(netns, &["ip", "xfrm", "policy", "flush"]);
-    let (s, p) = (states.unwrap_or(0), policies.unwrap_or(0));
+    let flush = |what: &str| {
+        runner
+            .run_in_netns(netns, &["ip", "xfrm", what, "flush"])
+            .is_ok_and(|o| o.status.success())
+    };
+    let states_ok = flush("state");
+    let policies_ok = flush("policy");
+    for (what, ok) in [("state", states_ok), ("policy", policies_ok)] {
+        if !ok {
+            eprintln!(
+                "[supervise] line {idx}: `ip xfrm {what} flush` failed in {netns}; stale Gm state may remain"
+            );
+        }
+    }
+    // Only what a successful flush removed counts as cleared.
+    let s = if states_ok { states.unwrap_or(0) } else { 0 };
+    let p = if policies_ok {
+        policies.unwrap_or(0)
+    } else {
+        0
+    };
     if s + p > 0 {
         println!(
             "[supervise] line {idx}: cleared {s} stale Gm SAs / {p} policies before agent start"
@@ -3235,6 +3270,15 @@ mod tests {
             seed(&runner, "policy", 1, "");
             assert_eq!(clear_line_gm_state(&runner, 0, "ims0"), (0, 0));
             assert_eq!(flushes(&runner).len(), 2);
+        }
+
+        #[test]
+        fn a_failed_flush_is_not_reported_as_cleared() {
+            let runner = MockCommandRunner::new();
+            seed(&runner, "state", 0, &dump(4));
+            seed(&runner, "policy", 0, &dump(8));
+            seed(&runner, "state flush", 1, "");
+            assert_eq!(clear_line_gm_state(&runner, 0, "ims0"), (0, 8));
         }
 
         #[test]

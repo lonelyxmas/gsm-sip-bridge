@@ -10,6 +10,7 @@ use super::runner::{ChildHandle, ChildSpec, CommandRunner};
 use crate::control::protocol::IkeSaLossCause;
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -275,6 +276,18 @@ pub struct SharedCharon {
     /// across the check-and-spawn is what makes "restart it only if nobody
     /// else already has" atomic.
     handle: Mutex<Option<Arc<ChildHandle>>>,
+    /// Bumped every time the log is truncated for a fresh charon, so a
+    /// [`LogMark`] taken before that can tell its byte offset no longer refers
+    /// to the same file (a length comparison alone cannot: the new log may
+    /// have grown past the old mark by the next read).
+    log_generation: AtomicU64,
+}
+
+/// A position in the shared charon log: its truncation generation and length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogMark {
+    generation: u64,
+    len: usize,
 }
 
 impl SharedCharon {
@@ -284,6 +297,7 @@ impl SharedCharon {
             swanctl_top_conf,
             charon_log,
             handle: Mutex::new(None),
+            log_generation: AtomicU64::new(0),
         }
     }
 
@@ -336,6 +350,7 @@ impl SharedCharon {
             runner.reap(&old);
         }
         let _ = runner.write_file(&self.charon_log, "");
+        self.log_generation.fetch_add(1, Ordering::SeqCst);
         let _ = runner.run(&["rm", "-f", "/var/run/charon.pid"]);
 
         let env = self.env_prefix();
@@ -462,19 +477,29 @@ impl StrongswanEngine {
     /// The charon log's current length, taken before a recovery is issued so
     /// [`Self::fresh_pcscf_since`] can tell the new negotiation from the old.
     /// `0` if the log cannot be read, which makes any closed batch count.
-    pub fn log_mark(&self, runner: &dyn CommandRunner) -> usize {
-        runner
-            .read_file(&self.shared.charon_log)
-            .map(|c| c.len())
-            .unwrap_or(0)
+    pub fn log_mark(&self, runner: &dyn CommandRunner) -> LogMark {
+        LogMark {
+            generation: self.shared.log_generation.load(Ordering::SeqCst),
+            len: runner
+                .read_file(&self.shared.charon_log)
+                .map(|c| c.len())
+                .unwrap_or(0),
+        }
     }
 
     /// The P-CSCF of a negotiation logged after `mark`, if one has completed.
-    pub fn fresh_pcscf_since(&self, runner: &dyn CommandRunner, mark: usize) -> Option<String> {
+    /// A log truncated since the mark (charon restarted) is read from its
+    /// start: everything in it is newer than the mark.
+    pub fn fresh_pcscf_since(&self, runner: &dyn CommandRunner, mark: LogMark) -> Option<String> {
+        let offset = if self.shared.log_generation.load(Ordering::SeqCst) == mark.generation {
+            mark.len
+        } else {
+            0
+        };
         runner
             .read_file(&self.shared.charon_log)
             .ok()
-            .and_then(|c| extract_pcscf_after(&c, &self.conn_name, mark))
+            .and_then(|c| extract_pcscf_after(&c, &self.conn_name, offset))
     }
 
     /// Backgrounded `swanctl` invocation — matches the bash calls that end
@@ -1265,6 +1290,24 @@ mod tests {
             assert_eq!(
                 TunnelEngine::ike_sa_loss_cause(&engine, &runner),
                 IkeSaLossCause::CarrierDelete
+            );
+        }
+
+        #[test]
+        fn a_charon_restart_invalidates_the_log_mark_even_if_the_new_log_outgrows_it() {
+            let runner = MockCommandRunner::new();
+            let engine = strongswan_engine();
+            let old = "[CFG] <ims0|1> received P-CSCF server IP 192.0.2.10\n[IKE] <ims0|1> CHILD_SA ims0{3} established x\n";
+            runner.set_file(&engine.shared.charon_log, old);
+            let mark = engine.log_mark(&runner);
+            // charon restarts: the log is truncated, then grows past the mark.
+            engine.shared.log_generation.fetch_add(1, Ordering::SeqCst);
+            let new = "[CFG] <ims0|2> received P-CSCF server IP 192.0.2.11\n[IKE] <ims0|2> CHILD_SA ims0{4} established y\n[IKE] <ims0|2> padding padding padding padding\n";
+            assert!(new.len() > old.len());
+            runner.set_file(&engine.shared.charon_log, new);
+            assert_eq!(
+                engine.fresh_pcscf_since(&runner, mark),
+                Some("192.0.2.11".to_string())
             );
         }
 

@@ -410,12 +410,21 @@ fn fold_flapping_into_tunnel_streak(
     opened_by_flapping: &mut bool,
 ) {
     if flapping {
-        if since.is_none() {
-            *since = prev_since.or_else(|| {
+        // The streak flapping keeps open: whatever `apply_state` left, else the
+        // one that stood before this report (a CHILD_SA reported up must not
+        // end an episode that flapping is still holding open).
+        let now = Instant::now();
+        let target = threshold.and_then(|t| now.checked_sub(t)).unwrap_or(now);
+        match since.or(prev_since) {
+            // Already past the threshold: leave it, whoever opened it.
+            Some(s) if s <= target => *since = Some(s),
+            // Younger than the threshold (an outage that began with the latest
+            // rebuild, or none yet): flapping alone is enough to alert, so
+            // bring it back to the threshold rather than wait it out again.
+            _ => {
+                *since = Some(target);
                 *opened_by_flapping = true;
-                let now = Instant::now();
-                Some(threshold.and_then(|t| now.checked_sub(t)).unwrap_or(now))
-            });
+            }
         }
     } else if state.tunnel_flapping == Some(false)
         && state.child_sa_up.is_none()
@@ -2113,5 +2122,20 @@ mod tests {
         );
         let no_cause = tunnel_failure_description("VoWiFi", 300, true, None);
         assert!(no_cause.contains("rebuilt repeatedly") && !no_cause.contains("last IKE_SA loss"));
+    }
+
+    #[test]
+    fn flapping_backdates_a_fresh_outage_timer_so_the_alert_is_not_delayed() {
+        let m = "test-flapping-backdates-outage";
+        let cfg = tunnel_cfg();
+        // The third rebuild reports the CHILD_SA down: `apply_state` opens a
+        // brand-new outage timer, which flapping must not leave waiting.
+        let t = sup_state_report(&cfg, m, 1, flap_state(false, true));
+        assert_eq!(
+            tunnel_events(&t),
+            vec![(AgentKind::Supervisor, CriticalEventKind::Failure)]
+        );
+        // The CHILD_SA coming back while still flapping keeps the same episode.
+        assert!(tunnel_events(&sup_state_report(&cfg, m, 2, flap_state(true, true))).is_empty());
     }
 }

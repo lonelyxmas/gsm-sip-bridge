@@ -484,10 +484,13 @@ pub fn tick_steady_state(
             // No IKE_SA to terminate: re-initiate builds a fresh one. The
             // strike count is reset above, so a later CHILD_SA loss starts
             // from its first strike.
+            // Read before re-initiating: the parser resets on the next
+            // establishment, so a slow tick would otherwise lose the cause.
+            let cause = engine.ike_sa_loss_cause(runner);
             engine.reinitiate(runner);
             return SteadyOutcome::Recovered {
                 reason: DegradeReason::IkeSaLost,
-                ike_sa_loss_cause: Some(engine.ike_sa_loss_cause(runner)),
+                ike_sa_loss_cause: Some(cause),
             };
         }
         SteadyStateHealth::ChildSaMissing => {
@@ -598,6 +601,17 @@ pub fn recovery_restarts_agent(reason: DegradeReason) -> bool {
     )
 }
 
+/// Whether a recovery starts a new IKE negotiation, i.e. whether a fresh P-CSCF
+/// batch will follow and the recovery counts as an IKE_SA rebuild.
+///
+/// Narrower than [`recovery_restarts_agent`]: `DefaultRouteMissing` restarts
+/// the agent but only repairs a route, so waiting for a new negotiation would
+/// burn the whole wait for nothing, and three route repairs are not a flapping
+/// tunnel.
+pub fn recovery_renegotiates(reason: DegradeReason) -> bool {
+    recovery_restarts_agent(reason) && reason != DegradeReason::DefaultRouteMissing
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -706,6 +720,10 @@ mod tests {
         fn reinitiate(&self, _runner: &dyn CommandRunner) {
             *self.reinitiate_calls.borrow_mut() += 1;
             self.call_order.borrow_mut().push("reinitiate");
+        }
+        fn ike_sa_loss_cause(&self, _runner: &dyn CommandRunner) -> IkeSaLossCause {
+            self.call_order.borrow_mut().push("loss_cause");
+            IkeSaLossCause::Unknown
         }
         fn repair_default_route(&self, _runner: &dyn CommandRunner) -> bool {
             if !*self.route_missing.borrow() {
@@ -1359,6 +1377,38 @@ mod tests {
                 }
             ),
             "the second miss after an IKE_SA loss is a first strike: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_route_repair_restarts_the_agent_but_does_not_renegotiate() {
+        assert!(recovery_restarts_agent(DegradeReason::DefaultRouteMissing));
+        assert!(!recovery_renegotiates(DegradeReason::DefaultRouteMissing));
+        assert!(!recovery_renegotiates(DegradeReason::ChildSaMissing));
+        for r in [
+            DegradeReason::ProcessDied,
+            DegradeReason::ViciBroken,
+            DegradeReason::TunVanished,
+            DegradeReason::ChildSaStuck,
+            DegradeReason::IkeSaLost,
+            DegradeReason::PcscfUnreachable,
+        ] {
+            assert!(recovery_renegotiates(r), "{r:?}");
+        }
+    }
+
+    #[test]
+    fn the_loss_cause_is_read_before_the_replacement_negotiation_starts() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            health: RefCell::new(SteadyStateHealth::IkeSaMissing),
+            ..Default::default()
+        };
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut SteadyTracking::default());
+        assert_eq!(
+            *engine.call_order.borrow(),
+            vec!["loss_cause", "reinitiate"],
+            "a new establishment would reset the parser"
         );
     }
 
