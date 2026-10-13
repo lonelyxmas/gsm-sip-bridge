@@ -1319,6 +1319,31 @@ mod codec_offer_tests {
 mod tests {
     use super::*;
 
+    /// specs/088 (#103): the SDP part of T2's multipart INVITE parses as the
+    /// offer it is — including the `/1` channel count on every AMR rtpmap.
+    #[test]
+    fn the_t2_sdp_part_parses_to_its_offer() {
+        use crate::ims::body::fixtures::T2_SDP;
+        let offer = parse_offer(T2_SDP).unwrap();
+        assert_eq!(offer.remote_rtp, "203.0.113.30:21892".parse().unwrap());
+        assert_eq!(offer.proto, "RTP/AVP");
+        let codecs: Vec<_> = offer
+            .offered
+            .iter()
+            .map(|c| (c.payload_type, c.codec))
+            .collect();
+        assert_eq!(
+            codecs,
+            vec![
+                (104, NegotiatedCodec::AmrWb),
+                (110, NegotiatedCodec::AmrWb),
+                (102, NegotiatedCodec::AmrNb),
+                (108, NegotiatedCodec::AmrNb),
+            ]
+        );
+        assert_eq!(offer.dtmf, vec![(96, 16000), (97, 8000)]);
+    }
+
     /// An inbound offer listing exactly `codecs`, e.g. `[(0, "PCMU/8000")]`.
     fn offer_of(codecs: &[(u8, &str)]) -> SdpOffer {
         let pts = codecs

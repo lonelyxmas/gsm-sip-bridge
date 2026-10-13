@@ -24,7 +24,7 @@ real parsed `SipRequest`s; no mocks. Fixtures are synthetic only
 
 ## Phase 1: Setup
 
-- [ ] T001 Create empty module `gsm-sip-bridge/src/ims/body.rs` (module doc citing RFC 5621 §4.2, RFC 2046 §5.1, RFC 3261 §20.11) and register `mod body;` in `gsm-sip-bridge/src/ims/mod.rs`; confirm `make build` passes
+- [X] T001 Create empty module `gsm-sip-bridge/src/ims/body.rs` (module doc citing RFC 5621 §4.2, RFC 2046 §5.1, RFC 3261 §20.11) and register `mod body;` in `gsm-sip-bridge/src/ims/mod.rs`; confirm `make build` passes
 
 ---
 
@@ -34,17 +34,17 @@ real parsed `SipRequest`s; no mocks. Fixtures are synthetic only
 
 ### Tests first
 
-- [ ] T002 Write failing `MediaType::parse` tests in `gsm-sip-bridge/src/ims/body.rs`: case-insensitive type/subtype/param names, quoted `boundary="a b;c"` with `\"` escape, whitespace around `;`/`=`, missing subtype → `None`
-- [ ] T003 Write failing `Disposition` tests in `gsm-sip-bridge/src/ims/body.rs`: defaults (`session` for `application/sdp`, `render` otherwise, `handling=required`), explicit `render;handling=optional`, unknown handling value → `Required`
-- [ ] T004 Write failing splitter tests in `gsm-sip-bridge/src/ims/body.rs`: two parts with CRLF; bare-LF body; preamble and epilogue ignored; delimiter CRLF stripped from the preceding part; trailing whitespace on a delimiter line; per-part `Content-Length` with a wrong value ignored; folded part header joined; missing close delimiter → `Malformed`; boundary empty or > 70 chars → `Malformed`; 17 parts → `Malformed`; depth 5 → `Malformed`
-- [ ] T005 Write failing `extract_sdp` selection tests in `gsm-sip-bridge/src/ims/body.rs`: empty/whitespace body → `Empty`; no Content-Type + SDP text → `Sdp`; `application/sdp;charset=x` → `Sdp`; T2-shaped `multipart/mixed` fixture (PIDF optional first, SDP second, per quickstart.md) → `Sdp` byte-equal to the SDP part with `skipped=[application/pidf+xml]`; same parts reversed; nested `multipart/mixed` in `multipart/mixed`; `multipart/x-vendor` treated as mixed; `multipart/alternative` picks the last usable part; unknown `handling=required` part + SDP → `Sdp` (lenient, Clarification Q1); two SDP session parts → `Ambiguous`; only unknown parts → `NoSession`; SDP part with `Content-Disposition: render` → not selected; SDP part with `Content-Transfer-Encoding: base64` → `Unsupported`; `text/plain` top level → `Unsupported`; `Rejection::status()` is 415/400 per contract
+- [X] T002 Write failing `MediaType::parse` tests in `gsm-sip-bridge/src/ims/body.rs`: case-insensitive type/subtype/param names, quoted `boundary="a b;c"` with `\"` escape, whitespace around `;`/`=`, missing subtype → `None`
+- [X] T003 Write failing `Disposition` tests in `gsm-sip-bridge/src/ims/body.rs`: defaults (`session` for `application/sdp`, `render` otherwise, `handling=required`), explicit `render;handling=optional`, unknown handling value → `Required`
+- [X] T004 Write failing splitter tests in `gsm-sip-bridge/src/ims/body.rs`: two parts with CRLF; bare-LF body; preamble and epilogue ignored; delimiter CRLF stripped from the preceding part; trailing whitespace on a delimiter line; per-part `Content-Length` with a wrong value ignored; folded part header joined; missing close delimiter → `Malformed`; boundary empty or > 70 chars → `Malformed`; 17 parts → `Malformed`; depth 5 → `Malformed`
+- [X] T005 Write failing `extract_sdp` selection tests in `gsm-sip-bridge/src/ims/body.rs`: empty/whitespace body → `Empty`; no Content-Type + SDP text → `Sdp`; `application/sdp;charset=x` → `Sdp`; T2-shaped `multipart/mixed` fixture (PIDF optional first, SDP second, per quickstart.md) → `Sdp` byte-equal to the SDP part with `skipped=[application/pidf+xml]`; same parts reversed; nested `multipart/mixed` in `multipart/mixed`; `multipart/x-vendor` treated as mixed; `multipart/alternative` picks the last usable part; unknown `handling=required` part + SDP → `Sdp` (lenient, Clarification Q1); two SDP session parts → `Ambiguous`; only unknown parts → `NoSession`; SDP part with `Content-Disposition: render` → not selected; SDP part with `Content-Transfer-Encoding: base64` → `Unsupported`; `text/plain` top level → `Unsupported`; `Rejection::status()` is 415/400 per contract
 
 ### Implementation
 
-- [ ] T006 Implement `MediaType` and `Disposition` in `gsm-sip-bridge/src/ims/body.rs` until T002–T003 pass
-- [ ] T007 Implement the RFC 2046 §5.1.1 splitter with depth/part limits in `gsm-sip-bridge/src/ims/body.rs` until T004 passes (work on `&[u8]`; never use part `Content-Length`)
-- [ ] T008 Implement `extract_sdp`, `Decoded`, `DecodeInfo`, `Rejection` in `gsm-sip-bridge/src/ims/body.rs` until T005 passes; emit one `tracing` line per multipart or refused body with `outer`, `selected`, `skipped`, `outcome` — warn for skipped required parts, info otherwise; never log part contents
-- [ ] T009 Commit "feat(ims): MIME body decoder for SIP (RFC 5621/2046)" after `make format && make lint && make test`
+- [X] T006 Implement `MediaType` and `Disposition` in `gsm-sip-bridge/src/ims/body.rs` until T002–T003 pass
+- [X] T007 Implement the RFC 2046 §5.1.1 splitter with depth/part limits in `gsm-sip-bridge/src/ims/body.rs` until T004 passes (work on `&[u8]`; never use part `Content-Length`)
+- [X] T008 Implement `extract_sdp`, `Decoded`, `DecodeInfo`, `Rejection` in `gsm-sip-bridge/src/ims/body.rs` until T005 passes; emit one `tracing` line per multipart or refused body with `outer`, `selected`, `skipped`, `outcome` — warn for skipped required parts, info otherwise; never log part contents
+- [X] T009 Commit "feat(ims): MIME body decoder for SIP (RFC 5621/2046)" after `make format && make lint && make test`
 
 **Checkpoint**: decoder complete and tested; no call path uses it yet.
 
@@ -58,17 +58,17 @@ real parsed `SipRequest`s; no mocks. Fixtures are synthetic only
 
 ### Tests first
 
-- [ ] T010 [US1] Write failing `invite_body_decision` tests in `gsm-sip-bridge/src/ims/agent/inbound.rs` using the existing `invite_with_content_type`/`invite_with_body` helpers plus a new `invite_with(content_type, body)` helper: T2-shaped multipart → `Offer` equal to its SDP part; reversed order; quoted boundary; plain SDP → `Offer`; no body → `Offerless`; `Content-Length: 0` with Content-Type → `Offerless`
-- [ ] T011 [US2] Write failing refusal tests in `gsm-sip-bridge/src/ims/agent/inbound.rs`: `text/plain` → response starts `SIP/2.0 415` and contains `Accept: application/sdp, multipart/mixed, multipart/alternative`; multipart with only a PIDF part → 415 same `Accept`; no close delimiter → `SIP/2.0 400 Bad Request`; two SDP parts → 400; every refusal carries the given `to_tag`
-- [ ] T012 [US1] Write a test in `gsm-sip-bridge/src/ims/sdp.rs` that `parse_offer` on the T2 SDP part (from the shared fixture) yields remote `203.0.113.30:21892`, `RTP/AVP`, AMR-WB PTs 104/110, AMR PTs 102/108, DTMF `(96,16000),(97,8000)` — guards channel-count `/1` parsing (spec verification matrix)
+- [X] T010 [US1] Write failing `invite_body_decision` tests in `gsm-sip-bridge/src/ims/agent/inbound.rs` using the existing `invite_with_content_type`/`invite_with_body` helpers plus a new `invite_with(content_type, body)` helper: T2-shaped multipart → `Offer` equal to its SDP part; reversed order; quoted boundary; plain SDP → `Offer`; no body → `Offerless`; `Content-Length: 0` with Content-Type → `Offerless`
+- [X] T011 [US2] Write failing refusal tests in `gsm-sip-bridge/src/ims/agent/inbound.rs`: `text/plain` → response starts `SIP/2.0 415` and contains `Accept: application/sdp, multipart/mixed, multipart/alternative`; multipart with only a PIDF part → 415 same `Accept`; no close delimiter → `SIP/2.0 400 Bad Request`; two SDP parts → 400; every refusal carries the given `to_tag`
+- [X] T012 [US1] Write a test in `gsm-sip-bridge/src/ims/sdp.rs` that `parse_offer` on the T2 SDP part (from the shared fixture) yields remote `203.0.113.30:21892`, `RTP/AVP`, AMR-WB PTs 104/110, AMR PTs 102/108, DTMF `(96,16000),(97,8000)` — guards channel-count `/1` parsing (spec verification matrix)
 
 ### Implementation
 
-- [ ] T013 [US1] Add `pub(crate) const INVITE_BODY_ACCEPT: &str = "application/sdp, multipart/mixed, multipart/alternative";` and `enum InviteBody { Offerless, Offer(String), Refuse { response: String, reason: String } }` plus `fn invite_body_decision(req: &SipRequest, to_tag: &str) -> InviteBody` in `gsm-sip-bridge/src/ims/agent/inbound.rs`, using `body::extract_sdp(req.header("Content-Type"), req.header("Content-Disposition"), &req.body_bytes)`; 415 via `build_415_unsupported_media(req, to_tag, INVITE_BODY_ACCEPT)`, 400 via `build_uas_response(400, "Bad Request", req, Some(to_tag), None, None)` (`gsm-sip-bridge/src/ims/sip_client.rs:365`)
-- [ ] T014 [US1] In `handle_invite` (`gsm-sip-bridge/src/ims/agent/inbound.rs` ≈ lines 208–254) replace the `invite_content_type_supported` gate and the `req.body.trim().is_empty()` branch with a match on `invite_body_decision`: `Offerless` → `handle_offerless_invite` (unchanged args), `Offer(sdp)` → `sdp::parse_offer(&sdp)?`, `Refuse` → log `declining: INVITE body` with reason, send response, `obs.report_call_not_answered(CallStatus::Failed, BridgeFailureReason::BridgeSetupFailed, …)`, `return Ok(None)`; keep the `100 Trying` before it
-- [ ] T015 [US2] Delete `invite_content_type_supported`, its doc comment and the SDP-05 comment block in `gsm-sip-bridge/src/ims/agent/inbound.rs`; replace `an_unrecognised_invite_content_type_is_not_supported` and `supported_invite_content_types_are_accepted` with the T010/T011 tests; update the doc comments of the offerless tests that reference the old predicate
-- [ ] T016 [US2] Use `INVITE_BODY_ACCEPT` for the `Accept` header in `options_response` (`gsm-sip-bridge/src/ims/agent/mod.rs:453`) and update/add its test asserting the new value
-- [ ] T017 [US1] Commit "fix(ims): accept multipart INVITE bodies instead of declining 415 (#103)" after `make format && make lint && make test`
+- [X] T013 [US1] Add `pub(crate) const INVITE_BODY_ACCEPT: &str = "application/sdp, multipart/mixed, multipart/alternative";` and `enum InviteBody { Offerless, Offer(String), Refuse { response: String, reason: String } }` plus `fn invite_body_decision(req: &SipRequest, to_tag: &str) -> InviteBody` in `gsm-sip-bridge/src/ims/agent/inbound.rs`, using `body::extract_sdp(req.header("Content-Type"), req.header("Content-Disposition"), &req.body_bytes)`; 415 via `build_415_unsupported_media(req, to_tag, INVITE_BODY_ACCEPT)`, 400 via `build_uas_response(400, "Bad Request", req, Some(to_tag), None, None)` (`gsm-sip-bridge/src/ims/sip_client.rs:365`)
+- [X] T014 [US1] In `handle_invite` (`gsm-sip-bridge/src/ims/agent/inbound.rs` ≈ lines 208–254) replace the `invite_content_type_supported` gate and the `req.body.trim().is_empty()` branch with a match on `invite_body_decision`: `Offerless` → `handle_offerless_invite` (unchanged args), `Offer(sdp)` → `sdp::parse_offer(&sdp)?`, `Refuse` → log `declining: INVITE body` with reason, send response, `obs.report_call_not_answered(CallStatus::Failed, BridgeFailureReason::BridgeSetupFailed, …)`, `return Ok(None)`; keep the `100 Trying` before it
+- [X] T015 [US2] Delete `invite_content_type_supported`, its doc comment and the SDP-05 comment block in `gsm-sip-bridge/src/ims/agent/inbound.rs`; replace `an_unrecognised_invite_content_type_is_not_supported` and `supported_invite_content_types_are_accepted` with the T010/T011 tests; update the doc comments of the offerless tests that reference the old predicate
+- [X] T016 [US2] Use `INVITE_BODY_ACCEPT` for the `Accept` header in `options_response` (`gsm-sip-bridge/src/ims/agent/mod.rs:453`) and update/add its test asserting the new value
+- [X] T017 [US1] Commit "fix(ims): accept multipart INVITE bodies instead of declining 415 (#103)" after `make format && make lint && make test`
 
 **Checkpoint**: T2-shaped INVITEs reach the PBX in tests; MVP shippable.
 

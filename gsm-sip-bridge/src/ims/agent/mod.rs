@@ -441,7 +441,8 @@ fn unsupported_required_extensions(req: &SipRequest) -> Vec<String> {
 /// Answers the carrier's `OPTIONS` — the keepalive a P-CSCF (and our own
 /// `ping`, in the other direction) uses to decide whether a UE is still there.
 /// Silence is indistinguishable from a UE that has gone away, and RFC 3261
-/// §11.2 wants the same `Allow` a 200 to an INVITE carries.
+/// §11.2 wants the same `Allow` a 200 to an INVITE carries, and an `Accept`
+/// naming the bodies an INVITE may carry (specs/088: multipart too).
 fn options_response(req: &SipRequest, to_tag: &str) -> String {
     build_uas_response_with_headers(
         200,
@@ -450,7 +451,7 @@ fn options_response(req: &SipRequest, to_tag: &str) -> String {
         Some(to_tag),
         None,
         None,
-        &[("Allow", ALLOW), ("Accept", "application/sdp")],
+        &[("Allow", ALLOW), ("Accept", inbound::INVITE_BODY_ACCEPT)],
     )
 }
 
@@ -3919,6 +3920,12 @@ mod tests {
         let resp = options_response(&request("OPTIONS"), "totag1");
         assert!(resp.starts_with("SIP/2.0 200 OK\r\n"), "{resp}");
         assert!(resp.contains(&format!("\r\nAllow: {ALLOW}\r\n")), "{resp}");
+        assert!(
+            resp.contains(
+                "\r\nAccept: application/sdp, multipart/mixed, multipart/alternative\r\n"
+            ),
+            "{resp}"
+        );
         assert!(resp.contains("\r\nCSeq: 3 OPTIONS\r\n"), "{resp}");
     }
 
