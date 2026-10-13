@@ -7,6 +7,7 @@
 //! exact bash this replaces.
 
 use super::runner::CommandRunner;
+use crate::control::protocol::IkeSaLossCause;
 use std::time::Duration;
 
 /// Mirrors the current establish-time loop's `attempt`/`stuck_without_pcscf`
@@ -41,7 +42,13 @@ pub enum DegradeReason {
     /// worked. Nothing downstream of the interface is worth disturbing until
     /// it exists: see the TunVanished branch of [`tick_steady_state`].
     TunUnavailable,
+    /// The CHILD_SA was lost under a live (listed) IKE_SA; re-initiated in
+    /// place, the agent untouched.
     ChildSaMissing,
+    /// The IKE_SA itself is gone: a carrier DELETE or a dead-peer clear (#106).
+    /// A new IKE_SA brings a new VIP and P-CSCF pool, so the agent always
+    /// restarts (spec 087, clarification Q1).
+    IkeSaLost,
     /// The CHILD_SA stayed missing across consecutive ticks even though it was
     /// re-initiated (#107): the ePDG ignored CREATE_CHILD_SA inside the
     /// surviving IKE_SA, and only a fresh IKE_SA recovers. The agent must
@@ -87,6 +94,10 @@ pub enum SteadyStateHealth {
     Ok,
     ViciBroken,
     TunVanished,
+    /// No IKE_SA is listed for this connection at all (specs/087).
+    IkeSaMissing,
+    /// An IKE_SA is listed (any state, `CONNECTING` included) but has no
+    /// usable CHILD_SA.
     ChildSaMissing,
 }
 
@@ -163,6 +174,11 @@ pub trait TunnelEngine {
     /// (strongswan: `swanctl --initiate --child <this line's connection>`;
     /// swu: no-op, matching `terminate`). Scoped for the same reason.
     fn reinitiate(&self, runner: &dyn CommandRunner);
+    /// Why this line's IKE_SA was lost, from the engine's own log. Only the
+    /// strongswan engine can tell; the default is `Unknown` (specs/087).
+    fn ike_sa_loss_cause(&self, _runner: &dyn CommandRunner) -> IkeSaLossCause {
+        IkeSaLossCause::Unknown
+    }
     /// Steady-state-only health beyond process-alive/P-CSCF-change.
     fn steady_state_health(&self, runner: &dyn CommandRunner) -> SteadyStateHealth;
     /// Recreates this line's tunnel interface after `SteadyStateHealth::
@@ -293,6 +309,8 @@ pub enum SteadyOutcome {
     /// issued by the time this returns.
     Recovered {
         reason: DegradeReason,
+        /// Why the IKE_SA was lost; `Some` only for [`DegradeReason::IkeSaLost`].
+        ike_sa_loss_cause: Option<IkeSaLossCause>,
     },
 }
 
@@ -303,7 +321,7 @@ pub enum SteadyOutcome {
 pub struct SteadyTracking {
     /// Consecutive ticks the P-CSCF was unreachable.
     pub pcscf_unreachable: u32,
-    /// Consecutive ticks the CHILD_SA was missing under a live IKE_SA.
+    /// Consecutive ticks an IKE_SA was listed but had no usable CHILD_SA.
     pub child_sa_missing: u32,
     /// Whether the last tick saw a usable CHILD_SA.
     pub child_sa_usable: bool,
@@ -334,6 +352,7 @@ pub fn tick_steady_state(
         engine.restart_process(runner);
         return SteadyOutcome::Recovered {
             reason: DegradeReason::ProcessDied,
+            ike_sa_loss_cause: None,
         };
     }
 
@@ -349,6 +368,7 @@ pub fn tick_steady_state(
             engine.restart_process(runner);
             return SteadyOutcome::Recovered {
                 reason: DegradeReason::ViciBroken,
+                ike_sa_loss_cause: None,
             };
         }
         SteadyStateHealth::TunVanished => {
@@ -381,12 +401,24 @@ pub fn tick_steady_state(
             if !engine.recreate_interface(runner) {
                 return SteadyOutcome::Recovered {
                     reason: DegradeReason::TunUnavailable,
+                    ike_sa_loss_cause: None,
                 };
             }
             engine.terminate(runner);
             engine.reinitiate(runner);
             return SteadyOutcome::Recovered {
                 reason: DegradeReason::TunVanished,
+                ike_sa_loss_cause: None,
+            };
+        }
+        SteadyStateHealth::IkeSaMissing => {
+            // No IKE_SA to terminate: re-initiate builds a fresh one. The
+            // strike count is reset above, so a later CHILD_SA loss starts
+            // from its first strike.
+            engine.reinitiate(runner);
+            return SteadyOutcome::Recovered {
+                reason: DegradeReason::IkeSaLost,
+                ike_sa_loss_cause: Some(engine.ike_sa_loss_cause(runner)),
             };
         }
         SteadyStateHealth::ChildSaMissing => {
@@ -399,12 +431,14 @@ pub fn tick_steady_state(
                 engine.reinitiate(runner);
                 return SteadyOutcome::Recovered {
                     reason: DegradeReason::ChildSaStuck,
+                    ike_sa_loss_cause: None,
                 };
             }
             // First miss: re-initiate only, without restarting the agent.
             engine.reinitiate(runner);
             return SteadyOutcome::Recovered {
                 reason: DegradeReason::ChildSaMissing,
+                ike_sa_loss_cause: None,
             };
         }
         SteadyStateHealth::Ok => {}
@@ -437,6 +471,7 @@ pub fn tick_steady_state(
             tracking.pcscf_unreachable = 0;
             return SteadyOutcome::Recovered {
                 reason: DegradeReason::DefaultRouteMissing,
+                ike_sa_loss_cause: None,
             };
         }
         tracking.pcscf_unreachable = tracking.pcscf_unreachable.saturating_add(1);
@@ -453,12 +488,14 @@ pub fn tick_steady_state(
             if !engine.recreate_interface(runner) {
                 return SteadyOutcome::Recovered {
                     reason: DegradeReason::TunUnavailable,
+                    ike_sa_loss_cause: None,
                 };
             }
             engine.terminate(runner);
             engine.reinitiate(runner);
             return SteadyOutcome::Recovered {
                 reason: DegradeReason::PcscfUnreachable,
+                ike_sa_loss_cause: None,
             };
         }
     }
@@ -468,7 +505,9 @@ pub fn tick_steady_state(
 
 /// Whether a [`SteadyOutcome::Recovered`] reason also means "restart this
 /// line's vowifi-ims-agent" — matches the original script exactly: every
-/// recovery path does, EXCEPT a bare `ChildSaMissing` re-initiate.
+/// recovery path does (`IkeSaLost` included: the new IKE_SA means a new VIP
+/// and P-CSCF pool), EXCEPT a bare `ChildSaMissing` re-initiate (a CHILD_SA
+/// lost under a live, listed IKE_SA).
 ///
 /// `TunUnavailable` is the one addition to that rule. The agent's whole job is
 /// to route over a tunnel interface which, in that state, does not exist and
@@ -754,7 +793,8 @@ mod tests {
         assert_eq!(
             outcome,
             SteadyOutcome::Recovered {
-                reason: DegradeReason::ProcessDied
+                reason: DegradeReason::ProcessDied,
+                ike_sa_loss_cause: None,
             }
         );
         assert_eq!(*engine.restart_calls.borrow(), 1);
@@ -772,7 +812,8 @@ mod tests {
         assert_eq!(
             outcome,
             SteadyOutcome::Recovered {
-                reason: DegradeReason::ViciBroken
+                reason: DegradeReason::ViciBroken,
+                ike_sa_loss_cause: None,
             }
         );
         assert_eq!(*engine.restart_calls.borrow(), 1);
@@ -790,7 +831,8 @@ mod tests {
         assert_eq!(
             outcome,
             SteadyOutcome::Recovered {
-                reason: DegradeReason::TunVanished
+                reason: DegradeReason::TunVanished,
+                ike_sa_loss_cause: None,
             }
         );
         assert_eq!(*engine.terminate_calls.borrow(), 1);
@@ -839,7 +881,8 @@ mod tests {
         assert_eq!(
             outcome,
             SteadyOutcome::Recovered {
-                reason: DegradeReason::TunUnavailable
+                reason: DegradeReason::TunUnavailable,
+                ike_sa_loss_cause: None,
             },
             "a distinct reason, so the caller can tell 'recreated it' from \
              'could not', and skip the agent restart for the latter"
@@ -893,7 +936,8 @@ mod tests {
         assert_eq!(
             tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
             SteadyOutcome::Recovered {
-                reason: DegradeReason::PcscfUnreachable
+                reason: DegradeReason::PcscfUnreachable,
+                ike_sa_loss_cause: None,
             }
         );
         // Same remedy as TunVanished, and in the same order: recreate the
@@ -987,7 +1031,8 @@ mod tests {
         assert_eq!(
             tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
             SteadyOutcome::Recovered {
-                reason: DegradeReason::DefaultRouteMissing
+                reason: DegradeReason::DefaultRouteMissing,
+                ike_sa_loss_cause: None,
             },
             "a missing route must be named as such, not inferred from unreachability"
         );
@@ -1025,6 +1070,7 @@ mod tests {
         for _ in 0..strikes {
             if let SteadyOutcome::Recovered {
                 reason: DegradeReason::PcscfUnreachable,
+                ..
             } = tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak)
             {
                 rebuilt = true;
@@ -1119,6 +1165,7 @@ mod tests {
         for _ in 0..remaining {
             if let SteadyOutcome::Recovered {
                 reason: DegradeReason::PcscfUnreachable,
+                ..
             } = super::tick_steady_state(
                 &engine,
                 &runner,
@@ -1144,7 +1191,8 @@ mod tests {
         assert_eq!(
             outcome,
             SteadyOutcome::Recovered {
-                reason: DegradeReason::ChildSaMissing
+                reason: DegradeReason::ChildSaMissing,
+                ike_sa_loss_cause: None,
             }
         );
         assert_eq!(*engine.reinitiate_calls.borrow(), 1);
@@ -1161,6 +1209,62 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_ike_sa_reinitiates_without_terminate_and_always_restarts_the_agent() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            health: RefCell::new(SteadyStateHealth::IkeSaMissing),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking {
+            child_sa_missing: 1,
+            child_sa_usable: true,
+            ..Default::default()
+        };
+        let outcome = tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        assert_eq!(
+            outcome,
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::IkeSaLost,
+                ike_sa_loss_cause: Some(IkeSaLossCause::Unknown),
+            }
+        );
+        assert_eq!(*engine.reinitiate_calls.borrow(), 1);
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+        assert_eq!(tracking.child_sa_missing, 0);
+        assert!(!tracking.child_sa_usable);
+    }
+
+    #[test]
+    fn an_ike_sa_loss_between_two_child_sa_misses_resets_the_strike_count() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            health: RefCell::new(SteadyStateHealth::ChildSaMissing),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        child_sa_tick(&engine, &runner, &mut tracking);
+        *engine.health.borrow_mut() = SteadyStateHealth::IkeSaMissing;
+        child_sa_tick(&engine, &runner, &mut tracking);
+        *engine.health.borrow_mut() = SteadyStateHealth::ChildSaMissing;
+        let outcome = child_sa_tick(&engine, &runner, &mut tracking);
+        assert!(
+            matches!(
+                outcome,
+                SteadyOutcome::Recovered {
+                    reason: DegradeReason::ChildSaMissing,
+                    ..
+                }
+            ),
+            "the second miss after an IKE_SA loss is a first strike: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn ike_sa_lost_restarts_the_agent() {
+        assert!(recovery_restarts_agent(DegradeReason::IkeSaLost));
+    }
+
+    #[test]
     fn a_second_consecutive_missing_child_sa_rebuilds_the_ike_sa() {
         let runner = MockCommandRunner::new();
         let engine = FakeEngine {
@@ -1171,14 +1275,16 @@ mod tests {
         assert_eq!(
             child_sa_tick(&engine, &runner, &mut tracking),
             SteadyOutcome::Recovered {
-                reason: DegradeReason::ChildSaMissing
+                reason: DegradeReason::ChildSaMissing,
+                ike_sa_loss_cause: None,
             }
         );
         assert_eq!(*engine.terminate_calls.borrow(), 0);
         assert_eq!(
             child_sa_tick(&engine, &runner, &mut tracking),
             SteadyOutcome::Recovered {
-                reason: DegradeReason::ChildSaStuck
+                reason: DegradeReason::ChildSaStuck,
+                ike_sa_loss_cause: None,
             }
         );
         assert_eq!(*engine.terminate_calls.borrow(), 1);
@@ -1201,7 +1307,8 @@ mod tests {
         assert_eq!(
             child_sa_tick(&engine, &runner, &mut tracking),
             SteadyOutcome::Recovered {
-                reason: DegradeReason::ChildSaMissing
+                reason: DegradeReason::ChildSaMissing,
+                ike_sa_loss_cause: None,
             }
         );
         assert_eq!(*engine.terminate_calls.borrow(), 0);
@@ -1217,7 +1324,7 @@ mod tests {
         let mut tracking = SteadyTracking::default();
         let reasons: Vec<_> = (0..4)
             .map(|_| match child_sa_tick(&engine, &runner, &mut tracking) {
-                SteadyOutcome::Recovered { reason } => reason,
+                SteadyOutcome::Recovered { reason, .. } => reason,
                 other => panic!("unexpected {other:?}"),
             })
             .collect();
@@ -1262,7 +1369,8 @@ mod tests {
         assert_eq!(
             child_sa_tick(&engine, &runner, &mut tracking),
             SteadyOutcome::Recovered {
-                reason: DegradeReason::ChildSaMissing
+                reason: DegradeReason::ChildSaMissing,
+                ike_sa_loss_cause: None,
             },
             "the respawned connection gets its own first retry"
         );
@@ -1370,6 +1478,7 @@ mod tests {
             DegradeReason::TunVanished,
             DegradeReason::PcscfChanged,
             DegradeReason::ChildSaStuck,
+            DegradeReason::IkeSaLost,
         ] {
             assert!(
                 recovery_restarts_agent(reason),
@@ -1390,6 +1499,7 @@ mod tests {
             DegradeReason::PcscfUnreachable,
             DegradeReason::DefaultRouteMissing,
             DegradeReason::ChildSaStuck,
+            DegradeReason::IkeSaLost,
         ] {
             match reason {
                 DegradeReason::ProcessDied
@@ -1399,6 +1509,8 @@ mod tests {
                 // A fresh IKE_SA brings a new VIP/P-CSCF pool, so the agent
                 // must re-register.
                 | DegradeReason::ChildSaStuck
+                // Likewise: a new IKE_SA, a new VIP and P-CSCF pool.
+                | DegradeReason::IkeSaLost
                 // A rebuilt tunnel means a new data path, which the agent has
                 // to re-register over -- so it must be restarted.
                 | DegradeReason::PcscfUnreachable

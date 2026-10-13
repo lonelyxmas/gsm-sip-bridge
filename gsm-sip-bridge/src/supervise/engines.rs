@@ -7,6 +7,7 @@
 
 use super::line_supervisor::{SteadyStateHealth, TunnelEngine};
 use super::runner::{ChildHandle, ChildSpec, CommandRunner};
+use crate::control::protocol::IkeSaLossCause;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -152,6 +153,43 @@ pub fn list_sas_has_child_sa(sas_output: &str, conn_name: &str) -> bool {
             .nth(2)
             .is_some_and(|state| USABLE_CHILD_SA_STATES.contains(&state))
     })
+}
+
+/// Whether `swanctl --list-sas --ike <conn>` lists an IKE_SA for `conn_name`
+/// in **any** state, `CONNECTING` included.
+///
+/// The IKE_SA is the column-0 `ims0: #1, ESTABLISHED, ...` header; the CHILD_SA
+/// beneath it is indented. vici enumerates half-open IKE_SAs too, so an
+/// initiate still in flight from the previous tick reads as present (and so
+/// takes the two-strike CHILD_SA path) rather than as lost. No header at all
+/// means the carrier deleted it or charon gave up (#106; research R1).
+pub fn list_sas_has_ike_sa(sas_output: &str, conn_name: &str) -> bool {
+    let prefix = format!("{conn_name}: #");
+    sas_output.lines().any(|l| l.starts_with(&prefix))
+}
+
+/// Best-effort reason this connection's IKE_SA was lost, from the charon log.
+///
+/// Only lines after the most recent `IKE_SA <conn>[N] established` count, so a
+/// previous session's DELETE is never blamed. Both markers are DBG1 in
+/// strongSwan 5.9, hence present at our `filelog default = 1` (research R2).
+/// A loss we caused ourselves logs neither, and reads `Unknown`.
+pub fn ike_sa_loss_cause(charon_log: &str, conn_name: &str) -> IkeSaLossCause {
+    let established = format!("IKE_SA {conn_name}[");
+    let mut cause = IkeSaLossCause::Unknown;
+    for line in lines_for_conn(charon_log, conn_name) {
+        if line
+            .find(&established)
+            .is_some_and(|pos| line[pos..].contains("] established"))
+        {
+            cause = IkeSaLossCause::Unknown;
+        } else if line.contains("received DELETE for IKE_SA") {
+            cause = IkeSaLossCause::CarrierDelete;
+        } else if line.contains("giving up after") {
+            cause = IkeSaLossCause::DeadPeer;
+        }
+    }
+    cause
 }
 
 /// The single charon daemon shared by every strongswan-engine line.
@@ -398,6 +436,13 @@ impl TunnelEngine for StrongswanEngine {
         self.shared.is_alive(runner)
     }
 
+    fn ike_sa_loss_cause(&self, runner: &dyn CommandRunner) -> IkeSaLossCause {
+        runner
+            .read_file(&self.shared.charon_log)
+            .map(|c| ike_sa_loss_cause(&c, &self.conn_name))
+            .unwrap_or(IkeSaLossCause::Unknown)
+    }
+
     fn terminate(&self, runner: &dyn CommandRunner) {
         // `--force` makes charon delete the IKE_SA without waiting on a pending
         // exchange: without it #107 spent 52s on a stuck CREATE_CHILD_SA. Not
@@ -460,6 +505,13 @@ impl TunnelEngine for StrongswanEngine {
                 return SteadyStateHealth::ViciBroken;
             }
         };
+        if !list_sas_has_ike_sa(&sas_output, &self.conn_name) {
+            println!(
+                "[supervise] line {}: {} IKE_SA missing; re-initiating",
+                self.idx, self.conn_name
+            );
+            return SteadyStateHealth::IkeSaMissing;
+        }
         if !list_sas_has_child_sa(&sas_output, &self.conn_name) {
             println!(
                 "[supervise] line {}: {} CHILD_SA missing; re-initiating",
@@ -843,6 +895,44 @@ mod tests {
     }
 
     #[test]
+    fn list_sas_ike_detection_table() {
+        let h = ike_header("ims0");
+        let cases: Vec<(String, bool)> = vec![
+            (format!("{h}{}", child("ims0", 4, "INSTALLED")), true),
+            (h.clone(), true),
+            (h.replace("ESTABLISHED", "CONNECTING"), true),
+            (String::new(), false),
+            (ike_header("ims1"), false),
+            (child("ims0", 4, "INSTALLED"), false),
+            (ike_header("ims10"), false),
+        ];
+        for (i, (out, want)) in cases.iter().enumerate() {
+            assert_eq!(list_sas_has_ike_sa(out, "ims0"), *want, "case {i}: {out}");
+        }
+    }
+
+    #[test]
+    fn ike_sa_loss_cause_table() {
+        let est = "09[IKE] <ims0|3> IKE_SA ims0[3] established between 198.51.100.10[a]...203.0.113.1[b]\n";
+        let del = "11[IKE] <ims0|3> received DELETE for IKE_SA ims0[3]\n";
+        let dpd = "11[IKE] <ims0|3> giving up after 5 retransmits\n";
+        let other = "11[IKE] <ims1|2> received DELETE for IKE_SA ims1[2]\n";
+        let cases: Vec<(String, IkeSaLossCause)> = vec![
+            (format!("{est}{del}"), IkeSaLossCause::CarrierDelete),
+            (format!("{est}{dpd}"), IkeSaLossCause::DeadPeer),
+            (est.to_string(), IkeSaLossCause::Unknown),
+            (format!("{del}{est}"), IkeSaLossCause::Unknown),
+            (format!("{est}{dpd}{del}"), IkeSaLossCause::CarrierDelete),
+            (format!("{est}{del}{dpd}"), IkeSaLossCause::DeadPeer),
+            (format!("{est}{other}"), IkeSaLossCause::Unknown),
+            (String::new(), IkeSaLossCause::Unknown),
+        ];
+        for (i, (log, want)) in cases.iter().enumerate() {
+            assert_eq!(ike_sa_loss_cause(log, "ims0"), *want, "case {i}: {log}");
+        }
+    }
+
+    #[test]
     fn swu_connected_marker_matches_the_grep_pattern() {
         assert!(swu_log_shows_connected("... STATE CONNECTED ..."));
         assert!(!swu_log_shows_connected("STATE CONNECTING"));
@@ -976,6 +1066,55 @@ mod tests {
             );
             let healthy = seed("ims0: #1, ESTABLISHED, IKEv2, aa_i* bb_r\n  ims0: #4, reqid 1, INSTALLED, TUNNEL-in-UDP, ESP:AES_CBC-128/HMAC_SHA1_96\n");
             assert_eq!(engine.steady_state_health(&healthy), SteadyStateHealth::Ok);
+        }
+
+        #[test]
+        fn steady_state_health_reports_a_missing_ike_sa_distinctly() {
+            use std::os::unix::process::ExitStatusExt;
+            let list_key =
+                "timeout 10 env STRONGSWAN_CONF=/etc/strongswan-shared.conf swanctl --list-sas --ike ims0";
+            let seed = |status: i32, stdout: &str| {
+                let runner = MockCommandRunner::new();
+                runner.set_run_output(
+                    list_key,
+                    std::process::Output {
+                        status: std::process::ExitStatus::from_raw(status),
+                        stdout: stdout.as_bytes().to_vec(),
+                        stderr: Vec::new(),
+                    },
+                );
+                runner
+            };
+            let engine = strongswan_engine();
+            assert_eq!(
+                engine.steady_state_health(&seed(0, "")),
+                SteadyStateHealth::IkeSaMissing
+            );
+            let connecting = seed(0, "ims0: #2, CONNECTING, IKEv2, aa_i* bb_r\n");
+            assert_eq!(
+                engine.steady_state_health(&connecting),
+                SteadyStateHealth::ChildSaMissing
+            );
+            assert_eq!(
+                engine.steady_state_health(&seed(256, "")),
+                SteadyStateHealth::ViciBroken
+            );
+        }
+
+        #[test]
+        fn ike_sa_loss_cause_reads_this_lines_charon_log() {
+            let runner = MockCommandRunner::new();
+            let engine = strongswan_engine();
+            runner
+                .write_file(
+                    &engine.shared.charon_log,
+                    "09[IKE] <ims0|3> IKE_SA ims0[3] established between a...b\n11[IKE] <ims0|3> received DELETE for IKE_SA ims0[3]\n",
+                )
+                .unwrap();
+            assert_eq!(
+                TunnelEngine::ike_sa_loss_cause(&engine, &runner),
+                IkeSaLossCause::CarrierDelete
+            );
         }
 
         #[test]
