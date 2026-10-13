@@ -316,6 +316,18 @@ pub(super) fn handle_invite(
         return Ok(None);
     }
 
+    // specs/088 FR-018a: the caller's own mandatory segment not yet reserved
+    // is the carrier's to wait for, not ours — the call proceeds (answering
+    // would need an `UPDATE` we don't implement), but say so once.
+    let unmet = sdp::offerer_unmet_mandatory(&offer);
+    if !unmet.is_empty() {
+        tracing::info!(
+            call_id = %call_id,
+            unmet = ?unmet,
+            "offerer reports its own mandatory QoS precondition unmet; proceeding"
+        );
+    }
+
     // A carrier's mobile-terminating VoWiFi INVITE often offers no PCMU at
     // all (Airtel: AMR-WB+AMR-NB on some calls, AMR-NB alone on others), so
     // anything AMR gets answered and transcoded rather than declined. Uses
