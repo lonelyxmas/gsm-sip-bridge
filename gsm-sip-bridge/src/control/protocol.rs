@@ -112,6 +112,30 @@ pub struct AgentReport {
     pub dropped: u64,
 }
 
+/// Why a line's IKE_SA vanished, as far as the charon log can tell
+/// (specs/087). Closed on purpose: it only ever feeds log lines and alert
+/// text, so neither the wire nor the text can grow unbounded cardinality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IkeSaLossCause {
+    /// The ePDG sent an IKE `DELETE` for the IKE_SA.
+    CarrierDelete,
+    /// charon gave up retransmitting to an unresponsive peer.
+    DeadPeer,
+    /// Neither was logged (e.g. a loss we caused ourselves).
+    Unknown,
+}
+
+impl std::fmt::Display for IkeSaLossCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::CarrierDelete => "carrier DELETE",
+            Self::DeadPeer => "dead-peer timeout",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
 /// Absolute, latest-wins gauge state. `None` means "this agent does not
 /// report this signal" — distinct from `Some(false)`, which means "reports
 /// it, and it is currently down". The daemon never invents a value for
@@ -165,6 +189,16 @@ pub struct AgentState {
     /// agent); the ingest side leaves the gauge untouched.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub child_sa_up: Option<bool>,
+    /// Supervisor only: the line's tunnel has needed `FLAP_REBUILDS` or more
+    /// IKE_SA rebuilds within `unhealthy_sec` and has not had a full quiet
+    /// window since (specs/087). `None` = not reported; ingest leaves its state
+    /// untouched.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tunnel_flapping: Option<bool>,
+    /// Supervisor only: why the most recent IKE_SA loss on this line happened.
+    /// For alert text; never drives a decision.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ike_sa_loss_cause: Option<IkeSaLossCause>,
 }
 
 /// A counter delta or histogram observation. Every enumerated field below is
@@ -454,6 +488,51 @@ mod tests {
         let back: AgentReport = serde_json::from_str(&json).unwrap();
         assert_eq!(back.agent, AgentKind::Supervisor);
         assert_eq!(back.state.child_sa_up, Some(false));
+    }
+
+    #[test]
+    fn ike_sa_loss_cause_serde_names_and_display() {
+        use IkeSaLossCause::*;
+        for (c, wire, text) in [
+            (CarrierDelete, "\"carrier_delete\"", "carrier DELETE"),
+            (DeadPeer, "\"dead_peer\"", "dead-peer timeout"),
+            (Unknown, "\"unknown\"", "unknown"),
+        ] {
+            assert_eq!(serde_json::to_string(&c).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<IkeSaLossCause>(wire).unwrap(), c);
+            assert_eq!(c.to_string(), text);
+        }
+    }
+
+    #[test]
+    fn flapping_and_loss_cause_round_trip_and_are_optional() {
+        let report = AgentReport {
+            agent: AgentKind::Supervisor,
+            module_id: "m".into(),
+            epoch: 1,
+            seq: 1,
+            state: AgentState {
+                tunnel_flapping: Some(true),
+                ike_sa_loss_cause: Some(IkeSaLossCause::CarrierDelete),
+                ..Default::default()
+            },
+            events: vec![],
+            dropped: 0,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"tunnel_flapping\":true"));
+        assert!(json.contains("\"ike_sa_loss_cause\":\"carrier_delete\""));
+        let back: AgentReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.state.tunnel_flapping, Some(true));
+        assert_eq!(
+            back.state.ike_sa_loss_cause,
+            Some(IkeSaLossCause::CarrierDelete)
+        );
+        let empty: AgentState = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.tunnel_flapping, None);
+        assert_eq!(empty.ike_sa_loss_cause, None);
+        let json = serde_json::to_string(&empty).unwrap();
+        assert!(!json.contains("tunnel_flapping") && !json.contains("ike_sa_loss_cause"));
     }
 
     #[test]

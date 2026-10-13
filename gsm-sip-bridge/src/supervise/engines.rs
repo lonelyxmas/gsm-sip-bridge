@@ -7,8 +7,10 @@
 
 use super::line_supervisor::{SteadyStateHealth, TunnelEngine};
 use super::runner::{ChildHandle, ChildSpec, CommandRunner};
+use crate::control::protocol::IkeSaLossCause;
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -47,7 +49,41 @@ pub fn charon_log_shows_established(charon_log: &str, conn_name: &str) -> bool {
 /// imported, since this crate has no shared "bash-parity log parsers" module
 /// yet — both read the identical `received P-CSCF server IP ...` marker.
 pub fn extract_latest_pcscf(charon_log: &str, conn_name: &str) -> Option<String> {
-    pick_stable_pcscf(&latest_pcscf_batch(charon_log, conn_name))
+    pick_stable_pcscf(&latest_pcscf_batch(charon_log, conn_name).0)
+}
+
+/// The P-CSCF of a negotiation that started **after** byte offset `mark` of the
+/// charon log, or `None` while there is none yet (specs/087, research R4).
+///
+/// `mark` is the log's length taken before a recovery was issued, so only the
+/// new negotiation can answer. Only a *closed* batch (ended by a `CHILD_SA ...
+/// established` line) counts, so a half-logged negotiation is never accepted.
+/// If the log is shorter than `mark` (truncated or rotated) the whole log is
+/// read; a `mark` landing mid-line or off a char boundary is snapped forward
+/// to the next line start.
+pub fn extract_pcscf_after(charon_log: &str, conn_name: &str, mark: usize) -> Option<String> {
+    let slice = if mark > charon_log.len() {
+        charon_log
+    } else {
+        let mut at = mark;
+        while !charon_log.is_char_boundary(at) {
+            at += 1;
+        }
+        // Mid-line: the rest of that line belongs to the old batch.
+        if at > 0 && charon_log.as_bytes()[at - 1] != b'\n' {
+            match charon_log[at..].find('\n') {
+                Some(nl) => at += nl + 1,
+                None => at = charon_log.len(),
+            }
+        }
+        &charon_log[at..]
+    };
+    let (batch, closed) = latest_pcscf_batch(slice, conn_name);
+    if closed {
+        pick_stable_pcscf(&batch)
+    } else {
+        None
+    }
 }
 
 fn is_valid_pcscf_addr(s: &str) -> bool {
@@ -63,8 +99,9 @@ fn is_valid_pcscf_addr(s: &str) -> bool {
 /// lines in a row (Jio sends four: two IPv6, two IPv4) followed by the
 /// `CHILD_SA ... established` line. So a batch is the run of addresses since
 /// the last establishment: seeing an establishment closes the current batch,
-/// and the next address starts a fresh one.
-fn latest_pcscf_batch(charon_log: &str, conn_name: &str) -> Vec<String> {
+/// and the next address starts a fresh one. Also reports whether the returned
+/// batch has been closed by its establishment.
+fn latest_pcscf_batch(charon_log: &str, conn_name: &str) -> (Vec<String>, bool) {
     const MARKER: &str = "received P-CSCF server IP ";
     let mut batch: Vec<String> = Vec::new();
     let mut closed = false;
@@ -94,7 +131,7 @@ fn latest_pcscf_batch(charon_log: &str, conn_name: &str) -> Vec<String> {
             closed = true;
         }
     }
-    batch
+    (batch, closed)
 }
 
 /// Choose one P-CSCF from a batch, as a **deterministic function of the set**
@@ -117,10 +154,22 @@ fn pick_stable_pcscf(batch: &[String]) -> Option<String> {
     v4.or_else(|| batch.iter().min()).cloned()
 }
 
+/// How long, after a recovery that restarts the agent, to wait for the new
+/// negotiation's P-CSCF before restarting the agent with the old one (R4).
+/// Measured live: a rebuild logs its P-CSCF batch within a few seconds.
+pub const POST_RECOVERY_PCSCF_WAIT: Duration = Duration::from_secs(20);
+/// Poll interval for that wait.
+pub const POST_RECOVERY_PCSCF_POLL: Duration = Duration::from_secs(1);
+
 /// Outer bound on a steady-state IKE_SA teardown. #107's teardown waited 52s on
 /// an exchange the ePDG would never answer; `shutdown.rs`'s
 /// `TERMINATE_TIMEOUT_SECS` is the precedent for bounding it.
 const STEADY_TERMINATE_TIMEOUT_SECS: u32 = 10;
+
+/// How long a graceful `swanctl --terminate` waits for the ePDG's DELETE
+/// response (swanctl's own `--timeout`), and the outer `timeout` around it.
+const GRACEFUL_TERMINATE_WAIT_SECS: u32 = 5;
+const GRACEFUL_TERMINATE_TIMEOUT_SECS: u32 = 8;
 
 /// Outer bound on the steady-state `swanctl --list-sas` query.
 const STEADY_LIST_SAS_TIMEOUT_SECS: u32 = 10;
@@ -152,6 +201,43 @@ pub fn list_sas_has_child_sa(sas_output: &str, conn_name: &str) -> bool {
             .nth(2)
             .is_some_and(|state| USABLE_CHILD_SA_STATES.contains(&state))
     })
+}
+
+/// Whether `swanctl --list-sas --ike <conn>` lists an IKE_SA for `conn_name`
+/// in **any** state, `CONNECTING` included.
+///
+/// The IKE_SA is the column-0 `ims0: #1, ESTABLISHED, ...` header; the CHILD_SA
+/// beneath it is indented. vici enumerates half-open IKE_SAs too, so an
+/// initiate still in flight from the previous tick reads as present (and so
+/// takes the two-strike CHILD_SA path) rather than as lost. No header at all
+/// means the carrier deleted it or charon gave up (#106; research R1).
+pub fn list_sas_has_ike_sa(sas_output: &str, conn_name: &str) -> bool {
+    let prefix = format!("{conn_name}: #");
+    sas_output.lines().any(|l| l.starts_with(&prefix))
+}
+
+/// Best-effort reason this connection's IKE_SA was lost, from the charon log.
+///
+/// Only lines after the most recent `IKE_SA <conn>[N] established` count, so a
+/// previous session's DELETE is never blamed. Both markers are DBG1 in
+/// strongSwan 5.9, hence present at our `filelog default = 1` (research R2).
+/// A loss we caused ourselves logs neither, and reads `Unknown`.
+pub fn ike_sa_loss_cause(charon_log: &str, conn_name: &str) -> IkeSaLossCause {
+    let established = format!("IKE_SA {conn_name}[");
+    let mut cause = IkeSaLossCause::Unknown;
+    for line in lines_for_conn(charon_log, conn_name) {
+        if line
+            .find(&established)
+            .is_some_and(|pos| line[pos..].contains("] established"))
+        {
+            cause = IkeSaLossCause::Unknown;
+        } else if line.contains("received DELETE for IKE_SA") {
+            cause = IkeSaLossCause::CarrierDelete;
+        } else if line.contains("giving up after") {
+            cause = IkeSaLossCause::DeadPeer;
+        }
+    }
+    cause
 }
 
 /// The single charon daemon shared by every strongswan-engine line.
@@ -190,6 +276,18 @@ pub struct SharedCharon {
     /// across the check-and-spawn is what makes "restart it only if nobody
     /// else already has" atomic.
     handle: Mutex<Option<Arc<ChildHandle>>>,
+    /// Bumped every time the log is truncated for a fresh charon, so a
+    /// [`LogMark`] taken before that can tell its byte offset no longer refers
+    /// to the same file (a length comparison alone cannot: the new log may
+    /// have grown past the old mark by the next read).
+    log_generation: AtomicU64,
+}
+
+/// A position in the shared charon log: its truncation generation and length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogMark {
+    generation: u64,
+    len: usize,
 }
 
 impl SharedCharon {
@@ -199,6 +297,7 @@ impl SharedCharon {
             swanctl_top_conf,
             charon_log,
             handle: Mutex::new(None),
+            log_generation: AtomicU64::new(0),
         }
     }
 
@@ -251,6 +350,7 @@ impl SharedCharon {
             runner.reap(&old);
         }
         let _ = runner.write_file(&self.charon_log, "");
+        self.log_generation.fetch_add(1, Ordering::SeqCst);
         let _ = runner.run(&["rm", "-f", "/var/run/charon.pid"]);
 
         let env = self.env_prefix();
@@ -346,6 +446,62 @@ impl StrongswanEngine {
         self.shared.env_prefix()
     }
 
+    /// `swanctl --list-sas` scoped to this line's connection; `None` if the
+    /// call failed or timed out.
+    ///
+    /// `--ike <conn>` keeps the shared daemon from reporting every line's SAs,
+    /// where another line's healthy CHILD_SA would mask this line's missing
+    /// one. Bounded: a vici call that never returns would otherwise freeze this
+    /// line's supervision loop while the reporter thread keeps heartbeating the
+    /// last (healthy) state. A timeout reads as a broken vici.
+    fn list_sas(&self, runner: &dyn CommandRunner) -> Option<String> {
+        let env = self.env_prefix();
+        let secs = STEADY_LIST_SAS_TIMEOUT_SECS.to_string();
+        match runner.run(&[
+            "timeout",
+            &secs,
+            "env",
+            &env,
+            "swanctl",
+            "--list-sas",
+            "--ike",
+            &self.conn_name,
+        ]) {
+            Ok(out) if out.status.success() => {
+                Some(String::from_utf8_lossy(&out.stdout).into_owned())
+            }
+            _ => None,
+        }
+    }
+
+    /// The charon log's current length, taken before a recovery is issued so
+    /// [`Self::fresh_pcscf_since`] can tell the new negotiation from the old.
+    /// `0` if the log cannot be read, which makes any closed batch count.
+    pub fn log_mark(&self, runner: &dyn CommandRunner) -> LogMark {
+        LogMark {
+            generation: self.shared.log_generation.load(Ordering::SeqCst),
+            len: runner
+                .read_file(&self.shared.charon_log)
+                .map(|c| c.len())
+                .unwrap_or(0),
+        }
+    }
+
+    /// The P-CSCF of a negotiation logged after `mark`, if one has completed.
+    /// A log truncated since the mark (charon restarted) is read from its
+    /// start: everything in it is newer than the mark.
+    pub fn fresh_pcscf_since(&self, runner: &dyn CommandRunner, mark: LogMark) -> Option<String> {
+        let offset = if self.shared.log_generation.load(Ordering::SeqCst) == mark.generation {
+            mark.len
+        } else {
+            0
+        };
+        runner
+            .read_file(&self.shared.charon_log)
+            .ok()
+            .and_then(|c| extract_pcscf_after(&c, &self.conn_name, offset))
+    }
+
     /// Backgrounded `swanctl` invocation — matches the bash calls that end
     /// in `&` (every `--initiate`). Fire-and-forget: like the bash version,
     /// the spawned process's handle is never tracked or waited on (the
@@ -398,12 +554,60 @@ impl TunnelEngine for StrongswanEngine {
         self.shared.is_alive(runner)
     }
 
+    fn ike_sa_loss_cause(&self, runner: &dyn CommandRunner) -> IkeSaLossCause {
+        runner
+            .read_file(&self.shared.charon_log)
+            .map(|c| ike_sa_loss_cause(&c, &self.conn_name))
+            .unwrap_or(IkeSaLossCause::Unknown)
+    }
+
+    /// Graceful delete first, forced only if the ePDG does not acknowledge it
+    /// (specs/087, research R3).
+    ///
+    /// A non-forced terminate sends the DELETE and waits up to
+    /// `GRACEFUL_TERMINATE_WAIT_SECS` for the ePDG's response, which is the
+    /// ePDG's own statement that the old session is gone. That is what a fixed
+    /// post-terminate sleep used to guess at (#106). Whether it was
+    /// acknowledged is decided by presence (a follow-up `--list-sas`), not by
+    /// swanctl's exit status; a failed presence query counts as "still there",
+    /// because forcing is the only safe step then. `--force` is never combined
+    /// with swanctl's `--timeout`, which disables its no-wait behaviour (the
+    /// outer `timeout` bounds it instead; #107 spent 52s on a stuck exchange).
+    ///
+    /// No sleep on either path: on the forced path the ePDG is not answering,
+    /// so waiting buys nothing. Worst case is 8 + 10 + 10 = 28s, under the
+    /// shutdown read guard; `shutdown.rs`'s own teardown is already non-forced
+    /// with a 5s bound and is intentionally unchanged.
     fn terminate(&self, runner: &dyn CommandRunner) {
-        // `--force` makes charon delete the IKE_SA without waiting on a pending
-        // exchange: without it #107 spent 52s on a stuck CREATE_CHILD_SA. Not
-        // swanctl's own `--timeout`, which disables `--force`'s no-wait
-        // behaviour; the outer `timeout` bounds it instead.
         let env = self.env_prefix();
+        let graceful_outer = GRACEFUL_TERMINATE_TIMEOUT_SECS.to_string();
+        let graceful_wait = GRACEFUL_TERMINATE_WAIT_SECS.to_string();
+        let _ = runner.run(&[
+            "timeout",
+            &graceful_outer,
+            "env",
+            &env,
+            "swanctl",
+            "--terminate",
+            "--ike",
+            &self.conn_name,
+            "--timeout",
+            &graceful_wait,
+        ]);
+        if self
+            .list_sas(runner)
+            .is_some_and(|out| !list_sas_has_ike_sa(&out, &self.conn_name))
+        {
+            println!(
+                "[supervise] line {}: IKE_SA deleted (acknowledged)",
+                self.idx
+            );
+            return;
+        }
+        println!(
+            "[supervise] line {}: ePDG did not acknowledge DELETE within {GRACEFUL_TERMINATE_WAIT_SECS}s; forced",
+            self.idx
+        );
         let secs = STEADY_TERMINATE_TIMEOUT_SECS.to_string();
         let _ = runner.run(&[
             "timeout",
@@ -432,34 +636,21 @@ impl TunnelEngine for StrongswanEngine {
             return SteadyStateHealth::TunVanished;
         }
 
-        let env = self.env_prefix();
-        // `--ike <conn>` scopes the query to this line. Without it the shared
-        // daemon reports every line's SAs, and another line's healthy
-        // CHILD_SA would mask this line's missing one.
-        //
-        // Bounded: a vici call that never returns would otherwise freeze this
-        // line's supervision loop while the reporter thread keeps heartbeating
-        // the last (healthy) state. A timeout reads as a broken vici.
-        let secs = STEADY_LIST_SAS_TIMEOUT_SECS.to_string();
-        let sas_output = match runner.run(&[
-            "timeout",
-            &secs,
-            "env",
-            &env,
-            "swanctl",
-            "--list-sas",
-            "--ike",
-            &self.conn_name,
-        ]) {
-            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
-            _ => {
-                println!(
-                    "[supervise] line {}: swanctl --list-sas failed (vici connection broken)",
-                    self.idx
-                );
-                return SteadyStateHealth::ViciBroken;
-            }
+        // Bounded and scoped to this line: see `list_sas`.
+        let Some(sas_output) = self.list_sas(runner) else {
+            println!(
+                "[supervise] line {}: swanctl --list-sas failed (vici connection broken)",
+                self.idx
+            );
+            return SteadyStateHealth::ViciBroken;
         };
+        if !list_sas_has_ike_sa(&sas_output, &self.conn_name) {
+            println!(
+                "[supervise] line {}: {} IKE_SA missing; re-initiating",
+                self.idx, self.conn_name
+            );
+            return SteadyStateHealth::IkeSaMissing;
+        }
         if !list_sas_has_child_sa(&sas_output, &self.conn_name) {
             println!(
                 "[supervise] line {}: {} CHILD_SA missing; re-initiating",
@@ -843,6 +1034,81 @@ mod tests {
     }
 
     #[test]
+    fn list_sas_ike_detection_table() {
+        let h = ike_header("ims0");
+        let cases: Vec<(String, bool)> = vec![
+            (format!("{h}{}", child("ims0", 4, "INSTALLED")), true),
+            (h.clone(), true),
+            (h.replace("ESTABLISHED", "CONNECTING"), true),
+            (String::new(), false),
+            (ike_header("ims1"), false),
+            (child("ims0", 4, "INSTALLED"), false),
+            (ike_header("ims10"), false),
+        ];
+        for (i, (out, want)) in cases.iter().enumerate() {
+            assert_eq!(list_sas_has_ike_sa(out, "ims0"), *want, "case {i}: {out}");
+        }
+    }
+
+    #[test]
+    fn ike_sa_loss_cause_table() {
+        let est = "09[IKE] <ims0|3> IKE_SA ims0[3] established between 198.51.100.10[a]...203.0.113.1[b]\n";
+        let del = "11[IKE] <ims0|3> received DELETE for IKE_SA ims0[3]\n";
+        let dpd = "11[IKE] <ims0|3> giving up after 5 retransmits\n";
+        let other = "11[IKE] <ims1|2> received DELETE for IKE_SA ims1[2]\n";
+        let cases: Vec<(String, IkeSaLossCause)> = vec![
+            (format!("{est}{del}"), IkeSaLossCause::CarrierDelete),
+            (format!("{est}{dpd}"), IkeSaLossCause::DeadPeer),
+            (est.to_string(), IkeSaLossCause::Unknown),
+            (format!("{del}{est}"), IkeSaLossCause::Unknown),
+            (format!("{est}{dpd}{del}"), IkeSaLossCause::CarrierDelete),
+            (format!("{est}{del}{dpd}"), IkeSaLossCause::DeadPeer),
+            (format!("{est}{other}"), IkeSaLossCause::Unknown),
+            (String::new(), IkeSaLossCause::Unknown),
+        ];
+        for (i, (log, want)) in cases.iter().enumerate() {
+            assert_eq!(ike_sa_loss_cause(log, "ims0"), *want, "case {i}: {log}");
+        }
+    }
+
+    #[test]
+    fn extract_pcscf_after_only_accepts_a_closed_batch_logged_after_the_mark() {
+        let old = "[CFG] <ims0|1> received P-CSCF server IP 192.0.2.10\n[IKE] <ims0|1> CHILD_SA ims0{3} established with SPIs a_i b_o\n";
+        let new_open = "[CFG] <ims0|2> received P-CSCF server IP 192.0.2.11\n";
+        let new_close = "[IKE] <ims0|2> CHILD_SA ims0{4} established with SPIs c_i d_o\n";
+        let mark = old.len();
+        // Nothing new yet.
+        assert_eq!(extract_pcscf_after(old, "ims0", mark), None);
+        // New batch, not yet closed.
+        let open = format!("{old}{new_open}");
+        assert_eq!(extract_pcscf_after(&open, "ims0", mark), None);
+        // New batch, closed.
+        let closed = format!("{old}{new_open}{new_close}");
+        assert_eq!(
+            extract_pcscf_after(&closed, "ims0", mark),
+            Some("192.0.2.11".to_string())
+        );
+        // Truncated log: the whole log is read.
+        assert_eq!(
+            extract_pcscf_after(&closed, "ims0", closed.len() + 100),
+            Some("192.0.2.11".to_string())
+        );
+        // Another connection's batch does not count.
+        let other = format!("{old}{}", closed[old.len()..].replace("ims0", "ims1"));
+        assert_eq!(extract_pcscf_after(&other, "ims0", mark), None);
+    }
+
+    #[test]
+    fn extract_pcscf_after_never_panics_on_an_awkward_mark() {
+        let log = "[CFG] <ims0|1> received P-CSCF server IP 192.0.2.10\n[IKE] <ims0|1> CHILD_SA ims0{3} established é\n";
+        for mark in 0..=log.len() + 2 {
+            let _ = extract_pcscf_after(log, "ims0", mark);
+        }
+        // A mark mid-line skips the rest of that line.
+        assert_eq!(extract_pcscf_after(log, "ims0", 10), None);
+    }
+
+    #[test]
     fn swu_connected_marker_matches_the_grep_pattern() {
         assert!(swu_log_shows_connected("... STATE CONNECTED ..."));
         assert!(!swu_log_shows_connected("STATE CONNECTING"));
@@ -979,6 +1245,73 @@ mod tests {
         }
 
         #[test]
+        fn steady_state_health_reports_a_missing_ike_sa_distinctly() {
+            use std::os::unix::process::ExitStatusExt;
+            let list_key =
+                "timeout 10 env STRONGSWAN_CONF=/etc/strongswan-shared.conf swanctl --list-sas --ike ims0";
+            let seed = |status: i32, stdout: &str| {
+                let runner = MockCommandRunner::new();
+                runner.set_run_output(
+                    list_key,
+                    std::process::Output {
+                        status: std::process::ExitStatus::from_raw(status),
+                        stdout: stdout.as_bytes().to_vec(),
+                        stderr: Vec::new(),
+                    },
+                );
+                runner
+            };
+            let engine = strongswan_engine();
+            assert_eq!(
+                engine.steady_state_health(&seed(0, "")),
+                SteadyStateHealth::IkeSaMissing
+            );
+            let connecting = seed(0, "ims0: #2, CONNECTING, IKEv2, aa_i* bb_r\n");
+            assert_eq!(
+                engine.steady_state_health(&connecting),
+                SteadyStateHealth::ChildSaMissing
+            );
+            assert_eq!(
+                engine.steady_state_health(&seed(256, "")),
+                SteadyStateHealth::ViciBroken
+            );
+        }
+
+        #[test]
+        fn ike_sa_loss_cause_reads_this_lines_charon_log() {
+            let runner = MockCommandRunner::new();
+            let engine = strongswan_engine();
+            runner
+                .write_file(
+                    &engine.shared.charon_log,
+                    "09[IKE] <ims0|3> IKE_SA ims0[3] established between a...b\n11[IKE] <ims0|3> received DELETE for IKE_SA ims0[3]\n",
+                )
+                .unwrap();
+            assert_eq!(
+                TunnelEngine::ike_sa_loss_cause(&engine, &runner),
+                IkeSaLossCause::CarrierDelete
+            );
+        }
+
+        #[test]
+        fn a_charon_restart_invalidates_the_log_mark_even_if_the_new_log_outgrows_it() {
+            let runner = MockCommandRunner::new();
+            let engine = strongswan_engine();
+            let old = "[CFG] <ims0|1> received P-CSCF server IP 192.0.2.10\n[IKE] <ims0|1> CHILD_SA ims0{3} established x\n";
+            runner.set_file(&engine.shared.charon_log, old);
+            let mark = engine.log_mark(&runner);
+            // charon restarts: the log is truncated, then grows past the mark.
+            engine.shared.log_generation.fetch_add(1, Ordering::SeqCst);
+            let new = "[CFG] <ims0|2> received P-CSCF server IP 192.0.2.11\n[IKE] <ims0|2> CHILD_SA ims0{4} established y\n[IKE] <ims0|2> padding padding padding padding\n";
+            assert!(new.len() > old.len());
+            runner.set_file(&engine.shared.charon_log, new);
+            assert_eq!(
+                engine.fresh_pcscf_since(&runner, mark),
+                Some("192.0.2.11".to_string())
+            );
+        }
+
+        #[test]
         fn terminate_is_scoped_to_this_lines_connection() {
             let runner = MockCommandRunner::new();
             let engine = strongswan_engine();
@@ -996,26 +1329,102 @@ mod tests {
             );
         }
 
-        #[test]
-        fn terminate_is_forced_and_bounded() {
-            let runner = MockCommandRunner::new();
-            strongswan_engine().terminate(&runner);
-            let calls = runner.run_calls.lock().unwrap();
-            let want: Vec<String> = [
+        const ENV: &str = "STRONGSWAN_CONF=/etc/strongswan-shared.conf";
+        const LIST_KEY: &str = "timeout 10 env STRONGSWAN_CONF=/etc/strongswan-shared.conf swanctl --list-sas --ike ims0";
+
+        fn argv(parts: &[&str]) -> Vec<String> {
+            parts.iter().map(|p| p.to_string()).collect()
+        }
+
+        fn graceful_argv() -> Vec<String> {
+            argv(&[
+                "timeout",
+                "8",
+                "env",
+                ENV,
+                "swanctl",
+                "--terminate",
+                "--ike",
+                "ims0",
+                "--timeout",
+                "5",
+            ])
+        }
+
+        fn forced_argv() -> Vec<String> {
+            argv(&[
                 "timeout",
                 "10",
                 "env",
-                "STRONGSWAN_CONF=/etc/strongswan-shared.conf",
+                ENV,
                 "swanctl",
                 "--terminate",
                 "--ike",
                 "ims0",
                 "--force",
-            ]
-            .map(String::from)
-            .to_vec();
-            assert_eq!(calls.iter().filter(|c| **c == want).count(), 1);
-            assert!(!calls.iter().any(|c| c.contains(&"--timeout".to_string())));
+            ])
+        }
+
+        fn seed_list(runner: &MockCommandRunner, status: i32, stdout: &str) {
+            use std::os::unix::process::ExitStatusExt;
+            runner.set_run_output(
+                LIST_KEY,
+                std::process::Output {
+                    status: std::process::ExitStatus::from_raw(status),
+                    stdout: stdout.as_bytes().to_vec(),
+                    stderr: Vec::new(),
+                },
+            );
+        }
+
+        fn assert_terminate_invariants(runner: &MockCommandRunner) {
+            let calls = runner.run_calls.lock().unwrap();
+            assert!(
+                !calls
+                    .iter()
+                    .any(|c| c.contains(&"--force".to_string())
+                        && c.contains(&"--timeout".to_string())),
+                "--timeout cancels --force's no-wait behaviour"
+            );
+            assert!(
+                runner.sleeps.lock().unwrap().is_empty(),
+                "teardown waits on the ePDG's acknowledgement, never a fixed delay"
+            );
+        }
+
+        #[test]
+        fn an_acknowledged_graceful_terminate_is_not_forced() {
+            let runner = MockCommandRunner::new();
+            seed_list(&runner, 0, "");
+            strongswan_engine().terminate(&runner);
+            let calls = runner.run_calls.lock().unwrap();
+            assert_eq!(calls[0], graceful_argv());
+            assert!(!calls.contains(&forced_argv()));
+            drop(calls);
+            assert_terminate_invariants(&runner);
+        }
+
+        #[test]
+        fn an_unacknowledged_graceful_terminate_is_forced() {
+            let runner = MockCommandRunner::new();
+            seed_list(&runner, 0, "ims0: #1, ESTABLISHED, IKEv2, aa_i* bb_r\n");
+            strongswan_engine().terminate(&runner);
+            let calls = runner.run_calls.lock().unwrap();
+            assert_eq!(calls[0], graceful_argv());
+            assert_eq!(calls.iter().filter(|c| **c == forced_argv()).count(), 1);
+            drop(calls);
+            assert_terminate_invariants(&runner);
+        }
+
+        #[test]
+        fn a_failed_presence_query_is_forced() {
+            let runner = MockCommandRunner::new();
+            seed_list(&runner, 256, "");
+            strongswan_engine().terminate(&runner);
+            let calls = runner.run_calls.lock().unwrap();
+            assert_eq!(calls.iter().filter(|c| **c == forced_argv()).count(), 1);
+            drop(calls);
+            assert_terminate_invariants(&runner);
         }
 
         #[test]
