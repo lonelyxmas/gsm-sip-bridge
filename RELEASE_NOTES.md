@@ -1,9 +1,6 @@
 # Release Notes
 
-<!-- Rename the "## Unreleased" heading to the real "## vX.Y.Z" at release
-     time — publish.yml's notes extractor matches ^## v${TAG}$ exactly, so an
-     "Unreleased" heading is not picked up for the GitHub release. -->
-## Unreleased
+## v8.20.0
 
 - **A carrier-deleted ePDG session now recovers cleanly** -- When the carrier deleted a VoWiFi line's whole IKE session (not just its data tunnel), the line stayed unreachable for minutes and was then restarted a second time by its own supervisor. Now: a lost session is told apart from a lost tunnel, rebuilt, and the IMS agent restarted once, with the log naming the cause (`carrier DELETE`, `dead-peer timeout` or `unknown`). After any rebuild that restarts the agent, the supervisor waits up to 20 seconds for the new negotiation and takes the P-CSCF from it, so the old session's address is no longer mistaken for a change. A tunnel teardown now waits for the ePDG to acknowledge the delete (5 seconds) before forcing it, with no fixed delay. Leaked Gm IPsec state is cleared before each agent start, so repeated restarts no longer accumulate stale SAs (strongSwan engine only). `[alerts.tunnel_failure]` also fires when a line's tunnel is rebuilt 3 or more times within `unhealthy_sec`, and its text names the last loss cause. No configuration change (#106; the extra delay on a not-yet-acknowledged teardown is #120).
 - **AMR and Opus toward the phone** -- The phone or PBX leg of a VoWiFi or VoLTE call can now use AMR-WB, AMR-NB or Opus, which cuts the audio bandwidth to the phone (AMR-WB is about 12.65 kbit/s against G.722's 64). With no config change, a phone or PBX that prefers AMR or Opus can now negotiate it; one that does not still gets G.722 or PCMU. New `[sip].codecs` sets the order explicitly (`PCMU` is required), and `[sip].amr_octet_align` (default `true`) chooses octet-aligned or bandwidth-efficient AMR for calls the bridge offers. The bridge still decodes and re-encodes the audio; passthrough is #111. Call history shows the phone's codec. Circuit-switched calls are unchanged (#109).
