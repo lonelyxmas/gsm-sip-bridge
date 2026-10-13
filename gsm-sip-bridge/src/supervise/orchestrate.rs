@@ -1635,7 +1635,7 @@ fn start_vowifi_line_strongswan(
     let _ = runner.write_file(Path::new(&line.pcscf_source_path), &pcscf);
 
     // Shared with the agent loop: set while a rebuild is syncing the P-CSCF.
-    let rebuild_gate = Arc::new(AtomicBool::new(false));
+    let rebuild_gate = Arc::new(RebuildGate::default());
     start_line_tail(
         ctx,
         idx,
@@ -1699,7 +1699,7 @@ fn start_vowifi_line_strongswan(
         // take many seconds, and an agent that exits meanwhile must not be
         // respawned against the old P-CSCF (specs/087 R5). Released below
         // unless this tick turns out to renegotiate.
-        rebuild_gate.store(true, Ordering::SeqCst);
+        rebuild_gate.close();
         let outcome = line_supervisor::tick_steady_state(
             &engine,
             runner.as_ref(),
@@ -1713,7 +1713,7 @@ fn start_vowifi_line_strongswan(
                 if line_supervisor::recovery_renegotiates(reason)
         );
         if !renegotiated {
-            rebuild_gate.store(false, Ordering::SeqCst);
+            rebuild_gate.open();
         }
         if rebuilds.tick(std::time::Instant::now()) {
             println!("[supervise] line {idx}: tunnel no longer flapping");
@@ -1814,7 +1814,7 @@ fn start_vowifi_line_strongswan(
                     }
                     let _ =
                         runner.run(&["pkill", "-f", &format!("vowifi-ims-agent --line {idx}$")]);
-                    rebuild_gate.store(false, Ordering::SeqCst);
+                    rebuild_gate.open();
                     if rebuilds.record(std::time::Instant::now()) {
                         println!(
                             "[supervise] line {idx}: tunnel flapping ({} rebuilds within {}s)",
@@ -1870,6 +1870,27 @@ fn repair_line_veth(runner: &dyn CommandRunner, idx: u32, netns: &str, line: &Li
     match epdg_iface::ensure_line_veth(runner, &veth) {
         Ok(()) => println!("[supervise] line {idx}: veth missing; rebuilt"),
         Err(e) => eprintln!("[supervise] line {idx}: veth missing and rebuild failed: {e}"),
+    }
+}
+
+/// The per-line "tunnel rebuild in progress" gate shared by the steady loop and
+/// the agent loop (specs/087, research R5). `flag` is what the agent loop waits
+/// on; `spawn` makes its check-then-spawn atomic against [`Self::close`].
+#[derive(Default)]
+struct RebuildGate {
+    flag: AtomicBool,
+    spawn: Mutex<()>,
+}
+
+impl RebuildGate {
+    /// Blocks only while an agent spawn is in flight, then closes the gate.
+    fn close(&self) {
+        let _slot = self.spawn.lock().unwrap();
+        self.flag.store(true, Ordering::SeqCst);
+    }
+
+    fn open(&self) {
+        self.flag.store(false, Ordering::SeqCst);
     }
 }
 
@@ -2025,7 +2046,7 @@ fn start_line_tail(
     line: &LineResolutionEntry,
     usim_holder: &Arc<Mutex<Option<Arc<ChildHandle>>>>,
     initial_pcscf: String,
-    rebuild_gate: Arc<AtomicBool>,
+    rebuild_gate: Arc<RebuildGate>,
 ) {
     let runner = ctx.runner;
     let bin = ctx.bin;
@@ -2093,7 +2114,7 @@ fn start_line_tail(
                 // (specs/087, R5). Before taking the shutdown guard, which it
                 // must not hold while waiting.
                 wait_for_rebuild_gate(
-                    &rebuild_gate,
+                    &rebuild_gate.flag,
                     runner.as_ref(),
                     super::engines::POST_RECOVERY_PCSCF_WAIT + Duration::from_secs(5),
                     &|| *shutting_down.read().unwrap(),
@@ -2101,6 +2122,16 @@ fn start_line_tail(
                 let guard = shutting_down.read().unwrap();
                 if *guard {
                     return;
+                }
+                // Check-and-spawn is atomic against `RebuildGate::close`: the
+                // slot is held until the spawn is done, so a rebuild that
+                // closes the gate either runs first (we see it and wait
+                // again) or after the spawn (and its `pkill` then restarts
+                // this very agent). Taken after the shutdown guard, the same
+                // order `close` is called in, so the two cannot deadlock.
+                let spawn_slot = rebuild_gate.spawn.lock().unwrap();
+                if rebuild_gate.flag.load(Ordering::SeqCst) {
+                    continue;
                 }
                 if clear_gm_state {
                     clear_line_gm_state(runner.as_ref(), idx, &netns);
@@ -2121,6 +2152,7 @@ fn start_line_tail(
                     ])
                     .capture_stdout_to(agent_log.clone()),
                 );
+                drop(spawn_slot);
                 let Ok(handle) = handle else {
                     drop(guard);
                     eprintln!("[supervise] line {idx}: failed to spawn vowifi-ims-agent");
@@ -2381,7 +2413,7 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
         line,
         &usim_holder,
         pcscf.clone(),
-        Arc::new(AtomicBool::new(false)),
+        Arc::new(RebuildGate::default()),
     );
 
     let mut current_pcscf = pcscf;
@@ -3147,6 +3179,24 @@ mod tests {
             assert_eq!(got, None);
             assert_eq!(reads.get(), 0);
             assert!(runner.sleeps.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn closing_the_gate_waits_out_an_in_flight_spawn() {
+            let gate = Arc::new(RebuildGate::default());
+            let slot = gate.spawn.lock().unwrap();
+            let g = Arc::clone(&gate);
+            let closer = std::thread::spawn(move || g.close());
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(
+                !gate.flag.load(Ordering::SeqCst),
+                "close() must not complete while a spawn holds the slot"
+            );
+            drop(slot);
+            closer.join().unwrap();
+            assert!(gate.flag.load(Ordering::SeqCst));
+            gate.open();
+            assert!(!gate.flag.load(Ordering::SeqCst));
         }
 
         #[test]
