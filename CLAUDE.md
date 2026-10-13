@@ -1,7 +1,7 @@
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan at
-`specs/087-ike-sa-loss-recovery/plan.md`.
+`specs/088-multipart-sip-bodies/plan.md`.
 <!-- SPECKIT END -->
 
 ## Pre-commit Checklist
