@@ -177,24 +177,24 @@ All paths are relative to the repo root. `session.rs` means `gsm-sip-bridge/src/
 
 **Goal**: FR-015. The log distinguishes the two shapes, and the policy is the same for both.
 
-- [ ] T022 [US3] Write failing tests in `session.rs`:
+- [X] T022 [US3] Write failing tests in `session.rs`:
   - `<registration state="terminated">` whose current contact is `terminated/deactivated` gives `scope == IdentityDeregistered` and `event == Deactivated` (Story 3, scenario 1).
   - `<registration state="active">` with the current contact `terminated/rejected` alongside another device's `active` contact gives `scope == BindingRemoved` and `event == Rejected` (scenario 2).
   - The #117 two-AOR body (both registrations terminated) gives `IdentityDeregistered`.
   - The bare fixtures without `<registration>` give `BindingRemoved`.
-- [ ] T023 [US3] Compute `scope` in `classify_reg_notify` per research R6 and add `scope` to the per-NOTIFY log line when an event is applied. Commit: `feat(ims): tell identity deregistration from a removed binding in the reg-event log`
+- [X] T023 [US3] Compute `scope` in `classify_reg_notify` per research R6 and add `scope` to the per-NOTIFY log line when an event is applied. Commit: `feat(ims): tell identity deregistration from a removed binding in the reg-event log`
 
 ---
 
 ## Phase 6: Polish and cross-cutting
 
-- [ ] T024 [P] Document `reg_rejected_cooldown_sec` (commented out at its default) under `[vowifi]`, `[[vowifi.line]]`, `[volte]` and `[[volte.line]]` in `config.toml.example` and `docs/configuration.md`
-- [ ] T025 [P] Add a short reg-event NOTIFY section to `docs/observability.md` (it has none today) with the new fields and messages from `contracts/observability.md`
-- [ ] T026 Add the unreleased entries:
+- [X] T024 [P] Document `reg_rejected_cooldown_sec` (commented out at its default) under `[vowifi]`, `[[vowifi.line]]`, `[volte]` and `[[volte.line]]` in `config.toml.example` and `docs/configuration.md`
+- [X] T025 [P] Add a short reg-event NOTIFY section to `docs/observability.md` (it has none today) with the new fields and messages from `contracts/observability.md`
+- [X] T026 Add the unreleased entries:
   - **RELEASE_NOTES.md:** bold only the summary phrase, with a plain description after it. One entry for the #124 loop fix and one for the per-event policy and cooldown key.
   - **CHANGELOG.md:** following the existing format.
   - Commit: `docs: release notes and config docs for reg-event attribution (#124)`.
-- [ ] T027 Final gate: `make format && make lint && make test` (quickstart Q0). Grep the diff for anything that looks like a real MSISDN, IMEI or IP
+- [X] T027 Final gate: `make format && make lint && make test` (quickstart Q0). Grep the diff for anything that looks like a real MSISDN, IMEI or IP
 - [ ] T028 Live gate Q2 (blocking): on the local Vodafone VoWiFi rig, confirm `attribution=contact-addr own_entries=2` on the initial registration's NOTIFY and after one renewal. If it does not match, stop and revisit research R1 before merging
 - [ ] T029 Live gate Q1 (blocking for SC-001): on a carrier that retires replaced bindings (Jio Pi, or the #124 reporter's build), run ≥ 3 h. The `replaced binding retired` count should be close to the renewal count, with zero `our current binding was deregistered` lines and renewals at the normal cadence only
 - [ ] T030 Live check Q3: `vowifi-status` / `volte-status` print `rejection_cooldown: none`

@@ -106,6 +106,42 @@ routine daemon restart doesn't lose in-flight events. See
 `specs/014-vowifi-metrics-restore/contracts/observability-protocol.md` for
 the wire format.
 
+## Reg-event NOTIFY logs
+
+Every reg-event `NOTIFY` the IMS agent receives (VoWiFi and VoLTE alike) logs
+one line saying what it meant for the line's current binding (specs/089). The
+field names are stable; grep for them.
+
+| Field | Example | Meaning |
+|---|---|---|
+| `attribution` | `contact-addr` | How the line's current entries were found: `contact-addr` (the address it registered), `imei` (IMEI echoed on an entry with no address), `sole-contact` or `none` |
+| `contact_addr` | `10.0.0.1:5070` | The address the current registration advertised |
+| `own_entries` | `2` | Entries for the current binding (one per public identity) |
+| `retired_entries` | `1` | Entries echoing the IMEI at another address: a binding a renewal replaced |
+| `contact_states` | `active/registered` | `state/event` of each current entry |
+| `applied` | `rejected` | The event acted on, the most restrictive one (`deactivated`, `unregistered`, `probation`, `rejected`), or `none` |
+| `retry_after_secs` | `600` | The longest `retry-after` the network gave, when present |
+| `scope` | `binding-removed` | When an event is applied: `identity-deregistered` (the whole public identity) or `binding-removed` (only this binding) |
+| `subscription_state` | `active;expires=600000` | The `Subscription-State` header, verbatim |
+| `body` | reginfo XML | The full document |
+
+Messages:
+
+- `reg-event NOTIFY: our current binding was deregistered` (WARN): an event was applied.
+- `reg-event NOTIFY for our binding` (INFO): the current binding is listed and nothing changed.
+- `reg-event NOTIFY, nothing attributable to our current binding` (INFO): none of the entries is the current binding.
+- `replaced binding retired` (INFO, one per entry, with `retired_addr`, `state`, `event` and `contact_addr`): the network retired a binding a renewal replaced. Expected about once per renewal on carriers that do this; never acted on.
+
+What the agent then does is logged as one of:
+
+- `re-registering now: the network deactivated our binding` (`registered_secs_ago`, `counted`)
+- `the network dropped our binding; retrying on backoff` (`event`, `registered_secs_ago`, `retry_in_secs`)
+- `the network rejected our registration; holding off` (`cooldown_secs`, `retry_after_secs`, `next_attempt_at`), then `ending call: the network rejected our registration` if a call was up, and `rejection cooldown over; trying to register once` when the cooldown ends
+
+During a rejection cooldown, `vowifi-status`/`volte-status` read `state: Failed`,
+`can_answer: false`, and `rejection_cooldown: until <time> (next attempt in <N>s)`;
+otherwise `rejection_cooldown: none`.
+
 ## Grafana dashboard
 
 The "GSM-SIP Bridge" dashboard is auto-provisioned on first boot of the
