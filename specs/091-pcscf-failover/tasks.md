@@ -385,15 +385,15 @@ logged.
 
 ## Phase 8: Polish & cross-cutting
 
-- [ ] T042 [P] Add a P-CSCF section to the operator docs under `docs/`, next to the vowifi status and troubleshooting
+- [X] T042 [P] Add a P-CSCF section to the operator docs under `docs/`, next to the vowifi status and troubleshooting
   section that 090 extended. Cover:
   - the `.pool` and `.state` files;
   - the two new status lines;
   - what marks and what never does;
   - how to clear state (delete `/tmp/pcscf-N.state` and restart the agent).
-- [ ] T043 [P] Update `RELEASE_NOTES.md` and `CHANGELOG.md`. Bold only the summary (memory: release notes bold
+- [X] T043 [P] Update `RELEASE_NOTES.md` and `CHANGELOG.md`. Bold only the summary (memory: release notes bold
   scope), for example `**P-CSCF failover**`, followed by a plain-text description.
-- [ ] T044 Run quickstart Q0 in full. Confirm `make lint` is clean across all targets and that no test or fixture
+- [X] T044 Run quickstart Q0 in full. Confirm `make lint` is clean across all targets and that no test or fixture
   contains a real address or number (`grep -rn` the diff for anything outside the placeholders listed at the top).
 - [ ] T045 Live gate quickstart Q2 and Q3 on the Jio Pi (blocking: SC-001, SC-004, SC-005, R9). Record the
   `"P-CSCF marked unavailable"` / `"failing over"` lines and the `vowifi-status` output (addresses redacted) in the
@@ -450,3 +450,26 @@ Then:      T017 → T018 → T014/T019 → T020 → T015/T021      ‖      T022
 - **Then US3 and US4** (P2): bounded exhaustion and restart memory. They can land in either order.
 - **Then US5** (P3): status and log polish. Its fields can land earlier if they help with debugging US1.
 - Commit after every task or test+implementation pair, with `make format && make lint && make test` green each time.
+
+---
+
+## Implementation notes (where the build departed from the task text)
+
+- **T013**: `register_session` opens the modem before it sends anything, so a REGISTER against a local fake registrar
+  cannot run in CI. Two things cover it instead:
+  - the `Retry-After` parsing tests (`ims::tests::retry_after_reads_seconds_and_ignores_comments`);
+  - the `cause_of` table (`pcscf_pool::tests::only_the_pcscfs_own_failures_amount_to_a_cause`).
+
+  `register_checked` reads the header before `cleanup()`.
+- **T014/T020**: the agent tests drive `register_via_pool` and `LoopState::on_renewal_failure` directly. The attempt
+  itself is a real connect to `127.0.0.1`/`127.0.0.2`: a refused TCP connect, or a silent UDP REGISTER. Only what
+  follows the transport (SIM, AKA) is stubbed, with the justification at the stub.
+- **T015**: the endpoint-failure and keepalive marks are covered through `mark_active_pcscf`. Two things have no new
+  test:
+  - `probe_gm_connection`'s new return value needs a live session and Gm listener;
+  - the mid-call deferral is the existing `MaintenancePolicy` path, unchanged.
+- **T036**: the startup wait uses the existing `watchdog::Phase::Dormant` ("asleep by design, never a stall") and
+  re-enters `Startup` afterwards, rather than adding a `PcscfWait` phase.
+- **T040**: the reply carries the P-CSCF status as one boxed `pcscf: Option<PcscfStatusReply>`, not three flat
+  fields. Three inline lists tripped `clippy::large_enum_variant` on `ControlMessage`. contracts/control.md is
+  updated to match.
