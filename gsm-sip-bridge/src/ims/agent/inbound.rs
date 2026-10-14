@@ -13,6 +13,7 @@ use super::veth::{spawn_relay, spawn_veth_uas_listener, VETH_INVITE_TIMEOUT};
 use super::{unsupported_required_extensions, CONTROL_TIMEOUT};
 use crate::control::protocol::{BridgeFailureReason, CallStatus};
 use crate::error::{BridgeError, BridgeResult};
+use crate::ims::body;
 use crate::ims::lifecycle::{BridgedCall, CallStage};
 use crate::ims::sdp::{self, NegotiatedCodec};
 use crate::ims::session::{
@@ -113,23 +114,61 @@ pub(super) fn uas_answer_headers(access_network_info: &str) -> [(&str, &str); 3]
     ]
 }
 
-/// Whether this UAS can interpret an inbound INVITE's body as SDP: no
-/// `Content-Type` at all (the long-standing implicit assumption — this is
-/// also what an offerless INVITE looks like, RFC 3261 §14.2/RFC 3264 §3,
-/// handled by [`handle_invite`]'s own empty-body branch rather than here;
-/// specs/047-offerless-invite-sms-reassembly SDP-04), or `application/sdp`
-/// compared with any `;`-delimited parameters ignored. Anything else —
-/// including `multipart/mixed` — is declined rather than scanned as if it
-/// were bare SDP text (specs/045 SDP-05).
-fn invite_content_type_supported(req: &SipRequest) -> bool {
-    match req.header("Content-Type") {
-        None => true,
-        Some(ct) => ct
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .eq_ignore_ascii_case("application/sdp"),
+/// What an inbound INVITE's `415` says this UAS accepts (RFC 3261 §21.4.13),
+/// and what the `OPTIONS` answer advertises (§11.2). RFC 5621 §4.2 makes the
+/// two multipart types mandatory for every SIP UA.
+pub(crate) const INVITE_BODY_ACCEPT: &str =
+    "application/sdp, multipart/mixed, multipart/alternative";
+
+/// What [`handle_invite`] does with an INVITE's body.
+#[derive(Debug, PartialEq, Eq)]
+enum InviteBody {
+    /// No body: RFC 3264 §3's offerless INVITE (specs/047 SDP-04).
+    Offerless,
+    /// The SDP offer, extracted from whatever MIME wrapping it came in.
+    Offer(String),
+    /// A body with no usable SDP: the complete `415`/`400` to send.
+    Refuse { response: String, reason: String },
+}
+
+/// Decides, from the body alone, whether an INVITE is offerless, carries an
+/// offer, or must be refused — the whole of [`handle_invite`]'s body
+/// handling, kept pure so it is testable without the live control channel
+/// and veth listener `handle_invite` needs.
+///
+/// specs/088 (issue #103): the body may be `multipart/*` — T2 sends its SDP
+/// alongside a PIDF-LO location part — so it goes through
+/// [`body::extract_sdp`] instead of the old "only `application/sdp`" gate,
+/// which declined every such call `415`. A body that has no session
+/// description is refused `415` with [`INVITE_BODY_ACCEPT`]; a broken or
+/// ambiguous multipart `400`. Neither is ever scanned as if it were SDP
+/// (specs/045 SDP-05).
+fn invite_body_decision(req: &SipRequest, to_tag: &str) -> InviteBody {
+    match body::extract_sdp(req.header("Content-Type"), &req.body_bytes) {
+        Ok(body::Decoded::Empty) => InviteBody::Offerless,
+        Ok(body::Decoded::Sdp { text, .. }) => InviteBody::Offer(text),
+        Err(rejection) => {
+            let response = if rejection.status() == 415 {
+                build_415_unsupported_media(req, to_tag, INVITE_BODY_ACCEPT)
+            } else {
+                build_uas_response(400, "Bad Request", req, Some(to_tag), None, None)
+            };
+            InviteBody::Refuse {
+                response,
+                reason: rejection.to_string(),
+            }
+        }
+    }
+}
+
+/// The SDP answer an offerless call's `ACK` carries (RFC 3264 §3), decoded
+/// the same way as an INVITE's body (specs/088) — `None` when the ACK has no
+/// body or none this bridge can read as SDP. The ACK itself still arrived;
+/// the caller tells that apart from a timeout.
+fn ack_answer(ack: &SipRequest) -> Option<String> {
+    match body::extract_sdp(ack.header("Content-Type"), &ack.body_bytes) {
+        Ok(body::Decoded::Sdp { text, .. }) => Some(text),
+        Ok(body::Decoded::Empty) | Err(_) => None,
     }
 }
 
@@ -207,51 +246,38 @@ pub(super) fn handle_invite(
 
     sink.send(&build_100_trying(req))?;
 
-    // specs/045 SDP-05: `req.body` was handed to `parse_offer` completely
-    // unconditionally — whatever the `Content-Type` said, or didn't say.
-    // `parse_offer`'s line-scanner has no concept of MIME structure, so a
-    // multipart body's boundary/part-header lines are silently skipped as
-    // unrecognized and its SDP part's `m=`/`c=`/`a=` lines are
-    // indistinguishable, to that scanner, from a bare SDP body's own —
-    // which is why a well-formed multipart body could parse "by accident"
-    // and a malformed one could misfire in stranger ways. Same posture
-    // already established for `MESSAGE` bodies (SMS-06,
-    // `message_content_type_supported`): decline what isn't recognized
-    // instead of guessing at it.
-    if !invite_content_type_supported(req) {
-        let content_type = req.header("Content-Type").unwrap_or("(none)").to_string();
-        tracing::info!(
-            call_id = %call_id,
-            content_type = %content_type,
-            "declining: INVITE body is not one we can interpret as SDP"
-        );
-        sink.send(&build_415_unsupported_media(req, to_tag, "application/sdp"))?;
-        obs.report_call_not_answered(
-            CallStatus::Failed,
-            BridgeFailureReason::BridgeSetupFailed,
-            &caller,
-            started_at,
-        );
-        return Ok(None);
-    }
-
     // specs/047-offerless-invite-sms-reassembly (SDP-04), research.md
     // Decision 1: an INVITE with no body at all is not a malformed offer —
     // it is a different, legal RFC 3264 §3 case (the answerer states the
-    // offer, in the 2xx, and the caller answers it in the ACK). Handled by
-    // its own branch, entirely separate from `parse_offer`'s error path,
-    // so a *genuinely* malformed non-empty body still gets today's
-    // existing behavior unchanged. specs/048 MT-06, research.md Decision
-    // 5: this branch returns before `parse_offer`/`precondition_verdict`
-    // ever run, so an offerless INVITE naturally has zero `a=des:qos`
-    // lines to act on — no special-case interaction needed.
-    if req.body.trim().is_empty() {
-        return handle_offerless_invite(
-            session, req, sink, inbound, ctx, &call_id, &caller, started_at, to_tag,
-        );
-    }
+    // offer, in the 2xx, and the caller answers it in the ACK). specs/048
+    // MT-06, research.md Decision 5: that branch returns before
+    // `parse_offer`/`precondition_verdict` ever run, so an offerless INVITE
+    // naturally has zero `a=des:qos` lines to act on.
+    let offer_sdp = match invite_body_decision(req, to_tag) {
+        InviteBody::Offerless => {
+            return handle_offerless_invite(
+                session, req, sink, inbound, ctx, &call_id, &caller, started_at, to_tag,
+            );
+        }
+        InviteBody::Offer(sdp) => sdp,
+        InviteBody::Refuse { response, reason } => {
+            tracing::info!(
+                call_id = %call_id,
+                reason = %reason,
+                "declining: INVITE body"
+            );
+            sink.send(&response)?;
+            obs.report_call_not_answered(
+                CallStatus::Failed,
+                BridgeFailureReason::BridgeSetupFailed,
+                &caller,
+                started_at,
+            );
+            return Ok(None);
+        }
+    };
 
-    let offer = sdp::parse_offer(&req.body)?;
+    let offer = sdp::parse_offer(&offer_sdp)?;
 
     // The transport this bridge implements is plain `RTP/AVP` — no SRTP, no
     // RTCP feedback profile. An offer naming anything else (`RTP/SAVP`, a
@@ -299,6 +325,18 @@ pub(super) fn handle_invite(
             started_at,
         );
         return Ok(None);
+    }
+
+    // specs/088 FR-018a: the caller's own mandatory segment not yet reserved
+    // is the carrier's to wait for, not ours — the call proceeds (answering
+    // would need an `UPDATE` we don't implement), but say so once.
+    let unmet = sdp::offerer_unmet_mandatory(&offer);
+    if !unmet.is_empty() {
+        tracing::info!(
+            call_id = %call_id,
+            unmet = ?unmet,
+            "offerer reports its own mandatory QoS precondition unmet; proceeding"
+        );
     }
 
     // A carrier's mobile-terminating VoWiFi INVITE often offers no PCMU at
@@ -874,7 +912,9 @@ fn handle_offerless_invite(
     // bridge sends its *own*, redundant `BYE` for a dialog already ended
     // from the other side (code review finding, 2026-08-28).
     let deadline = Instant::now() + OFFERLESS_ACK_TIMEOUT;
-    let mut ack_body: Option<String> = None;
+    // Outer `Some`: the ACK arrived. Inner: the SDP answer it carried, if
+    // its body had a usable one (`ack_answer`).
+    let mut ack: Option<Option<String>> = None;
     let mut caller_bye = false;
     'wait_for_ack: while Instant::now() < deadline {
         while let Ok((msg, req_sink)) = inbound.rx.try_recv() {
@@ -888,7 +928,7 @@ fn handle_offerless_invite(
                 req.header("From").unwrap_or_default(),
             );
             if candidate.method == "ACK" && this_dialog {
-                ack_body = Some(candidate.body.clone());
+                ack = Some(ack_answer(&candidate));
                 break 'wait_for_ack;
             }
             if candidate.method == "BYE" && this_dialog {
@@ -939,7 +979,7 @@ fn handle_offerless_invite(
         tracing::info!(call_id = %call_id, reason, "offerless call answered but not completed; tore it down");
     };
 
-    let Some(ack_body) = ack_body else {
+    let Some(ack_sdp) = ack else {
         // research.md Decision 4: no automatic 2xx retransmission exists in
         // this codebase's transaction-lite design, so a `BYE` — not a
         // second final response — is the honest way to end a dialog whose
@@ -954,7 +994,9 @@ fn handle_offerless_invite(
         return Ok(None);
     };
 
-    let answer = sdp::parse_answer(&ack_body);
+    let answer = ack_sdp
+        .ok_or_else(|| BridgeError::Ims("offerless ACK carried no usable SDP answer".into()))
+        .and_then(|text| sdp::parse_answer(&text));
     let chosen = answer
         .as_ref()
         .ok()
@@ -1363,19 +1405,121 @@ mod tests {
         SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
     }
 
-    /// specs/045 SDP-05: `application/sdp`, and no `Content-Type` at all
-    /// (today's long-standing implicit assumption), are both accepted.
+    /// An INVITE with `content_type` (if any) and `body` verbatim.
+    fn invite_with(content_type: Option<&str>, body: &str) -> SipRequest {
+        let ct_line = content_type
+            .map(|ct| format!("Content-Type: {ct}\r\n"))
+            .unwrap_or_default();
+        let raw = format!(
+            "INVITE sip:me@10.0.0.9:5060 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.1.1.1:5067;branch=z9hG4bKone\r\n\
+             From: <sip:caller@example.net>;tag=abc\r\n\
+             To: <sip:me@example.net>\r\n\
+             Call-ID: c1\r\nCSeq: 1 INVITE\r\n{ct_line}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    const BARE_SDP: &str =
+        "v=0\r\nc=IN IP4 192.0.2.5\r\nm=audio 49170 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+
+    /// The refusal's full response text, or a panic naming what came back.
+    fn refusal(decision: InviteBody) -> String {
+        match decision {
+            InviteBody::Refuse { response, .. } => response,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// specs/088 (#103): T2's `multipart/mixed` INVITE — PIDF-LO first, SDP
+    /// second — is an offer of exactly the SDP part, not a `415`.
     #[test]
-    fn supported_invite_content_types_are_accepted() {
-        assert!(invite_content_type_supported(&invite_with_content_type(
-            Some("application/sdp")
-        )));
-        assert!(invite_content_type_supported(&invite_with_content_type(
-            Some("APPLICATION/SDP")
-        )));
-        assert!(invite_content_type_supported(&invite_with_content_type(
-            None
-        )));
+    fn a_t2_multipart_invite_is_an_offer_of_its_sdp_part() {
+        use crate::ims::body::fixtures::{t2_body, T2_CONTENT_TYPE, T2_SDP};
+        let req = invite_with(Some(T2_CONTENT_TYPE), &t2_body());
+        assert_eq!(
+            invite_body_decision(&req, "tt"),
+            InviteBody::Offer(T2_SDP.to_string())
+        );
+    }
+
+    #[test]
+    fn a_multipart_invite_with_parts_reversed_or_a_quoted_boundary_is_an_offer() {
+        let reversed = format!(
+            "--x y\r\nContent-Type: application/sdp\r\n\r\n{BARE_SDP}\r\n\
+             --x y\r\nContent-Type: application/pidf+xml\r\n\
+             Content-Disposition: render;handling=optional\r\n\r\n<presence/>\r\n--x y--\r\n"
+        );
+        let req = invite_with(Some("multipart/mixed; boundary=\"x y\""), &reversed);
+        assert_eq!(
+            invite_body_decision(&req, "tt"),
+            InviteBody::Offer(BARE_SDP.to_string())
+        );
+    }
+
+    /// The pre-existing shapes are unchanged: bare SDP (typed or untyped) is
+    /// an offer, no body is offerless.
+    #[test]
+    fn plain_sdp_and_no_body_keep_their_existing_meaning() {
+        for ct in [Some("application/sdp"), Some("APPLICATION/SDP"), None] {
+            assert_eq!(
+                invite_body_decision(&invite_with(ct, BARE_SDP), "tt"),
+                InviteBody::Offer(BARE_SDP.to_string()),
+                "{ct:?}"
+            );
+        }
+        assert_eq!(
+            invite_body_decision(&invite_with_content_type(None), "tt"),
+            InviteBody::Offerless
+        );
+        // Content-Length: 0 with a Content-Type is still offerless.
+        assert_eq!(
+            invite_body_decision(&invite_with_content_type(Some("application/sdp")), "tt"),
+            InviteBody::Offerless
+        );
+    }
+
+    /// specs/088 FR-008: a body with no session description is `415` with
+    /// the multipart-aware `Accept`, on the call's own To-tag.
+    #[test]
+    fn a_body_with_no_session_description_is_refused_415() {
+        let pidf_only = "--b\r\nContent-Type: application/pidf+xml\r\n\r\n<presence/>\r\n--b--\r\n";
+        for req in [
+            invite_with(Some("text/plain"), "hello"),
+            invite_with(Some("application/isup"), "x"),
+            invite_with(Some("multipart/mixed;boundary=b"), pidf_only),
+        ] {
+            let response = refusal(invite_body_decision(&req, "tt"));
+            assert!(response.starts_with("SIP/2.0 415"), "{response}");
+            assert!(
+                response.contains(
+                    "Accept: application/sdp, multipart/mixed, multipart/alternative\r\n"
+                ),
+                "{response}"
+            );
+            assert!(response.contains(";tag=tt"), "{response}");
+        }
+    }
+
+    /// specs/088 FR-009: broken or ambiguous multipart is `400`, never
+    /// scanned as SDP.
+    #[test]
+    fn a_malformed_or_ambiguous_multipart_is_refused_400() {
+        let unclosed = format!("--b\r\nContent-Type: application/sdp\r\n\r\n{BARE_SDP}");
+        let two = format!(
+            "--b\r\nContent-Type: application/sdp\r\n\r\n{BARE_SDP}\r\n\
+             --b\r\nContent-Type: application/sdp\r\n\r\n{BARE_SDP}\r\n--b--\r\n"
+        );
+        for body in [unclosed, two] {
+            let req = invite_with(Some("multipart/mixed;boundary=b"), &body);
+            let response = refusal(invite_body_decision(&req, "tt"));
+            assert!(
+                response.starts_with("SIP/2.0 400 Bad Request"),
+                "{response}"
+            );
+            assert!(response.contains(";tag=tt"), "{response}");
+        }
     }
 
     fn invite_with_body(body: &str) -> SipRequest {
@@ -1392,31 +1536,69 @@ mod tests {
         SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
     }
 
+    fn ack_with(content_type: Option<&str>, body: &str) -> SipRequest {
+        let mut req = invite_with(content_type, body);
+        req.method = "ACK".into();
+        req
+    }
+
+    /// specs/088 T027: an offerless call's ACK is decoded like an INVITE.
+    #[test]
+    fn an_acks_sdp_answer_is_decoded_from_any_body_shape() {
+        let multipart = format!(
+            "--b\r\nContent-Type: application/pidf+xml\r\n\r\n<presence/>\r\n\
+             --b\r\nContent-Type: application/sdp\r\n\r\n{BARE_SDP}\r\n--b--\r\n"
+        );
+        assert_eq!(
+            ack_answer(&ack_with(Some("multipart/mixed;boundary=b"), &multipart)).as_deref(),
+            Some(BARE_SDP)
+        );
+        assert_eq!(
+            ack_answer(&ack_with(Some("application/sdp"), BARE_SDP)).as_deref(),
+            Some(BARE_SDP)
+        );
+        let unclosed = "--b\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n";
+        for (ct, body) in [
+            (Some("multipart/mixed;boundary=b"), unclosed),
+            (Some("text/plain"), "hello"),
+            (Some("application/sdp"), ""),
+            (None, ""),
+        ] {
+            assert_eq!(ack_answer(&ack_with(ct, body)), None, "{ct:?} {body:?}");
+        }
+    }
+
     /// specs/047-offerless-invite-sms-reassembly (SDP-04), T018: an INVITE
     /// with no body at all — RFC 3261 §14.2/RFC 3264 §3's offerless case —
     /// is what `handle_invite` routes to `handle_offerless_invite` instead
-    /// of `sdp::parse_offer`. The branch condition itself
-    /// (`req.body.trim().is_empty()`) is a one-line check with no
-    /// `handle_invite`-level unit-test seam (the function needs a live
-    /// control-channel/veth-listener socket this codebase's test suite
-    /// doesn't stand up — see quickstart.md), so it is pinned directly
-    /// here, the same granularity this module's other pure predicates
-    /// (`invite_content_type_supported`) are already tested at.
+    /// of `sdp::parse_offer`. `handle_invite` has no unit-test seam (it
+    /// needs a live control-channel/veth-listener socket this codebase's
+    /// test suite doesn't stand up — see quickstart.md), so the routing
+    /// decision, `invite_body_decision`, is pinned directly here.
     #[test]
     fn an_invite_with_no_body_is_recognized_as_offerless() {
         let offerless = invite_with_content_type(None);
-        assert!(offerless.body.trim().is_empty());
+        assert_eq!(
+            invite_body_decision(&offerless, "tt"),
+            InviteBody::Offerless
+        );
 
         // Content-Length: 0 but an explicit Content-Type still counts as
         // offerless — RFC 3264 §3 cares about the body's presence, not
         // whether a header claimed a type for a body that isn't there.
         let empty_typed_body = invite_with_body("");
-        assert!(empty_typed_body.body.trim().is_empty());
+        assert_eq!(
+            invite_body_decision(&empty_typed_body, "tt"),
+            InviteBody::Offerless
+        );
 
         // Whitespace-only is not a real offer either — RFC 4566's grammar
         // has no such thing as a body that is only line endings.
         let whitespace_only = invite_with_body("\r\n\r\n");
-        assert!(whitespace_only.body.trim().is_empty());
+        assert_eq!(
+            invite_body_decision(&whitespace_only, "tt"),
+            InviteBody::Offerless
+        );
     }
 
     /// specs/047-offerless-invite-sms-reassembly (SDP-04), T019: the
@@ -1429,19 +1611,10 @@ mod tests {
         let ordinary = invite_with_body(
             "v=0\r\nc=IN IP4 10.0.0.5\r\nm=audio 49170 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n",
         );
-        assert!(!ordinary.body.trim().is_empty());
-    }
-
-    /// A `multipart/mixed` (or any other unrecognized) body must be
-    /// declined, not scanned as if it were bare SDP text.
-    #[test]
-    fn an_unrecognised_invite_content_type_is_not_supported() {
-        assert!(!invite_content_type_supported(&invite_with_content_type(
-            Some("multipart/mixed; boundary=abc")
-        )));
-        assert!(!invite_content_type_supported(&invite_with_content_type(
-            Some("application/isup")
-        )));
+        assert!(matches!(
+            invite_body_decision(&ordinary, "tt"),
+            InviteBody::Offer(_)
+        ));
     }
 
     /// The `200 OK` answering a carrier INVITE must state what we accept.

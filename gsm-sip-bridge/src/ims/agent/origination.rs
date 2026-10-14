@@ -13,6 +13,7 @@ use super::call::{ActiveCall, DialogInfo};
 use super::session_refresh;
 use super::veth::{spawn_relay, spawn_veth_uas_listener, VethUasResult, VETH_INVITE_TIMEOUT};
 use crate::error::BridgeResult;
+use crate::ims::body;
 use crate::ims::lifecycle::{BridgedCall, CallStage};
 use crate::ims::sdp::{self, NegotiatedCodec};
 use crate::ims::sip_client::{random_hex, SipResponse};
@@ -766,14 +767,29 @@ impl PendingOrigination {
 
         if resp.status < 200 {
             tracing::info!(status = resp.status, reason = %resp.reason, "provisional response");
+            // The provisional's SDP, decoded like any SIP body (specs/088: it
+            // may be multipart). A body with none we can use is no answer.
+            let provisional_sdp = match body::extract_sdp(
+                resp.header("Content-Type"),
+                resp.body.as_bytes(),
+            ) {
+                Ok(body::Decoded::Sdp { text, .. }) => Some(text),
+                Ok(body::Decoded::Empty) => None,
+                Err(e) => {
+                    tracing::debug!(call_id = %self.call_id, reason = %e, "outbound: provisional body has no usable SDP");
+                    None
+                }
+            };
             // Keep the first provisional SDP we see: with a reliable provisional
             // this is the answer, and the 2xx that follows will be empty.
-            if self.provisional_answer.is_none() && !resp.body.trim().is_empty() {
-                tracing::debug!(
-                    status = resp.status,
-                    "outbound: provisional carried the SDP answer"
-                );
-                self.provisional_answer = Some(resp.body.clone());
+            if self.provisional_answer.is_none() {
+                if let Some(sdp) = &provisional_sdp {
+                    tracing::debug!(
+                        status = resp.status,
+                        "outbound: provisional carried the SDP answer"
+                    );
+                    self.provisional_answer = Some(sdp.clone());
+                }
             }
             self.prack_if_required(session, resp);
             // Relay ringback exactly once, and advance the lifecycle to
@@ -809,8 +825,8 @@ impl PendingOrigination {
             // its shot. The guard exists to stop a *successful* attempt
             // from being redone (e.g. on a retransmit), not to give up
             // after the first unparseable body.
-            if !self.early_media_sent && !resp.body.trim().is_empty() {
-                match sdp::parse_answer(&resp.body) {
+            if let (false, Some(provisional_sdp)) = (self.early_media_sent, &provisional_sdp) {
+                match sdp::parse_answer(provisional_sdp) {
                     Ok(early_answer) => {
                         self.early_media_sent = true;
                         if let Err(e) = self.rtp_socket.connect(early_answer.remote_rtp) {
@@ -878,12 +894,17 @@ impl PendingOrigination {
         // every 200 OK is empty. Parsing only the 2xx failed the call with
         // "SDP answer missing c= connection address" *after* the carrier had
         // already answered it (measured 2026-08-15).
-        let answer_body = if resp.body.trim().is_empty() {
-            self.provisional_answer.as_deref().unwrap_or(&resp.body)
-        } else {
-            &resp.body
+        //
+        // specs/088: the 2xx body is decoded as MIME (it may be multipart),
+        // exactly like `ims::call::run_call`'s.
+        let answer = match (
+            resp.body.trim().is_empty(),
+            self.provisional_answer.as_deref(),
+        ) {
+            (true, Some(cached)) => sdp::parse_answer(cached),
+            _ => crate::ims::call::answer_sdp(resp).and_then(|text| sdp::parse_answer(&text)),
         };
-        let answer = match sdp::parse_answer(answer_body) {
+        let answer = match answer {
             Ok(a) => a,
             Err(e) => {
                 self.fail(&format!("bad SDP answer: {e}"));
@@ -1780,6 +1801,38 @@ mod tests {
             peer_after_first,
             "a retransmitted provisional must not reconnect the RTP socket"
         );
+    }
+
+    /// specs/088 (Greptile, PR #128): a provisional whose SDP is wrapped in
+    /// `multipart/mixed` still starts early media with just the SDP part, and
+    /// is what an empty `200 OK` later falls back to.
+    #[test]
+    fn a_multipart_provisional_is_decoded_for_early_media_and_the_cached_answer() {
+        let call_id = "out-early-multipart";
+        let (control, _server) = control_pair();
+        let mut session = test_session();
+        let (mut p, _ctrl_tx) = test_pending(call_id, control);
+
+        let sdp = "v=0\r\nc=IN IP4 127.0.0.1\r\nm=audio 40002 RTP/AVP 0\r\n";
+        let mut resp = provisional_183_with_sdp(call_id);
+        resp.headers.push((
+            "Content-Type".to_string(),
+            "multipart/mixed;boundary=b".to_string(),
+        ));
+        resp.body = format!(
+            "--b\r\nContent-Type: application/pidf+xml\r\n\r\n<presence/>\r\n\
+             --b\r\nContent-Type: application/sdp\r\n\r\n{sdp}\r\n--b--\r\n"
+        );
+        assert!(matches!(
+            p.on_carrier_response(&resp, &mut session),
+            OriginationStatus::Pending
+        ));
+        assert!(p.early_media_sent);
+        assert_eq!(
+            p.rtp_socket.peer_addr().unwrap(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40002)
+        );
+        assert_eq!(p.provisional_answer.as_deref(), Some(sdp));
     }
 
     /// A provisional with no SDP body (e.g. a plain `100 Trying`/`180
