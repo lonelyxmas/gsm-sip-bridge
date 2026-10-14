@@ -129,7 +129,7 @@ real parsed `SipRequest`s; no mocks. Fixtures are synthetic only
 - [X] T034 [P] Add a `RELEASE_NOTES.md` entry under a new unreleased heading: bold one-line summary only (memory: bold only the summary), then plain text covering multipart INVITEs (#103, regression since v8.15.0), the precondition answer, ACK/2xx decoding, OPTIONS `Accept`, SMS media type; credit the #103 reporter
 - [X] T035 [P] Scan the diff for real numbers / identifiers (`git diff main | grep -E '\+[0-9]{10,}'`) — fixtures must use `+919000000000` and RFC 5737 addresses only (CLAUDE.md)
 - [X] T036 Run `cargo test -p gsm-sip-bridge ims::` and the full `make format && make lint && make test`; confirm zero warnings across all targets
-- [ ] T037 Live regression on Vodafone (local) and Jio (Pi) per `specs/088-multipart-sip-bodies/quickstart.md` §Regression — inbound call with audio, registration stable across OPTIONS keepalives, no `cause=503`
+- [X] T037 Live regression on Vodafone (local) and Jio (Pi) per `specs/088-multipart-sip-bodies/quickstart.md` §Regression — inbound call with audio, registration stable across OPTIONS keepalives, no `cause=503`
 - [ ] T038 Post a comment on #103 asking the reporter for the live T2 retest in `quickstart.md` §Live T2 (after the release is cut)
 
 ---
