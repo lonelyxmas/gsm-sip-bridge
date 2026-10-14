@@ -174,7 +174,7 @@ candidate, with no tunnel rebuild.
     `MaintenancePolicy` defers).
   - In `ping.rs`: `probe_gm_connection` returns `true` exactly on the call that sets `force_renewal` after
     `MAX_RECONNECT_ATTEMPTS`, and `false` otherwise.
-- [ ] T016 [P] [US1] Write failing tests in `line_supervisor.rs` (research R9):
+- [X] T016 [P] [US1] Write failing tests in `line_supervisor.rs` (research R9):
   - `tick_steady_state` with a dead `current_pcscf` but a pool member that answers `tcp_connect_ok_in_netns` never
     returns `Recovered { PcscfUnreachable }` across 2× `pcscf_unreachable_strikes` ticks.
   - With every pool member dead, it still does.
@@ -210,7 +210,7 @@ candidate, with no tunnel rebuild.
   - `probe_gm_connection` returns the escalation `bool`, and `on_idle_tick` marks with `GmKeepalive`.
   - Make T015 pass. Update the doc comment on `on_qualifying_endpoint_failure`, which currently says "spec 091
     builds on this", to describe what it now does. Commit.
-- [ ] T022 [US1] Implement R9 in `line_supervisor.rs` and `orchestrate.rs`:
+- [X] T022 [US1] Implement R9 in `line_supervisor.rs` and `orchestrate.rs`:
   - `tick_steady_state(engine, runner, current_pcscf, current_pool, tracking, poll)` counts reachable as "the
     selection answers, else any other member does".
   - Print `P-CSCF A unreachable; pool member B answers` once per episode, tracked in `SteadyTracking`.

@@ -1779,13 +1779,16 @@ fn start_vowifi_line_strongswan(
         // respawned against the old P-CSCF (specs/087 R5). Released below
         // unless this tick turns out to renegotiate.
         rebuild_gate.close();
-        let outcome = line_supervisor::tick_steady_state(
+        let via_sibling_before = tracking.pcscf_via_sibling;
+        let outcome = line_supervisor::tick_steady_state_with_pool(
             &engine,
             runner.as_ref(),
             &current_pcscf,
+            &current_pool,
             &mut tracking,
             line_supervisor::STEADY_STATE_POLL_INTERVAL,
         );
+        report_pcscf_sibling(idx, &current_pcscf, via_sibling_before, &tracking);
         let renegotiated = matches!(
             outcome,
             line_supervisor::SteadyOutcome::Recovered { reason, .. }
@@ -2022,6 +2025,21 @@ fn publish_pcscf(
     );
     println!("[supervise] line {idx}: P-CSCF pool: {}", pool.join(", "));
     let _ = runner.write_file(Path::new(selection_path), selection);
+}
+
+/// Says once per episode that the selection stopped answering but another pool
+/// member still does, which is why no rebuild follows (specs/091 R9).
+fn report_pcscf_sibling(
+    idx: u32,
+    selection: &str,
+    before: Option<std::net::IpAddr>,
+    tracking: &line_supervisor::SteadyTracking,
+) {
+    if let (None, Some(sibling)) = (before, tracking.pcscf_via_sibling) {
+        println!(
+            "[supervise] line {idx}: P-CSCF {selection} unreachable; pool member {sibling} answers"
+        );
+    }
 }
 
 /// The pool to republish after a healthy steady-state tick, if the advertised
@@ -2603,13 +2621,17 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
         if *guard {
             return;
         }
-        match line_supervisor::tick_steady_state(
+        let via_sibling_before = tracking.pcscf_via_sibling;
+        let outcome = line_supervisor::tick_steady_state_with_pool(
             &engine,
             runner.as_ref(),
             &current_pcscf,
+            &current_pool,
             &mut tracking,
             line_supervisor::SWU_STEADY_STATE_POLL_INTERVAL,
-        ) {
+        );
+        report_pcscf_sibling(idx, &current_pcscf, via_sibling_before, &tracking);
+        match outcome {
             line_supervisor::SteadyOutcome::StillUp => {
                 // Under the shutdown guard: a repair racing teardown would
                 // recreate the pair the plan just deleted.
