@@ -174,6 +174,10 @@ struct Subscription {
     /// A NOTIFY arrived since the last SUBSCRIBE in this dialog went out: the
     /// network has it, so Timer F no longer says anything about the path.
     notified_since_send: bool,
+    /// The expiry the last scheduled refresh was sent against. A refresh is
+    /// due once per expiry: a NOTIFY that does not move it must not make the
+    /// same refresh go out again.
+    refreshed_for: Option<Instant>,
     last_cseq: u32,
     txn: Txn,
 }
@@ -188,6 +192,9 @@ impl Subscription {
     }
 
     fn refresh_due(&self, now: Instant) -> bool {
+        if self.expires_at.is_some() && self.refreshed_for == self.expires_at {
+            return false;
+        }
         match (self.expires_at, self.granted) {
             (Some(expires_at), Some(granted)) => {
                 now + crate::ims::renewal_headroom_for(granted, REFRESH_HEADROOM) >= expires_at
@@ -333,12 +340,14 @@ impl RegSubscription {
                     confirmed: false,
                     timer_n: Some(now + TIMER_N),
                     notified_since_send: false,
+                    refreshed_for: None,
                     last_cseq: sent.cseq,
                     txn,
                 });
             }
             SubKind::Refresh => {
                 if let Some(c) = &mut self.current {
+                    c.refreshed_for = c.expires_at;
                     c.requested_expires = sent.expires;
                     c.notified_since_send = false;
                     c.last_cseq = sent.cseq;
@@ -772,7 +781,7 @@ impl RegSubscription {
                     "reg-event subscription accepted but never confirmed; retrying on backoff"
                 );
                 return None;
-            } else if refresh_due && self.retry_at.is_none() {
+            } else if refresh_due && self.retry_at.is_none() && self.spaced(now) {
                 if has_dialog {
                     return Some(SubAction::SendRefresh {
                         expires: self.min_expires,
@@ -784,10 +793,7 @@ impl RegSubscription {
             }
         }
         let due = self.retry_at.is_some_and(|t| now >= t);
-        let spaced = self
-            .last_sent_at
-            .is_none_or(|last| now >= last + SUB_INITIAL_BACKOFF);
-        if !due || !spaced {
+        if !due || !self.spaced(now) {
             return None;
         }
         match &self.current {
@@ -805,6 +811,12 @@ impl RegSubscription {
                 })
             }
         }
+    }
+
+    /// At least [`SUB_INITIAL_BACKOFF`] since the last SUBSCRIBE (SC-006).
+    fn spaced(&self, now: Instant) -> bool {
+        self.last_sent_at
+            .is_none_or(|last| now >= last + SUB_INITIAL_BACKOFF)
     }
 
     /// The dialog a [`SubAction::SendRefresh`] is sent in.
@@ -2029,6 +2041,31 @@ mod tests {
             ResponseMatch::Current
         );
         assert_eq!(failure(&sub), None);
+    }
+
+    /// A NOTIFY after a refresh that leaves the expiry where it was (here,
+    /// one without `Subscription-State`) must not send the refresh again.
+    #[test]
+    fn a_notify_that_keeps_the_expiry_does_not_resend_the_refresh() {
+        let t0 = Instant::now();
+        let (mut sub, t1) = refreshing(t0);
+        assert!(matches!(
+            sub.on_notify(&notify("sub-a", "ltag-a", None, ""), t1 + secs(1)),
+            NotifyMatch::Current { .. }
+        ));
+        for tick in 1..=60 {
+            assert_eq!(sub.poll(t1 + secs(tick), false), None, "tick {tick}");
+        }
+        // The refresh's 2xx moves the expiry, and with it the next refresh.
+        assert_eq!(
+            sub.on_response(&ok("sub-a", 8, 600), t1 + secs(61)),
+            ResponseMatch::Current
+        );
+        assert_eq!(sub.poll(t1 + secs(61 + 299), false), None);
+        assert_eq!(
+            sub.poll(t1 + secs(61 + 300), false),
+            Some(SubAction::SendRefresh { expires: 3600 })
+        );
     }
 
     /// Expiry never brings a retry forward past the network's `Retry-After`.
