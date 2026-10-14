@@ -33,6 +33,11 @@ const MARK_BASE: Duration = Duration::from_secs(30);
 const MARK_CAP: Duration = Duration::from_secs(1800);
 const MARK_EXTRA: Duration = Duration::from_secs(300);
 
+/// The longest a P-CSCF is ever held unavailable. A `Retry-After` or a stored
+/// expiry beyond it is the network's or the file's error, and must not
+/// overflow `SystemTime` (Greptile, PR #130).
+const MAX_UNAVAILABLE: Duration = Duration::from_secs(24 * 3600);
+
 /// `.state` format version; anything else is ignored as a whole.
 const STATE_VERSION: u32 = 1;
 
@@ -235,10 +240,6 @@ impl PcscfPool {
         dedup(out)
     }
 
-    pub(crate) fn active(&self) -> Option<IpAddr> {
-        self.active
-    }
-
     /// Whether any candidate is eligible now: decides between failing over at
     /// once and the backoff ladder (research R7).
     pub(crate) fn has_unmarked(&self, now: SystemTime) -> bool {
@@ -349,7 +350,8 @@ impl PcscfPool {
         let unavailable = match &cause {
             FailureCause::RetryAfter(d) => *d,
             _ => mark_duration(failures),
-        };
+        }
+        .min(MAX_UNAVAILABLE);
         let mark = Mark {
             until: now + unavailable,
             failures,
@@ -469,11 +471,21 @@ impl PcscfPool {
         }
         self.last_registered = persisted.last_registered.filter(|a| self.known(*a));
         for m in persisted.marks {
+            // An expiry SystemTime cannot hold is a corrupt entry, not a
+            // reason to crash every startup.
+            let Some(until) = UNIX_EPOCH.checked_add(Duration::from_secs(m.until_unix)) else {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %format!("mark for {} has an impossible expiry", m.addr),
+                    "P-CSCF state unreadable; starting clean"
+                );
+                continue;
+            };
             if self.known(m.addr) {
                 self.marks.insert(
                     m.addr,
                     Mark {
-                        until: UNIX_EPOCH + Duration::from_secs(m.until_unix),
+                        until,
                         failures: m.failures,
                         cause: m.cause,
                     },
@@ -886,6 +898,36 @@ mod tests {
         assert_eq!(p.select(later).addr, ip(A));
         let m = p.on_failure(ip(A), FailureCause::Transport, later).unwrap();
         assert_eq!(m.failures, 2);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn an_absurd_retry_after_is_capped_not_a_panic() {
+        let mut p = mem(A, &[A, B]);
+        p.select(t0());
+        let m = p
+            .on_failure(
+                ip(A),
+                FailureCause::RetryAfter(Duration::from_secs(u64::MAX)),
+                t0(),
+            )
+            .unwrap();
+        assert_eq!(m.until, t0() + MAX_UNAVAILABLE);
+    }
+
+    #[test]
+    fn an_impossible_stored_expiry_is_dropped_not_a_panic() {
+        let path = temp_state();
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"last_registered":null,"marks":[{{"addr":"{A}","until_unix":{},"failures":1}}]}}"#,
+                u64::MAX
+            ),
+        )
+        .unwrap();
+        let p = PcscfPool::new(ip(A), ips(&[A, B]), Some(path.clone()));
+        assert!(p.marks.is_empty());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

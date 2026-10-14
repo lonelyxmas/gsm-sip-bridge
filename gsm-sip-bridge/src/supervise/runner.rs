@@ -1014,6 +1014,8 @@ mod mock {
         /// Every path written, in call order — `files` alone cannot show that
         /// one file was written before another.
         pub write_order: Mutex<Vec<std::path::PathBuf>>,
+        /// Paths whose writes fail, to exercise a full or read-only `/tmp`.
+        pub failing_writes: Mutex<Vec<std::path::PathBuf>>,
         pub spawn_specs: Mutex<Vec<ChildSpec>>,
         pub children: Mutex<Map<u64, MockChild>>,
         /// Every requested sleep duration, in call order — recorded instead
@@ -1220,6 +1222,15 @@ mod mock {
         }
 
         fn write_file(&self, path: &Path, contents: &str) -> io::Result<()> {
+            if self
+                .failing_writes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p == path)
+            {
+                return Err(io::Error::other("injected write failure"));
+            }
             self.files
                 .lock()
                 .unwrap()

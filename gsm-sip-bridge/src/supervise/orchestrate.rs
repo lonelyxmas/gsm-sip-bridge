@@ -1106,7 +1106,13 @@ mod resolve_epdg_ip_tests {
     fn publish_pcscf_writes_the_pool_before_the_selection() {
         let runner = MockCommandRunner::new();
         let pool = vec!["10.0.1.10".to_string(), "10.0.0.10".to_string()];
-        publish_pcscf(&runner, 0, "/tmp/pcscf-0", "10.0.0.10", &pool);
+        assert!(publish_pcscf(
+            &runner,
+            0,
+            "/tmp/pcscf-0",
+            "10.0.0.10",
+            &pool
+        ));
         assert_eq!(
             *runner.write_order.lock().unwrap(),
             vec![
@@ -1162,9 +1168,58 @@ mod resolve_epdg_ip_tests {
     }
 
     #[test]
+    fn a_failed_pool_write_is_reported_and_retried_not_recorded() {
+        // Greptile (PR #130): a write that failed must not count as published.
+        let runner = MockCommandRunner::new();
+        let pool_path = PathBuf::from("/tmp/pcscf-0.pool");
+        runner
+            .failing_writes
+            .lock()
+            .unwrap()
+            .push(pool_path.clone());
+        assert!(!publish_pcscf(
+            &runner,
+            0,
+            "/tmp/pcscf-0",
+            "10.0.0.10",
+            &addrs(&["10.0.0.10", "10.0.1.10"])
+        ));
+        assert_eq!(
+            runner.files.lock().unwrap()[&PathBuf::from("/tmp/pcscf-0")],
+            "10.0.0.10",
+            "the selection is still published"
+        );
+        let mut current = Vec::new();
+        republish_pool_after_set_change(
+            &runner,
+            0,
+            "/tmp/pcscf-0",
+            &mut current,
+            addrs(&["10.0.0.10", "10.0.1.10"]),
+        );
+        assert!(
+            current.is_empty(),
+            "still unpublished, so retried next tick"
+        );
+        runner.failing_writes.lock().unwrap().clear();
+        republish_pool_after_set_change(
+            &runner,
+            0,
+            "/tmp/pcscf-0",
+            &mut current,
+            addrs(&["10.0.0.10", "10.0.1.10"]),
+        );
+        assert_eq!(current, addrs(&["10.0.0.10", "10.0.1.10"]));
+        assert_eq!(
+            runner.files.lock().unwrap()[&pool_path],
+            "10.0.0.10\n10.0.1.10\n"
+        );
+    }
+
+    #[test]
     fn publish_pcscf_with_no_pool_publishes_the_selection_as_the_pool() {
         let runner = MockCommandRunner::new();
-        publish_pcscf(&runner, 1, "/tmp/pcscf-1", "10.0.0.10", &[]);
+        assert!(publish_pcscf(&runner, 1, "/tmp/pcscf-1", "10.0.0.10", &[]));
         assert_eq!(
             runner.files.lock().unwrap()[&PathBuf::from("/tmp/pcscf-1.pool")],
             "10.0.0.10\n"
@@ -1705,13 +1760,15 @@ fn start_vowifi_line_strongswan(
         .read_file(&ctx.shared_charon.charon_log)
         .map(|c| super::engines::extract_latest_pcscf_pool(&c, &vowifi_conn_name(idx)))
         .unwrap_or_default();
-    publish_pcscf(
+    if !publish_pcscf(
         runner.as_ref(),
         idx,
         &line.pcscf_source_path,
         &pcscf,
         &current_pool,
-    );
+    ) {
+        current_pool.clear();
+    }
 
     // Shared with the agent loop: set while a rebuild is syncing the P-CSCF.
     let rebuild_gate = Arc::new(RebuildGate::default());
@@ -1825,13 +1882,15 @@ fn start_vowifi_line_strongswan(
                 drop(guard);
                 println!("[supervise] line {idx}: P-CSCF changed ({current_pcscf} -> {new_pcscf}); refreshing");
                 current_pool = engine.latest_pcscf_pool(runner.as_ref());
-                publish_pcscf(
+                if !publish_pcscf(
                     runner.as_ref(),
                     idx,
                     &line.pcscf_source_path,
                     &new_pcscf,
                     &current_pool,
-                );
+                ) {
+                    current_pool.clear();
+                }
                 current_pcscf = new_pcscf;
                 let _ = runner.run(&["pkill", "-f", &format!("vowifi-ims-agent --line {idx}$")]);
             }
@@ -1902,13 +1961,15 @@ fn start_vowifi_line_strongswan(
                             current_pool = engine
                                 .fresh_pcscf_pool_since(runner.as_ref(), mark)
                                 .unwrap_or_default();
-                            publish_pcscf(
+                            if !publish_pcscf(
                                 runner.as_ref(),
                                 idx,
                                 &line.pcscf_source_path,
                                 &p,
                                 &current_pool,
-                            );
+                            ) {
+                                current_pool.clear();
+                            }
                             current_pcscf = p;
                         }
                         None if !stop() => println!(
@@ -2007,24 +2068,40 @@ impl RebuildGate {
 /// re-reads it before every registration attempt. An empty pool (an engine that
 /// logged only the one address) is published as the selection alone, so a
 /// pool left over from a previous run is never mistaken for this one.
+///
+/// Returns whether the pool was written. When it was not, the old pool file is
+/// replaced by the selection alone (best effort), so the agent never pairs a
+/// new selection with an earlier negotiation's pool, and the caller records
+/// nothing as published so the next healthy tick retries (Greptile, PR #130).
+#[must_use]
 fn publish_pcscf(
     runner: &dyn CommandRunner,
     idx: u32,
     selection_path: &str,
     selection: &str,
     pool: &[String],
-) {
+) -> bool {
     let pool: Vec<&str> = if pool.is_empty() {
         vec![selection]
     } else {
         pool.iter().map(String::as_str).collect()
     };
-    let _ = runner.write_file_atomic(
-        &crate::ims::pcscf_files::pool_path(selection_path),
-        &crate::ims::pcscf_files::render_pool(&pool),
-    );
-    println!("[supervise] line {idx}: P-CSCF pool: {}", pool.join(", "));
+    let pool_path = crate::ims::pcscf_files::pool_path(selection_path);
+    let rendered = crate::ims::pcscf_files::render_pool(&pool);
+    let written = match runner.write_file_atomic(&pool_path, &rendered) {
+        Ok(()) => {
+            println!("[supervise] line {idx}: P-CSCF pool: {}", pool.join(", "));
+            true
+        }
+        Err(e) => {
+            eprintln!("[supervise] line {idx}: could not publish the P-CSCF pool: {e}");
+            let alone = crate::ims::pcscf_files::render_pool(&[selection]);
+            let _ = runner.write_file_atomic(&pool_path, &alone);
+            false
+        }
+    };
     let _ = runner.write_file(Path::new(selection_path), selection);
+    written
 }
 
 /// Says once per episode that the selection stopped answering but another pool
@@ -2063,15 +2140,23 @@ fn republish_pool_after_set_change(
     latest: Vec<String>,
 ) {
     if let Some(pool) = steady_pool_update(current_pool, latest) {
-        let _ = runner.write_file_atomic(
+        // Recorded as published only once it is: a failed write is retried on
+        // the next healthy tick rather than forgotten.
+        match runner.write_file_atomic(
             &crate::ims::pcscf_files::pool_path(selection_path),
             &crate::ims::pcscf_files::render_pool(&pool),
-        );
-        println!(
-            "[supervise] line {idx}: P-CSCF pool changed (set): {}; not restarting",
-            pool.join(", ")
-        );
-        *current_pool = pool;
+        ) {
+            Ok(()) => {
+                println!(
+                    "[supervise] line {idx}: P-CSCF pool changed (set): {}; not restarting",
+                    pool.join(", ")
+                );
+                *current_pool = pool;
+            }
+            Err(e) => {
+                eprintln!("[supervise] line {idx}: could not publish the P-CSCF pool: {e}")
+            }
+        }
     }
 }
 
@@ -2571,13 +2656,15 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
 
     println!("[supervise] line {idx}: tunnel UP. P-CSCF: {pcscf}");
     let mut current_pool = engine.latest_pcscf_pool(runner.as_ref());
-    publish_pcscf(
+    if !publish_pcscf(
         runner.as_ref(),
         idx,
         &line.pcscf_source_path,
         &pcscf,
         &current_pool,
-    );
+    ) {
+        current_pool.clear();
+    }
     {
         let mut st = started.lock().unwrap();
         st.started_netns.push(netns.clone());
@@ -2647,7 +2734,16 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
             }
             line_supervisor::SteadyOutcome::PcscfChanged { new_pcscf } => {
                 drop(guard);
-                current_pool = engine.latest_pcscf_pool(runner.as_ref());
+                // This path has never rewritten the selection; the new
+                // negotiation's pool must still reach the agent, so it is
+                // published (pool only) and recorded only once written.
+                republish_pool_after_set_change(
+                    runner.as_ref(),
+                    idx,
+                    &line.pcscf_source_path,
+                    &mut current_pool,
+                    engine.latest_pcscf_pool(runner.as_ref()),
+                );
                 current_pcscf = new_pcscf;
             }
             line_supervisor::SteadyOutcome::Recovered { reason, .. } => {

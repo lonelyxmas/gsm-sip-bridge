@@ -2224,15 +2224,17 @@ impl LoopState {
         }
     }
 
-    /// Marks the active P-CSCF for a failure seen on the live registration —
-    /// spec 090's qualifying endpoint failure, or the Gm keepalive escalation
-    /// (FR-007). Not again while it is already marked: one episode can raise
-    /// both signals, and it must count once. The re-registration they trigger
-    /// then selects the next candidate.
-    fn mark_active_pcscf(&mut self, cause: FailureCause, port: u16) {
-        let Some(addr) = self.pool.active() else {
-            return;
-        };
+    /// Marks `addr` — the P-CSCF of the session the failure was seen on — for
+    /// a failure of the live registration: spec 090's qualifying endpoint
+    /// failure, or the Gm keepalive escalation (FR-007). Not again while it is
+    /// already marked: one episode can raise both signals, and it must count
+    /// once. The re-registration they trigger then selects the next candidate.
+    ///
+    /// The session's own address, not the pool's active one: after a renewal
+    /// through B fails without marking it, the loop is still on A's session
+    /// while the pool already names B, and A's next failure must not land on
+    /// B (`PcscfPool::on_failure` then ignores it as not active, FR-017).
+    fn mark_session_pcscf(&mut self, addr: IpAddr, cause: FailureCause, port: u16) {
         let now = SystemTime::now();
         if self.pool.is_marked(addr, now) {
             return;
@@ -3160,7 +3162,11 @@ impl LoopState {
             p.obs.set_gm_connection_up(false);
         }
         if let Some(cause) = self.endpoint_failure_seen.take() {
-            self.mark_active_pcscf(FailureCause::EndpointFailure(cause), p.reg_cfg.pcscf_port);
+            self.mark_session_pcscf(
+                session.pcscf_addr.ip(),
+                FailureCause::EndpointFailure(cause),
+                p.reg_cfg.pcscf_port,
+            );
         }
     }
 
@@ -3512,7 +3518,11 @@ impl LoopState {
                 &mut self.reconnect_attempts,
                 &mut self.force_renewal,
             ) {
-                self.mark_active_pcscf(FailureCause::GmKeepalive, p.reg_cfg.pcscf_port);
+                self.mark_session_pcscf(
+                    session.pcscf_addr.ip(),
+                    FailureCause::GmKeepalive,
+                    p.reg_cfg.pcscf_port,
+                );
             }
         }
 
@@ -5876,7 +5886,7 @@ mod tests {
         assert!(session.is_ok());
         assert_eq!(*tried.borrow(), vec![lo(1), lo(2)]);
         assert!(pool.is_marked(lo(1), SystemTime::now()));
-        assert_eq!(pool.active(), Some(lo(2)));
+        assert_eq!(pool.snapshot(SystemTime::now()).active, Some(lo(2)));
         assert!(waited.borrow().is_empty());
     }
 
@@ -6142,15 +6152,34 @@ mod tests {
         // FR-007: spec 090's endpoint failure and the Gm keepalive escalation
         // both mark the active P-CSCF; one episode counts once.
         let mut st = failing_over_loop();
-        st.mark_active_pcscf(PoolCause::GmKeepalive, 5060);
+        st.mark_session_pcscf(lo(1), PoolCause::GmKeepalive, 5060);
         assert!(st.pool.is_marked(lo(1), SystemTime::now()));
-        st.mark_active_pcscf(PoolCause::EndpointFailure("subscribe-timeout".into()), 5060);
+        st.mark_session_pcscf(
+            lo(1),
+            PoolCause::EndpointFailure("subscribe-timeout".into()),
+            5060,
+        );
         let snap = st.pool.snapshot(SystemTime::now());
         assert_eq!(snap.unavailable.len(), 1);
         let until = snap.unavailable[0].1;
         let left = until.duration_since(SystemTime::now()).unwrap();
         assert!(left <= Duration::from_secs(330), "counted once: {left:?}");
         assert_eq!(st.pool.select(SystemTime::now()).addr, lo(2));
+    }
+
+    #[test]
+    fn an_old_sessions_failure_never_marks_the_next_candidate() {
+        // Greptile (PR #130): a renewal through B failed without marking it,
+        // so the loop is still on A's session while the pool names B. A's
+        // keepalive escalation must not mark B.
+        let mut st = failing_over_loop();
+        st.on_renewal_failure(lo(1), &io_failure(REFUSED), true, SystemTime::now())
+            .unwrap();
+        assert_eq!(st.pool.select(SystemTime::now()).addr, lo(2));
+        st.on_renewal_failure(lo(2), &rejected(403, None), true, SystemTime::now())
+            .unwrap();
+        st.mark_session_pcscf(lo(1), PoolCause::GmKeepalive, 5060);
+        assert!(!st.pool.is_marked(lo(2), SystemTime::now()));
     }
 
     #[test]
