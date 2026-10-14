@@ -51,7 +51,7 @@ All paths are relative to the repo root:
 
 ## Phase 1: Setup
 
-- [ ] T001 Confirm the baseline on branch `091-pcscf-failover` is green: from the repo root, run
+- [X] T001 Confirm the baseline on branch `091-pcscf-failover` is green: from the repo root, run
   `CARGO_TARGET_DIR=$PWD/target make lint && CARGO_TARGET_DIR=$PWD/target make test`. Stop if anything fails before
   any code is touched.
 
@@ -63,14 +63,14 @@ All paths are relative to the repo root:
 `PcscfPool`. **Behaviour is unchanged at the end of this phase**: the same address is chosen, the same failures
 take the same paths, and nothing is marked yet.
 
-- [ ] T002 [P] Write failing tests in `engines.rs` (beside `a_new_negotiation_replaces_the_previous_pcscf_batch`):
+- [X] T002 [P] Write failing tests in `engines.rs` (beside `a_new_negotiation_replaces_the_previous_pcscf_batch`):
   - `extract_latest_pcscf_pool(log, "ims0")` returns all four addresses of the latest batch, in log order and
     deduplicated. Use the existing facility-tagged charon fixture, including two IPv6 and two IPv4 addresses.
   - A second negotiation replaces the first batch (FR-003).
   - Another connection's lines are ignored.
   - `extract_pcscf_pool_after(log, conn, mark)` returns `None` for an unclosed batch and for a batch before `mark`.
   - `extract_swu_pcscf_pool(log)` collects every `P-CSCF IPV4 ADDRESS` and `P-CSCF IPV6 ADDRESS` address, in order.
-- [ ] T003 Implement T002 in `engines.rs`:
+- [X] T003 Implement T002 in `engines.rs`:
   - The three functions, built on `latest_pcscf_batch`.
   - `TunnelEngine::latest_pcscf_pool(&self, runner) -> Vec<String>` in `line_supervisor.rs`, implemented for
     `StrongswanEngine` and `SwuEngine`, and for the test engine in the `line_supervisor.rs` tests (it returns its

@@ -161,6 +161,10 @@ pub trait TunnelEngine {
     fn is_tunnel_established(&self, runner: &dyn CommandRunner) -> bool;
     /// Latest P-CSCF address from wherever this engine's log records it.
     fn latest_pcscf(&self, runner: &dyn CommandRunner) -> Option<String>;
+    /// Every P-CSCF the latest negotiation advertised, deduplicated, in log
+    /// order (specs/091 R1). Published beside [`Self::latest_pcscf`]; never
+    /// compared by the "P-CSCF changed" check.
+    fn latest_pcscf_pool(&self, runner: &dyn CommandRunner) -> Vec<String>;
     /// Is this line's primary process (charon / the swu dialer) still alive?
     fn is_process_alive(&self, runner: &dyn CommandRunner) -> bool;
     /// Terminates the current negotiation without restarting the process
@@ -655,6 +659,7 @@ mod tests {
         route_repairs: RefCell<u32>,
         established: RefCell<bool>,
         pcscf: RefCell<Option<String>>,
+        pool: RefCell<Vec<String>>,
         alive: RefCell<bool>,
         health: RefCell<SteadyStateHealth>,
         max_attempts: Option<u32>,
@@ -677,6 +682,7 @@ mod tests {
             Self {
                 established: RefCell::new(false),
                 pcscf: RefCell::new(None),
+                pool: RefCell::new(Vec::new()),
                 // Default reachable: every pre-existing test asserts on the
                 // structural checks and must keep passing unchanged.
                 pcscf_reachable: RefCell::new(true),
@@ -709,6 +715,9 @@ mod tests {
         }
         fn latest_pcscf(&self, _runner: &dyn CommandRunner) -> Option<String> {
             self.pcscf.borrow().clone()
+        }
+        fn latest_pcscf_pool(&self, _runner: &dyn CommandRunner) -> Vec<String> {
+            self.pool.borrow().clone()
         }
         fn is_process_alive(&self, _runner: &dyn CommandRunner) -> bool {
             *self.alive.borrow()
