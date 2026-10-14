@@ -378,6 +378,44 @@ after
         assert!(!rendered.contains("@SRC_ADDR@"));
     }
 
+    /// The real template, as the image ships it.
+    const REAL_EPDG_TEMPLATE: &str =
+        include_str!("../../../docker/strongswan/swanctl-epdg.conf.template");
+
+    /// Drops every comment line (first non-whitespace character `#`) and
+    /// keeps every other line, newline included, exactly. charon parses only
+    /// the setting lines, so this is what "renders unchanged" means
+    /// (specs/092 research R2).
+    fn strip_comments(s: &str) -> String {
+        s.split_inclusive('\n')
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect()
+    }
+
+    /// Fixed synthetic parameters for real-template renders (specs/092).
+    fn real_template_params() -> SwanctlEpdgParams<'static> {
+        SwanctlEpdgParams {
+            conn_name: "ims0",
+            imsi: "001010000000001",
+            mcc: "001",
+            mnc: "001",
+            epdg_ip: "192.0.2.1",
+            if_id: "23",
+            updown_script: "/etc/strongswan.d/ims-updown-0.sh",
+            src_addr: None,
+        }
+    }
+
+    #[test]
+    fn real_template_dual_render_matches_the_pre_092_baseline() {
+        // Recorded on the template as it was before specs/092 added the
+        // tunnel_address_family placeholders. The `dual` default must keep
+        // every setting line byte-identical (FR-003, SC-001): never update
+        // this snapshot to make a later change pass.
+        let rendered = render_swanctl_epdg(REAL_EPDG_TEMPLATE, &real_template_params());
+        insta::assert_snapshot!(strip_comments(&rendered));
+    }
+
     #[test]
     fn updown_script_line_0_and_line_1_never_share_netns_or_iface() {
         let line0 = render_updown_script("ims", "tun23");
