@@ -25,6 +25,15 @@ Because every renewal in this bridge is already a full initial registration (new
 
 Spec 090 supplies one of the triggers: a SUBSCRIBE Timer F expiry confirmed by an unanswered keepalive raises a "qualifying endpoint failure".
 
+## Clarifications
+
+### Session 2026-10-14
+
+- Q: After a qualifying failure, when is the attempt through the next unmarked P-CSCF made? → A: Immediately, as a fresh initial registration; the backoff ladder applies only once every candidate is marked.
+- Q: Does a peer closing an established connection (FIN/RST) count as a fatal transport error? → A: No. Only connect refused/timeout or a send failure on a new connection qualifies; a peer close triggers the existing reconnect and qualifies only if that reconnect fails.
+- Q: After an agent restart, does a line that failed over to a working P-CSCF return to the supervisor's selection once its mark expires? → A: No. The last successfully registered P-CSCF is persisted with the marks and goes first on restart while it is still in the pool and unmarked.
+- Q: When every candidate is marked unavailable, which address does each backoff-ladder attempt target? → A: The candidate whose mark expires soonest; ties go to candidate order.
+
 ## User Scenarios & Testing *(mandatory)*
 
 ### User Story 1 - A line moves to another advertised P-CSCF when its own stops answering (Priority: P1)
@@ -73,7 +82,7 @@ When every advertised P-CSCF is marked unavailable (or the pool has one address,
 
 **Acceptance Scenarios**:
 
-1. **Given** pool `[A, B]` with both marked unavailable, **When** the next attempt is due, **Then** it follows the existing backoff ladder, and the agent exits to the supervisor when the existing budget is spent.
+1. **Given** pool `[A, B]` with both marked unavailable and `B`'s mark expiring first, **When** the next attempt is due, **Then** it follows the existing backoff ladder and targets `B`, and the agent exits to the supervisor when the existing budget is spent.
 2. **Given** a single-address pool, **When** that address fails, **Then** behaviour equals today's (backoff, then supervisor), plus the unavailability mark.
 3. **Given** no pool was published (older supervisor, or VoLTE), **When** the agent starts, **Then** it uses the single published address as a one-element pool.
 4. **Given** the supervisor rebuilt the tunnel and a new negotiation advertised `[C, D]`, **When** the agent starts, **Then** its candidates are `[C, D]` and marks for `A` and `B` are gone.
@@ -84,14 +93,15 @@ When every advertised P-CSCF is marked unavailable (or the pool has one address,
 
 If the agent restarts (for any reason) while a P-CSCF is still marked unavailable, and the tunnel's pool has not changed, the restarted agent skips that P-CSCF.
 
-**Why this priority**: The supervisor's single selection always names the same address; without remembered marks, every restart would retry the dead one first.
+**Why this priority**: The supervisor's single selection always names the same address; without remembered marks and a remembered working P-CSCF, every restart would retry the dead one first or abandon a working one.
 
-**Independent Test**: Mark `A` unavailable, restart the agent with the same pool, and confirm the first registration goes to `B`; repeat after the mark expires and confirm `A` is eligible again.
+**Independent Test**: Mark `A` unavailable, restart the agent with the same pool, and confirm the first registration goes to `B`; let the mark expire, restart again, and confirm the line stays on `B`; then mark `B` and confirm `A` is used.
 
 **Acceptance Scenarios**:
 
 1. **Given** `A` is marked unavailable for 10 more minutes and the pool is unchanged, **When** the agent restarts, **Then** its first registration goes to `B`.
-2. **Given** `A`'s mark has expired, **When** the agent restarts, **Then** `A` is eligible again, in its normal order.
+2. **Given** `A`'s mark has expired and the line was last registered through `B`, **When** the agent restarts, **Then** its first registration goes to `B` (the working P-CSCF is kept).
+3. **Given** `A`'s mark has expired and `B` is marked unavailable or no longer in the pool, **When** the agent restarts, **Then** `A` is eligible again, in its normal order.
 
 ---
 
@@ -115,6 +125,7 @@ Status queries show each line's active P-CSCF, the advertised pool, and which ca
 - The pool contains IPv6 and IPv4 addresses: IPv4 candidates are tried first, then IPv6, preserving today's preference.
 - The supervisor's single selection is not in the published pool (inconsistent files): the selection is tried first, then the pool.
 - A fatal transport error on connect to `A` happens at the same moment the tunnel drops: the tunnel being down takes precedence and no mark is set; the existing re-attach path decides.
+- The P-CSCF closes an established connection (as in #124's five peer closures): the existing reconnect runs against the same address; only a failed reconnect marks it unavailable.
 - A qualifying failure is reported by an event belonging to the previous registration (e.g. a late keepalive deadline after a renewal already moved on): ignored; it cannot mark the new endpoint.
 - The pool changes while the line is registered through `B` and `B` is still advertised: the line stays on `B`.
 - The pool changes and `B` (active) is no longer advertised: the supervisor's existing "P-CSCF changed" handling decides, as today; the agent's candidates become the new pool.
@@ -134,23 +145,23 @@ Status queries show each line's active P-CSCF, the advertised pool, and which ca
 
 **Candidates**
 
-- **FR-005**: The agent MUST build an ordered candidate list: the supervisor's single selection first, then the remaining pool addresses with IPv4 before IPv6.
+- **FR-005**: The agent MUST build an ordered candidate list: the last successfully registered P-CSCF first (when it is still in the pool and not marked unavailable), then the supervisor's single selection, then the remaining pool addresses with IPv4 before IPv6.
 - **FR-006**: When no pool is published, the agent MUST treat the single selection as a one-element pool. VoLTE lines MUST use their configured P-CSCF as a one-element pool.
 
 **Qualifying failures**
 
-- **FR-007**: The following MUST mark the current P-CSCF unavailable, but only while the line's tunnel or attachment is up: a REGISTER that receives no response within 128 s; a fatal transport error connecting or sending to the P-CSCF; a qualifying endpoint failure from spec 090; the existing Gm keepalive escalation (keepalive unanswered and reconnects exhausted).
+- **FR-007**: The following MUST mark the current P-CSCF unavailable, but only while the line's tunnel or attachment is up: a REGISTER that receives no response within 128 s; a fatal transport error reaching the P-CSCF (connection refused, connect timeout, or a send failure on a newly opened connection); a qualifying endpoint failure from spec 090; the existing Gm keepalive escalation (keepalive unanswered and reconnects exhausted).
 - **FR-008**: A `503` to REGISTER with `Retry-After` longer than 128 s MUST mark the P-CSCF unavailable for the Retry-After period.
-- **FR-009**: The following MUST NOT mark any P-CSCF unavailable: "network unreachable"/no-route errors; any failure while the tunnel or attachment is down; 4xx/5xx/6xx responses without Retry-After; any reg-event deregistration, including `rejected`.
+- **FR-009**: The following MUST NOT mark any P-CSCF unavailable: "network unreachable"/no-route errors; any failure while the tunnel or attachment is down; 4xx/5xx/6xx responses without Retry-After; any reg-event deregistration, including `rejected`; a peer close (FIN/RST) of an established connection, unless the reconnect that follows fails per FR-007.
 - **FR-010**: Other than per FR-008, an unavailability mark MUST last the RFC 5626 §4.5 retry delay (base 30 s, cap 1800 s, growing with that address's consecutive failures) plus 5 minutes. A successful registration through an address MUST reset its failure count.
 
 **Selection and recovery**
 
-- **FR-011**: After a qualifying failure, the next registration attempt MUST go to the first candidate not marked unavailable, as a full initial registration.
+- **FR-011**: After a qualifying failure, the next registration attempt MUST go to the first candidate not marked unavailable, as a full initial registration, without waiting for a backoff step. Because each failure marks its address, a pool of N addresses yields at most N such immediate attempts before FR-013 applies.
 - **FR-012**: While registrations through the active P-CSCF succeed, renewals MUST keep using it, even after an earlier candidate's mark expires.
-- **FR-013**: When every candidate is marked unavailable, the agent MUST follow the existing renewal backoff ladder and its existing exit to the supervisor; it MUST NOT cycle between candidates faster than that ladder.
-- **FR-014**: A new negotiation's pool MUST replace the candidate list and MUST discard marks for addresses no longer advertised.
-- **FR-015**: Unavailability marks MUST survive an agent restart while they are valid and the pool is unchanged.
+- **FR-013**: When every candidate is marked unavailable, and only then, the agent MUST follow the existing renewal backoff ladder and its existing exit to the supervisor; it MUST NOT cycle between candidates faster than that ladder. Each such attempt MUST target the candidate whose mark expires soonest (ties broken by candidate order).
+- **FR-014**: A new negotiation's pool MUST replace the candidate list and MUST discard marks, and the saved last-registered P-CSCF, for addresses no longer advertised.
+- **FR-015**: Unavailability marks, and the last successfully registered P-CSCF, MUST survive an agent restart while they are valid and the pool is unchanged.
 - **FR-016**: A P-CSCF switch MUST NOT happen during a call; it MUST wait for the first registration after the call ends (existing maintenance deferral).
 - **FR-017**: Failures attributable to a previous registration MUST NOT mark, or move away from, the current endpoint.
 - **FR-018**: Recovery on one line MUST NOT affect other lines' tunnels, P-CSCF state or registrations.
@@ -163,8 +174,8 @@ Status queries show each line's active P-CSCF, the advertised pool, and which ca
 ### Key Entities
 
 - **P-CSCF pool**: the address list from a line's latest tunnel negotiation; replaced wholesale by each new negotiation.
-- **Candidate list**: the pool ordered for selection (single selection first, IPv4 before IPv6).
-- **Active P-CSCF**: the candidate the line is currently registered through, or is attempting.
+- **Candidate list**: the pool ordered for selection (last successfully registered P-CSCF, then single selection, then IPv4 before IPv6).
+- **Active P-CSCF**: the candidate the line is currently registered through, or is attempting. The last one that registered successfully is persisted with the marks and is preferred on restart (FR-005).
 - **Unavailability mark**: per line and address; expiry time and consecutive-failure count; survives agent restarts; dropped when the address leaves the pool.
 - **Qualifying endpoint failure**: a failure attributable to the P-CSCF itself while the tunnel is up (FR-007, FR-008).
 
