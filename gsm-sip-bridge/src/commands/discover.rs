@@ -178,10 +178,23 @@ pub fn resolve_vowifi_lines_from_modems(
 }
 
 pub(crate) fn handle_render_command(args: &crate::cli::RenderArgs) -> ExitCode {
+    match render_asset(&args.asset) {
+        Ok(rendered) => {
+            print!("{rendered}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn render_asset(asset: &crate::cli::RenderAsset) -> Result<String, String> {
     use crate::cli::RenderAsset;
     use crate::supervise::render;
 
-    let rendered = match &args.asset {
+    Ok(match asset {
         RenderAsset::StrongswanConf {
             vici_socket,
             charon_log,
@@ -197,14 +210,10 @@ pub(crate) fn handle_render_command(args: &crate::cli::RenderArgs) -> ExitCode {
             if_id,
             updown_script,
             src_addr,
+            address_family,
         } => {
-            let template = match std::fs::read_to_string(template_path) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("error: could not read {}: {e}", template_path.display());
-                    return ExitCode::FAILURE;
-                }
-            };
+            let template = std::fs::read_to_string(template_path)
+                .map_err(|e| format!("could not read {}: {e}", template_path.display()))?;
             let params = render::SwanctlEpdgParams {
                 conn_name,
                 imsi,
@@ -214,7 +223,7 @@ pub(crate) fn handle_render_command(args: &crate::cli::RenderArgs) -> ExitCode {
                 if_id,
                 updown_script,
                 src_addr: src_addr.as_deref(),
-                address_family: crate::config::TunnelAddressFamily::Dual,
+                address_family: *address_family,
             };
             render::render_swanctl_epdg(&template, &params)
         }
@@ -222,10 +231,7 @@ pub(crate) fn handle_render_command(args: &crate::cli::RenderArgs) -> ExitCode {
             render::render_updown_script(netns, tun_iface)
         }
         RenderAsset::VpcdReaderConf { port } => render::render_vpcd_reader_conf(*port),
-    };
-
-    print!("{rendered}");
-    ExitCode::SUCCESS
+    })
 }
 
 fn write_line_resolution(
@@ -342,4 +348,61 @@ pub fn render_discover_shell_env(resolution: &crate::vowifi::discovery::LineReso
         arr(resolution.circuit_switched_excluded_ports.iter().cloned())
     );
     out
+}
+
+#[cfg(test)]
+mod render_command_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn render_epdg(extra: &[&str]) -> String {
+        let template = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../docker/strongswan/swanctl-epdg.conf.template"
+        );
+        let mut argv = vec![
+            "gsm-sip-bridge",
+            "render",
+            "swanctl-epdg",
+            "--template-path",
+            template,
+            "--conn-name",
+            "ims0",
+            "--imsi",
+            "001010000000001",
+            "--mcc",
+            "001",
+            "--mnc",
+            "001",
+            "--epdg-ip",
+            "192.0.2.1",
+            "--if-id",
+            "23",
+            "--updown-script",
+            "/tmp/u.sh",
+        ];
+        argv.extend_from_slice(extra);
+        let cli = crate::cli::Cli::try_parse_from(argv).expect("parses");
+        let Some(crate::cli::Commands::Render(args)) = cli.command else {
+            panic!("not a render command");
+        };
+        render_asset(&args.asset).expect("renders")
+    }
+
+    #[test]
+    fn render_swanctl_epdg_defaults_to_dual() {
+        let default = render_epdg(&[]);
+        assert_eq!(default, render_epdg(&["--address-family", "dual"]));
+        assert!(default.contains("        vips = 0.0.0.0, ::\n"));
+    }
+
+    #[test]
+    fn render_swanctl_epdg_honours_address_family() {
+        let v4 = render_epdg(&["--address-family", "ipv4"]);
+        assert!(v4.contains("        vips = 0.0.0.0\n"), "{v4}");
+        assert!(
+            v4.contains("                remote_ts = 0.0.0.0/0\n"),
+            "{v4}"
+        );
+    }
 }

@@ -429,6 +429,60 @@ after
         insta::assert_snapshot!(strip_comments(&rendered));
     }
 
+    fn render_family(conn_name: &'static str, family: TunnelAddressFamily) -> String {
+        render_swanctl_epdg(
+            REAL_EPDG_TEMPLATE,
+            &SwanctlEpdgParams {
+                conn_name,
+                address_family: family,
+                ..real_template_params()
+            },
+        )
+    }
+
+    #[test]
+    fn ipv4_and_ipv6_change_only_vips_and_remote_ts() {
+        let dual = strip_comments(&render_family("ims0", TunnelAddressFamily::Dual));
+        for (family, vips, remote_ts) in [
+            (
+                TunnelAddressFamily::Ipv4,
+                "        vips = 0.0.0.0\n",
+                "                remote_ts = 0.0.0.0/0\n",
+            ),
+            (
+                TunnelAddressFamily::Ipv6,
+                "        vips = ::\n",
+                "                remote_ts = ::/0\n",
+            ),
+        ] {
+            let rendered = render_family("ims0", family);
+            assert!(rendered.contains(vips), "{family}: {rendered}");
+            assert!(rendered.contains(remote_ts), "{family}: {rendered}");
+            assert!(!rendered.contains("@VIPS@") && !rendered.contains("@REMOTE_TS@"));
+            let stripped = strip_comments(&rendered);
+            let (a, b): (Vec<_>, Vec<_>) = (dual.lines().collect(), stripped.lines().collect());
+            assert_eq!(a.len(), b.len(), "{family}");
+            for (d, f) in a.iter().zip(&b) {
+                let setting = d.trim_start();
+                if setting.starts_with("vips =") || setting.starts_with("remote_ts =") {
+                    continue;
+                }
+                assert_eq!(d, f, "{family}: only vips/remote_ts may differ");
+            }
+        }
+    }
+
+    #[test]
+    fn two_lines_render_independently() {
+        // Comments name `ims0`, `ims1`, ... as examples; settings must not.
+        let ims0 = strip_comments(&render_family("ims0", TunnelAddressFamily::Dual));
+        let ims1 = strip_comments(&render_family("ims1", TunnelAddressFamily::Ipv4));
+        assert!(ims0.contains("vips = 0.0.0.0, ::\n"));
+        assert!(ims1.contains("vips = 0.0.0.0\n"));
+        assert!(ims0.contains("    ims0 {") && !ims0.contains("ims1"));
+        assert!(ims1.contains("    ims1 {") && !ims1.contains("ims0"));
+    }
+
     #[test]
     fn dual_render_leaves_no_placeholder() {
         let rendered = render_swanctl_epdg(REAL_EPDG_TEMPLATE, &real_template_params());
