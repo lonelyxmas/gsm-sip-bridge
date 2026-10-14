@@ -10,6 +10,16 @@ across releases.
 
 ### Added
 
+- **`tunnel_address_family`.** Which inner address families a VoWiFi line's
+  ePDG tunnel requests and carries: `dual` (default, unchanged), `ipv4` or
+  `ipv6`, under `[vowifi]` and `[[vowifi.line]]`. `ipv4` stops an ePDG that
+  assigns only IPv4 from rejecting each hourly CHILD_SA rekey with
+  `INVALID_SELECTORS`. A `dual` line logs a hint when that happens; an
+  `ipv4`/`ipv6` line ignores P-CSCFs of the other family. Strongswan engine
+  only; `swu` refuses a non-`dual` value
+  ([#126](https://github.com/selvakn/gsm-sip-bridge/issues/126),
+  [#107](https://github.com/selvakn/gsm-sip-bridge/issues/107)).
+
 - **P-CSCF failover.** The supervisor publishes every advertised P-CSCF to
   `/tmp/pcscf-N.pool` beside its unchanged single choice. The IMS agent marks a
   P-CSCF that fails while the tunnel is up (RFC 5626 delay + 5 min, or a long
