@@ -1349,6 +1349,64 @@ mod tests {
         assert_eq!(family_for(&base, "/dev/ttyUSB7"), Some(Dual));
     }
 
+    /// specs/092 US3: each line resolves its own family, matched by serial,
+    /// in both directions of the precedence.
+    #[test]
+    fn each_line_resolves_its_own_family() {
+        use crate::config::TunnelAddressFamily::{Dual, Ipv4};
+        let resolve = |section, line1| {
+            let base = VowifiConfig {
+                tunnel_address_family: section,
+                line_overrides: vec![VowifiLineOverride {
+                    modem_serial: Some("ec20-FEDCBA".to_string()),
+                    tunnel_address_family: Some(line1),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let modems = vec![
+                ready_modem("ec20-ABCDEF", "/dev/ttyUSB3", false, "001010000000001"),
+                ready_modem("ec20-FEDCBA", "/dev/ttyUSB7", false, "001010000000002"),
+            ];
+            let assignment = RoleAssignment::from_probed(&modems, &base.line_overrides, false);
+            let result = resolve_lines(&assignment, &base);
+            let family = |card: &str| {
+                result
+                    .lines
+                    .iter()
+                    .find(|l| l.card_id == card)
+                    .map(|l| l.config.tunnel_address_family)
+            };
+            (family("ec20-ABCDEF"), family("ec20-FEDCBA"))
+        };
+        assert_eq!(resolve(Dual, Ipv4), (Some(Dual), Some(Ipv4)));
+        assert_eq!(resolve(Ipv4, Dual), (Some(Ipv4), Some(Dual)));
+    }
+
+    /// specs/092: a resolution file written before the field existed (a
+    /// `docker restart` keeps `/tmp`) still loads, and reads as `Dual`.
+    #[test]
+    fn older_resolution_entry_without_the_field_reads_dual() {
+        let line = ResolvedLine {
+            config: VowifiConfig {
+                tunnel_address_family: crate::config::TunnelAddressFamily::Ipv4,
+                ..Default::default()
+            },
+            ..resolved_modem_line("ec20-ABCDEF", "/dev/ttyUSB3")
+        };
+        let mut json = serde_json::to_value(LineResolutionEntry::from(&line)).unwrap();
+        let removed = json["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tunnel_address_family");
+        assert!(removed.is_some(), "the field is serialized today");
+        let entry: LineResolutionEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            entry.config.tunnel_address_family,
+            crate::config::TunnelAddressFamily::Dual
+        );
+    }
+
     #[test]
     fn a_configured_lines_msisdn_reaches_the_resolution_entry() {
         let base = VowifiConfig {

@@ -720,6 +720,31 @@ fn build_vowifi(raw: RawVowifi) -> BridgeResult<VowifiConfig> {
         }
     }
 
+    let tunnel_address_family = raw
+        .tunnel_address_family
+        .parse::<TunnelAddressFamily>()
+        .map_err(|e| BridgeError::Config(format!("vowifi.tunnel_address_family {e}")))?;
+    // Checked here, before discovery merges the two levels, so the error can
+    // say which one set it (specs/092 research R5). The swu dialer always
+    // negotiates both families and has no knob for this.
+    if raw.tunnel_engine == "swu" {
+        let narrowed = std::iter::once((
+            "vowifi.tunnel_address_family".to_string(),
+            tunnel_address_family,
+        ))
+        .chain(line_overrides.iter().enumerate().filter_map(|(i, o)| {
+            o.tunnel_address_family
+                .map(|f| (format!("vowifi.line[{i}].tunnel_address_family"), f))
+        }))
+        .find(|(_, f)| *f != TunnelAddressFamily::Dual);
+        if let Some((key, family)) = narrowed {
+            return Err(BridgeError::Config(format!(
+                "{key} = \"{family}\" requires tunnel_engine = \"strongswan\" (the swu \
+                 engine always negotiates both families); remove it or set \"dual\""
+            )));
+        }
+    }
+
     // Derived fields keep their placeholder defaults here and are overwritten
     // per line by `vowifi::discovery::resolve_one_line`. They are not TOML
     // keys — see `raw::RawVowifi`.
@@ -808,10 +833,7 @@ fn build_vowifi(raw: RawVowifi) -> BridgeResult<VowifiConfig> {
             }
             raw.tunnel_engine
         },
-        tunnel_address_family: raw
-            .tunnel_address_family
-            .parse::<TunnelAddressFamily>()
-            .map_err(|e| BridgeError::Config(format!("vowifi.tunnel_address_family {e}")))?,
+        tunnel_address_family,
         vpcd_host: raw.vpcd_host,
         vpcd_port: in_range(raw.vpcd_port, "vowifi.vpcd_port", 1..=65535)?,
         max_lines: in_range(raw.max_lines, "vowifi.max_lines", 1..=64)?,

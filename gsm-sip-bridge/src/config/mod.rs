@@ -3292,4 +3292,108 @@ password = "s3cret"
         ));
         assert_eq!(c.vowifi.tunnel_address_family, TunnelAddressFamily::Ipv4);
     }
+
+    #[test]
+    fn absent_and_explicit_dual_resolve_identically() {
+        let absent = parse(&format!(
+            "{MINIMAL_TOML}\n[[vowifi.line]]\nmodem_port = \"/dev/ttyUSB2\"\n"
+        ));
+        let explicit = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\ntunnel_address_family = \"dual\"\n"
+        ));
+        assert_eq!(
+            absent.vowifi.tunnel_address_family,
+            explicit.vowifi.tunnel_address_family
+        );
+        assert_eq!(absent.vowifi.line_overrides[0].tunnel_address_family, None);
+    }
+
+    #[test]
+    fn line_override_beats_the_section_default_both_ways() {
+        use TunnelAddressFamily::{Dual, Ipv4};
+        let two_lines = |section: &str, line0: &str| {
+            parse(&format!(
+                "{MINIMAL_TOML}\n{section}\n\
+                 [[vowifi.line]]\nmodem_port = \"/dev/ttyUSB2\"\n{line0}\n\
+                 [[vowifi.line]]\nmodem_port = \"/dev/ttyUSB6\"\n"
+            ))
+            .vowifi
+        };
+        let v = two_lines("", "tunnel_address_family = \"ipv4\"");
+        assert_eq!(v.tunnel_address_family, Dual);
+        let overrides: Vec<_> = v
+            .line_overrides
+            .iter()
+            .map(|o| o.tunnel_address_family)
+            .collect();
+        assert_eq!(overrides, [Some(Ipv4), None]);
+
+        let v = two_lines(
+            "[vowifi]\ntunnel_address_family = \"ipv4\"",
+            "tunnel_address_family = \"dual\"",
+        );
+        assert_eq!(v.tunnel_address_family, Ipv4);
+        let overrides: Vec<_> = v
+            .line_overrides
+            .iter()
+            .map(|o| o.tunnel_address_family)
+            .collect();
+        assert_eq!(overrides, [Some(Dual), None]);
+    }
+
+    #[test]
+    fn unknown_tunnel_address_family_is_a_config_error() {
+        for value in ["ip4", "IPv4", "both"] {
+            for (toml, key) in [
+                (
+                    format!("[vowifi]\ntunnel_address_family = \"{value}\"\n"),
+                    "vowifi.tunnel_address_family",
+                ),
+                (
+                    format!(
+                        "[[vowifi.line]]\nmodem_port = \"/dev/ttyUSB2\"\n\
+                         [[vowifi.line]]\nmodem_port = \"/dev/ttyUSB6\"\n\
+                         tunnel_address_family = \"{value}\"\n"
+                    ),
+                    "vowifi.line[1].tunnel_address_family",
+                ),
+            ] {
+                let err = try_parse(&format!("{MINIMAL_TOML}\n{toml}"))
+                    .expect_err(value)
+                    .to_string();
+                assert!(err.contains(key), "{value}: {err}");
+                assert!(err.contains(&format!("{value:?}")), "{value}: {err}");
+                for accepted in ["\"dual\"", "\"ipv4\"", "\"ipv6\""] {
+                    assert!(err.contains(accepted), "{value}: {err}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn swu_refuses_a_non_dual_family() {
+        let swu = |extra: &str| {
+            try_parse(&format!(
+                "{MINIMAL_TOML}\n[vowifi]\ntunnel_engine = \"swu\"\n{extra}"
+            ))
+        };
+        let err = swu("tunnel_address_family = \"ipv4\"\n")
+            .expect_err("section ipv4 under swu")
+            .to_string();
+        assert!(err.contains("vowifi.tunnel_address_family"), "{err}");
+        assert!(err.contains("strongswan"), "{err}");
+
+        let err = swu(
+            "[[vowifi.line]]\nmodem_port = \"/dev/ttyUSB2\"\ntunnel_address_family = \"ipv6\"\n",
+        )
+        .expect_err("line ipv6 under swu")
+        .to_string();
+        assert!(err.contains("vowifi.line[0]"), "{err}");
+        assert!(err.contains("strongswan"), "{err}");
+
+        swu("").expect("no value under swu");
+        swu("tunnel_address_family = \"dual\"\n").expect("section dual under swu");
+        swu("[[vowifi.line]]\nmodem_port = \"/dev/ttyUSB2\"\ntunnel_address_family = \"dual\"\n")
+            .expect("line dual under swu");
+    }
 }
