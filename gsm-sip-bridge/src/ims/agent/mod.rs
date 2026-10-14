@@ -1994,14 +1994,18 @@ impl LoopState {
                 result
             }
             DeregEvent::Unregistered | DeregEvent::Probation => {
-                if self.early_loss_counted {
-                    return Ok(());
-                }
-                self.early_loss_counted = true;
-                if early {
-                    (self.backoff, self.consecutive_renewal_failures) = self.ladder_before_success;
-                }
-                let result = self.count_loss(busy);
+                // A repeat notice of the same loss is not counted again, but
+                // a longer `retry-after` it carries still has to be honoured.
+                let result = if self.early_loss_counted {
+                    Ok(())
+                } else {
+                    self.early_loss_counted = true;
+                    if early {
+                        (self.backoff, self.consecutive_renewal_failures) =
+                            self.ladder_before_success;
+                    }
+                    self.count_loss(busy)
+                };
                 if let Some(floor) = deregistration.retry_after.map(|r| now + r) {
                     self.next_renewal_attempt = self.next_renewal_attempt.max(Some(floor));
                 }
@@ -2448,6 +2452,21 @@ impl LoopState {
     /// `contains("busy")` is what `run_outbound_listener` (`vowifi/mod.rs`)
     /// checks to decide whether to try a different line rather than giving up
     /// outright.
+    /// Why this line must refuse a `PlaceCall` outright, if it must. Refused
+    /// before `CallAttempting`, Agent B treats the line as unavailable and
+    /// tries the next one. During a reg-event `rejected` cooldown the network
+    /// has released this binding (TS 24.229 §5.4.1.5), so an INVITE on it
+    /// would only fail at the carrier, too late for Agent B to move on.
+    fn outbound_refusal(&self) -> Option<&'static str> {
+        if self.busy() {
+            Some("busy")
+        } else if self.rejection.is_some() {
+            Some(reason::REGISTRATION_REJECTED)
+        } else {
+            None
+        }
+    }
+
     fn handle_place_call_request(
         &mut self,
         session: &mut crate::ims::RegisteredSession,
@@ -2457,16 +2476,17 @@ impl LoopState {
         let Ok(mut pending) = place_call_rx.try_recv() else {
             return false;
         };
-        if self.busy() {
+        if let Some(reason) = self.outbound_refusal() {
             tracing::debug!(
                 call_id = %pending.call_id,
-                "outbound: busy with another call, refusing"
+                reason,
+                "outbound: refusing before touching the carrier"
             );
             let _ = write_msg(
                 &mut pending.control,
                 &ControlMessage::CallFailed {
                     call_id: pending.call_id,
-                    reason: "busy".to_string(),
+                    reason: reason.to_string(),
                 },
             );
             return true;
@@ -5038,5 +5058,51 @@ mod tests {
             .expect("never an exit");
         assert!(applied);
         assert!(st.rejection.is_some());
+    }
+
+    /// A later notice of the same loss carrying a longer `retry-after` is
+    /// honoured, though not counted again (PR #125 review).
+    #[test]
+    fn a_repeat_notice_with_a_longer_retry_after_pushes_the_retry_out() {
+        let mut st = LoopState::new();
+        let now = Instant::now();
+        st.last_registered = now - REGISTRATION_SETTLE;
+        st.on_network_deregistration(now, false, &dereg(DeregEvent::Unregistered), COOLDOWN)
+            .expect("below the budget");
+        assert_retry_in(&st, RETRY_INITIAL_BACKOFF);
+
+        st.on_network_deregistration(
+            now,
+            false,
+            &dereg_after(DeregEvent::Probation, 600),
+            COOLDOWN,
+        )
+        .expect("below the budget");
+        assert!(st.next_renewal_attempt >= Some(now + Duration::from_secs(600)));
+        assert_eq!(
+            st.consecutive_renewal_failures, 1,
+            "the same loss, counted once"
+        );
+    }
+
+    /// During a rejection cooldown an outbound call is refused before the
+    /// carrier is touched, so Agent B moves on to another line (PR #125
+    /// review).
+    #[test]
+    fn outbound_calls_are_refused_during_a_rejection_cooldown() {
+        let mut st = LoopState::new();
+        assert_eq!(st.outbound_refusal(), None);
+        st.on_network_deregistration(
+            st.last_registered + Duration::from_secs(1),
+            false,
+            &dereg(DeregEvent::Rejected),
+            COOLDOWN,
+        )
+        .expect("never an exit");
+        assert_eq!(st.outbound_refusal(), Some(reason::REGISTRATION_REJECTED));
+
+        // The cooldown's own attempt starts (`on_idle_tick` takes it).
+        st.rejection.take();
+        assert_eq!(st.outbound_refusal(), None);
     }
 }

@@ -47,7 +47,8 @@ across releases.
 - **Per-event deregistration policy.** `deactivated` re-registers at once,
   `unregistered`/`probation` wait on the backoff (at least the network's
   `retry-after`), and `rejected` ends the call and starts a cooldown that
-  never spends the renewal-failure budget (TS 24.229 §5.1.1.7)
+  never spends the renewal-failure budget and refuses outbound calls so they
+  go out on another line (TS 24.229 §5.1.1.7)
   ([#124](https://github.com/selvakn/gsm-sip-bridge/issues/124)).
 
 - **Carrier-deleted IKE_SA recovered, with its cause.** The supervisor now
