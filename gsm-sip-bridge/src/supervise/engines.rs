@@ -7,6 +7,7 @@
 
 use super::line_supervisor::{SteadyStateHealth, TunnelEngine};
 use super::runner::{ChildHandle, ChildSpec, CommandRunner};
+use crate::config::TunnelAddressFamily;
 use crate::control::protocol::IkeSaLossCause;
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -473,6 +474,10 @@ pub struct StrongswanEngine {
     /// an operator-watched startup sequence needs an actual deadline rather
     /// than retrying forever.
     pub max_establish_attempts: Option<u32>,
+    /// This line's effective `tunnel_address_family` (specs/092). Filters the
+    /// P-CSCFs this engine selects and publishes (FR-013), and gates the
+    /// `INVALID_SELECTORS` rekey hint to `Dual` lines (FR-009a).
+    pub address_family: TunnelAddressFamily,
 }
 
 impl StrongswanEngine {
@@ -1303,6 +1308,7 @@ mod tests {
                 if_id: "23".to_string(),
                 shared: shared_charon(),
                 max_establish_attempts: None,
+                address_family: TunnelAddressFamily::Dual,
             }
         }
 

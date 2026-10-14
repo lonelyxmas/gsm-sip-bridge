@@ -214,6 +214,7 @@ pub(crate) fn handle_render_command(args: &crate::cli::RenderArgs) -> ExitCode {
                 if_id,
                 updown_script,
                 src_addr: src_addr.as_deref(),
+                address_family: crate::config::TunnelAddressFamily::Dual,
             };
             render::render_swanctl_epdg(&template, &params)
         }

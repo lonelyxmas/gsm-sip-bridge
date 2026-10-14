@@ -20,7 +20,7 @@ use super::shutdown::{self, StartedState};
 use super::{daemon_supervisor, epdg_iface, sim_recovery, vpcd};
 use crate::alerts::{self, discord::DiscordClient, AlertContext};
 use crate::config::secret::Secret;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, TunnelAddressFamily};
 use crate::vowifi::discovery::LineResolutionEntry;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -1530,6 +1530,7 @@ pub(super) fn establish_line_tunnel(
         if_id: &if_id,
         updown_script: &updown_path,
         src_addr: src_addr.as_deref(),
+        address_family: TunnelAddressFamily::Dual,
     };
     let swanctl_epdg = super::render::render_swanctl_epdg(&epdg_template, &params);
     let _ = runner.write_file(
@@ -1627,6 +1628,7 @@ pub(super) fn establish_line_tunnel(
         if_id: if_id.clone(),
         shared: Arc::clone(ctx.shared_charon),
         max_establish_attempts,
+        address_family: TunnelAddressFamily::Dual,
     };
     {
         // Greptile P1 (round 3, same design gap): the RwLock guard added for
@@ -1806,6 +1808,7 @@ fn start_vowifi_line_strongswan(
         if_id: line.strongswan_if_id.to_string(),
         shared: Arc::clone(ctx.shared_charon),
         max_establish_attempts: None,
+        address_family: TunnelAddressFamily::Dual,
     };
 
     // Steady-state supervision loop — runs for the container's lifetime.

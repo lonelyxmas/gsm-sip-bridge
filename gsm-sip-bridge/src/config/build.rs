@@ -693,6 +693,14 @@ fn build_vowifi(raw: RawVowifi) -> BridgeResult<VowifiConfig> {
                     )
                 })
                 .transpose()?,
+            tunnel_address_family: l
+                .tunnel_address_family
+                .map(|v| {
+                    v.parse::<TunnelAddressFamily>().map_err(|e| {
+                        BridgeError::Config(format!("vowifi.line[{i}].tunnel_address_family {e}"))
+                    })
+                })
+                .transpose()?,
         });
     }
 
@@ -800,6 +808,10 @@ fn build_vowifi(raw: RawVowifi) -> BridgeResult<VowifiConfig> {
             }
             raw.tunnel_engine
         },
+        tunnel_address_family: raw
+            .tunnel_address_family
+            .parse::<TunnelAddressFamily>()
+            .map_err(|e| BridgeError::Config(format!("vowifi.tunnel_address_family {e}")))?,
         vpcd_host: raw.vpcd_host,
         vpcd_port: in_range(raw.vpcd_port, "vowifi.vpcd_port", 1..=65535)?,
         max_lines: in_range(raw.max_lines, "vowifi.max_lines", 1..=64)?,

@@ -423,6 +423,9 @@ section! {
         /// `VowifiConfig::reg_rejected_cooldown_sec`.
         pub reg_rejected_cooldown_sec: u64,
         pub tunnel_engine: String,
+        /// `"dual"` (default), `"ipv4"` or `"ipv6"`. See
+        /// `VowifiConfig::tunnel_address_family`.
+        pub tunnel_address_family: String,
         pub vpcd_host: String,
         pub vpcd_port: u16,
         pub max_lines: u32,
@@ -458,6 +461,7 @@ impl Default for RawVowifi {
             keepalive_interval_sec: 20,
             reg_rejected_cooldown_sec: crate::config::DEFAULT_REG_REJECTED_COOLDOWN_SEC,
             tunnel_engine: "strongswan".to_string(),
+            tunnel_address_family: "dual".to_string(),
             vpcd_host: "127.0.0.1".to_string(),
             vpcd_port: 15963,
             max_lines: 8,
@@ -480,6 +484,8 @@ section! {
         pub msisdn: Option<String>,
         /// Overrides `[vowifi].reg_rejected_cooldown_sec` for this line.
         pub reg_rejected_cooldown_sec: Option<u64>,
+        /// Overrides `[vowifi].tunnel_address_family` for this line.
+        pub tunnel_address_family: Option<String>,
     }
 }
 

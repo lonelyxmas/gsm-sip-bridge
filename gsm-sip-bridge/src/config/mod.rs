@@ -25,6 +25,80 @@ fn default_reg_rejected_cooldown_sec() -> u64 {
     DEFAULT_REG_REJECTED_COOLDOWN_SEC
 }
 
+/// Which inner address families a line's ePDG tunnel requests (`vips`) and
+/// carries (`remote_ts`): `[vowifi].tunnel_address_family`, overridable per
+/// `[[vowifi.line]]` (specs/092-epdg-inner-address-family).
+///
+/// `Dual` is what every line negotiated before the setting existed. `Ipv4`
+/// is the remedy for an ePDG that assigns only an IPv4 inner address and
+/// then rejects every CHILD_SA rekey that still proposes `::/0` with
+/// `INVALID_SELECTORS` (#107). Strongswan engine only; the swu engine
+/// always negotiates both families.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TunnelAddressFamily {
+    #[default]
+    Dual,
+    Ipv4,
+    Ipv6,
+}
+
+impl TunnelAddressFamily {
+    /// The value rendered into the template's `@VIPS@`.
+    pub fn vips(self) -> &'static str {
+        match self {
+            Self::Dual => "0.0.0.0, ::",
+            Self::Ipv4 => "0.0.0.0",
+            Self::Ipv6 => "::",
+        }
+    }
+
+    /// The value rendered into the template's `@REMOTE_TS@`.
+    pub fn remote_ts(self) -> &'static str {
+        match self {
+            Self::Dual => "0.0.0.0/0, ::/0",
+            Self::Ipv4 => "0.0.0.0/0",
+            Self::Ipv6 => "::/0",
+        }
+    }
+
+    /// Whether a P-CSCF address of this family may be selected or published
+    /// (specs/092 FR-013). An unparseable address is admitted only by
+    /// `Dual`, which keeps the pre-092 behaviour.
+    pub fn admits(self, addr: &str) -> bool {
+        match self {
+            Self::Dual => true,
+            Self::Ipv4 => addr.parse::<std::net::IpAddr>().is_ok_and(|a| a.is_ipv4()),
+            Self::Ipv6 => addr.parse::<std::net::IpAddr>().is_ok_and(|a| a.is_ipv6()),
+        }
+    }
+}
+
+impl std::str::FromStr for TunnelAddressFamily {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "dual" => Ok(Self::Dual),
+            "ipv4" => Ok(Self::Ipv4),
+            "ipv6" => Ok(Self::Ipv6),
+            other => Err(format!(
+                "must be \"dual\", \"ipv4\" or \"ipv6\", got {other:?}"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for TunnelAddressFamily {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Dual => "dual",
+            Self::Ipv4 => "ipv4",
+            Self::Ipv6 => "ipv6",
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SipTransport {
     Udp,
@@ -886,6 +960,13 @@ pub struct VowifiConfig {
     /// (the original SWu-IKEv2 Python dialer, kept as an explicit fallback
     /// — see specs/012-strongswan-epdg).
     pub tunnel_engine: String,
+    /// Inner address families this line's ePDG tunnel requests
+    /// (specs/092-epdg-inner-address-family). The `[vowifi]` value until
+    /// `vowifi::discovery::resolve_one_line` applies the line's override, so
+    /// a resolved line carries its **effective** family. `#[serde(default)]`
+    /// so a line-resolution file from an older build reads as `Dual`.
+    #[serde(default)]
+    pub tunnel_address_family: TunnelAddressFamily,
     /// XFRM interface name the strongswan engine creates inside `netns`.
     /// Derived per line, not a `[vowifi]` TOML key.
     pub strongswan_tun_iface: String,
@@ -978,6 +1059,10 @@ pub struct VowifiLineOverride {
     /// Overrides `VowifiConfig::reg_rejected_cooldown_sec` for this line.
     #[serde(default)]
     pub reg_rejected_cooldown_sec: Option<u64>,
+    /// Overrides `VowifiConfig::tunnel_address_family` for this line
+    /// (specs/092-epdg-inner-address-family). `None` inherits `[vowifi]`.
+    #[serde(default)]
+    pub tunnel_address_family: Option<TunnelAddressFamily>,
 }
 
 impl Default for VowifiConfig {
@@ -1012,6 +1097,7 @@ impl Default for VowifiConfig {
             veth_sip_iface: "veth-sip".to_string(),
             veth_ims_iface: "veth-ims".to_string(),
             tunnel_engine: "strongswan".to_string(),
+            tunnel_address_family: TunnelAddressFamily::Dual,
             strongswan_tun_iface: "tun23".to_string(),
             strongswan_if_id: 23,
             vpcd_host: "127.0.0.1".to_string(),
@@ -3141,5 +3227,69 @@ password = "s3cret"
         .expect_err("strict parsing")
         .to_string();
         assert!(err.contains("reg_rejected_cooldown_secs"), "{err}");
+    }
+
+    // ---- specs/092-epdg-inner-address-family ----
+
+    #[test]
+    fn tunnel_address_family_spellings_round_trip() {
+        use std::str::FromStr;
+        for (text, family) in [
+            ("dual", TunnelAddressFamily::Dual),
+            ("ipv4", TunnelAddressFamily::Ipv4),
+            ("ipv6", TunnelAddressFamily::Ipv6),
+        ] {
+            assert_eq!(TunnelAddressFamily::from_str(text), Ok(family));
+            assert_eq!(family.to_string(), text);
+        }
+        assert_eq!(TunnelAddressFamily::default(), TunnelAddressFamily::Dual);
+    }
+
+    #[test]
+    fn tunnel_address_family_rejects_other_spellings_listing_the_accepted_ones() {
+        use std::str::FromStr;
+        for bad in ["IPv4", "ip4", "", "both"] {
+            let err = TunnelAddressFamily::from_str(bad).expect_err(bad);
+            for accepted in ["\"dual\"", "\"ipv4\"", "\"ipv6\""] {
+                assert!(err.contains(accepted), "{bad:?}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn tunnel_address_family_vips_and_remote_ts_match_the_data_model() {
+        use TunnelAddressFamily::*;
+        assert_eq!(Dual.vips(), "0.0.0.0, ::");
+        assert_eq!(Dual.remote_ts(), "0.0.0.0/0, ::/0");
+        assert_eq!(Ipv4.vips(), "0.0.0.0");
+        assert_eq!(Ipv4.remote_ts(), "0.0.0.0/0");
+        assert_eq!(Ipv6.vips(), "::");
+        assert_eq!(Ipv6.remote_ts(), "::/0");
+    }
+
+    #[test]
+    fn tunnel_address_family_admits_only_its_own_family() {
+        use TunnelAddressFamily::*;
+        for (family, v4, v6, junk) in [
+            (Dual, true, true, true),
+            (Ipv4, true, false, false),
+            (Ipv6, false, true, false),
+        ] {
+            assert_eq!(family.admits("10.0.0.10"), v4, "{family} 10.0.0.10");
+            assert_eq!(family.admits("2402:8100::10"), v6, "{family} v6");
+            assert_eq!(family.admits("not-an-address"), junk, "{family} junk");
+        }
+    }
+
+    #[test]
+    fn tunnel_address_family_defaults_to_dual_and_parses_the_section_value() {
+        assert_eq!(
+            parse(MINIMAL_TOML).vowifi.tunnel_address_family,
+            TunnelAddressFamily::Dual
+        );
+        let c = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\ntunnel_address_family = \"ipv4\"\n"
+        ));
+        assert_eq!(c.vowifi.tunnel_address_family, TunnelAddressFamily::Ipv4);
     }
 }

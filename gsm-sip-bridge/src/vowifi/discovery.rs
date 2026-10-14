@@ -429,6 +429,9 @@ fn resolve_one_line(index: u32, modem: &ProbedModem, base: &VowifiConfig) -> Res
     if let Some(cooldown) = over.and_then(|o| o.reg_rejected_cooldown_sec) {
         config.reg_rejected_cooldown_sec = cooldown;
     }
+    if let Some(family) = over.and_then(|o| o.tunnel_address_family) {
+        config.tunnel_address_family = family;
+    }
     // Not meaningful on a per-line derived config — overrides have already
     // been applied above.
     config.line_overrides = Vec::new();
@@ -567,6 +570,9 @@ fn resolve_one_pcsc_line(
     config.pcsc_reader = true;
     if let Some(cooldown) = over.reg_rejected_cooldown_sec {
         config.reg_rejected_cooldown_sec = cooldown;
+    }
+    if let Some(family) = over.tunnel_address_family {
+        config.tunnel_address_family = family;
     }
     config.line_overrides = Vec::new();
 
@@ -1306,6 +1312,41 @@ mod tests {
         };
         assert_eq!(cooldown_for("/dev/ttyUSB3"), Some(120));
         assert_eq!(cooldown_for("/dev/ttyUSB7"), Some(600));
+    }
+
+    /// specs/092: a line's `tunnel_address_family` override reaches its
+    /// config; a line without one keeps `[vowifi]`'s.
+    #[test]
+    fn a_lines_tunnel_address_family_override_reaches_its_config() {
+        use crate::config::TunnelAddressFamily::{Dual, Ipv4, Ipv6};
+        let family_for = |base: &VowifiConfig, port: &str| {
+            let modems = vec![
+                ready_modem("ec20-ABCDEF", "/dev/ttyUSB3", false, "001010000000001"),
+                ready_modem("ec20-FEDCBA", "/dev/ttyUSB7", false, "001010000000002"),
+            ];
+            let assignment = RoleAssignment::from_probed(&modems, &base.line_overrides, false);
+            resolve_lines(&assignment, base)
+                .lines
+                .iter()
+                .find(|l| l.modem_port == std::path::Path::new(port))
+                .map(|l| l.config.tunnel_address_family)
+        };
+        let base = VowifiConfig {
+            tunnel_address_family: Ipv4,
+            ..Default::default()
+        };
+        assert_eq!(family_for(&base, "/dev/ttyUSB3"), Some(Ipv4));
+        let base = VowifiConfig {
+            tunnel_address_family: Dual,
+            line_overrides: vec![VowifiLineOverride {
+                modem_port: Some("/dev/ttyUSB3".to_string()),
+                tunnel_address_family: Some(Ipv6),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(family_for(&base, "/dev/ttyUSB3"), Some(Ipv6));
+        assert_eq!(family_for(&base, "/dev/ttyUSB7"), Some(Dual));
     }
 
     #[test]

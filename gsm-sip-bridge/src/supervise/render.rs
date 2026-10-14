@@ -12,6 +12,8 @@
 //! dropped directive shows up as a failing snapshot diff in `cargo test`,
 //! before any image is built (spec FR-002/FR-003).
 
+use crate::config::TunnelAddressFamily;
+
 /// Renders the **one shared** `strongswan.conf`: the single vici socket and
 /// filelog path used by the single charon daemon that serves every line.
 ///
@@ -124,6 +126,10 @@ pub struct SwanctlEpdgParams<'a> {
     /// `sed -e "/local_addrs.*@SRC_ADDR@/d"` deletion branch (spec Acceptance
     /// Scenario 2).
     pub src_addr: Option<&'a str>,
+    /// This line's effective `tunnel_address_family` (specs/092): supplies
+    /// `@VIPS@` and `@REMOTE_TS@`. `Dual` renders what every line did
+    /// before the setting existed.
+    pub address_family: TunnelAddressFamily,
 }
 
 /// Renders the per-line ePDG `swanctl.conf` connection block by substituting
@@ -140,7 +146,9 @@ pub fn render_swanctl_epdg(template: &str, params: &SwanctlEpdgParams<'_>) -> St
         .replace("@MNC@", params.mnc)
         .replace("@EPDG_IP@", params.epdg_ip)
         .replace("@IF_ID@", params.if_id)
-        .replace("@UPDOWN@", params.updown_script);
+        .replace("@UPDOWN@", params.updown_script)
+        .replace("@VIPS@", params.address_family.vips())
+        .replace("@REMOTE_TS@", params.address_family.remote_ts());
 
     rendered = match params.src_addr {
         Some(addr) => rendered.replace("@SRC_ADDR@", addr),
@@ -291,6 +299,7 @@ connections {
             if_id: "24",
             updown_script: "/etc/strongswan.d/ims-updown-1.sh",
             src_addr: None,
+            address_family: TunnelAddressFamily::Dual,
         };
         let rendered = render_swanctl_epdg(EPDG_TEMPLATE, &params);
         assert!(
@@ -319,6 +328,7 @@ connections {
             if_id: "23",
             updown_script: "/etc/strongswan.d/ims-updown-0.sh",
             src_addr: Some("192.168.1.50"),
+            address_family: TunnelAddressFamily::Dual,
         };
         let rendered = render_swanctl_epdg(EPDG_TEMPLATE, &params);
         insta::assert_snapshot!(rendered);
@@ -350,6 +360,7 @@ after
             if_id: "1",
             updown_script: "1",
             src_addr: None,
+            address_family: TunnelAddressFamily::Dual,
         };
         let rendered = render_swanctl_epdg(template, &params);
         assert!(rendered.contains("optional; entrypoint deletes the local_addrs line"));
@@ -371,6 +382,7 @@ after
             if_id: "23",
             updown_script: "/etc/strongswan.d/ims-updown-0.sh",
             src_addr: None,
+            address_family: TunnelAddressFamily::Dual,
         };
         let rendered = render_swanctl_epdg(EPDG_TEMPLATE, &params);
         insta::assert_snapshot!(rendered);
@@ -403,6 +415,7 @@ after
             if_id: "23",
             updown_script: "/etc/strongswan.d/ims-updown-0.sh",
             src_addr: None,
+            address_family: TunnelAddressFamily::Dual,
         }
     }
 
@@ -414,6 +427,13 @@ after
         // this snapshot to make a later change pass.
         let rendered = render_swanctl_epdg(REAL_EPDG_TEMPLATE, &real_template_params());
         insta::assert_snapshot!(strip_comments(&rendered));
+    }
+
+    #[test]
+    fn dual_render_leaves_no_placeholder() {
+        let rendered = render_swanctl_epdg(REAL_EPDG_TEMPLATE, &real_template_params());
+        assert!(!rendered.contains("@VIPS@"), "{rendered}");
+        assert!(!rendered.contains("@REMOTE_TS@"), "{rendered}");
     }
 
     #[test]

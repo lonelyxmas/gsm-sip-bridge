@@ -42,6 +42,12 @@
 #                  execs, so a fixed path (pointing at the shared script with
 #                  no env override) left every line's address installing on
 #                  line 0's netns/interface too (same live finding as above).
+#   @VIPS@ @REMOTE_TS@
+#                - the inner address families this line requests and carries,
+#                  from [vowifi].tunnel_address_family or this line's
+#                  [[vowifi.line]] override (specs/092): "dual" renders
+#                  `0.0.0.0, ::` and `0.0.0.0/0, ::/0`, "ipv4" and "ipv6"
+#                  only their own family. Per line, like @IF_ID@.
 #
 # No `secrets{}` block: authentication runs live EAP-AKA against the SIM
 # inside the modem via `vowifi-usim-bridge` (pcscd/vpcd), not a static key.
@@ -55,10 +61,12 @@ connections {
         local_addrs  = @SRC_ADDR@
         remote_addrs = @EPDG_IP@
 
-        # Request both an IPv4 and an IPv6 inner address — carriers assign
-        # one or the other (sometimes only one family), matching the
-        # legacy engine's dual-family handling.
-        vips = 0.0.0.0, ::
+        # Which inner address families to request comes from
+        # tunnel_address_family (default "dual": both an IPv4 and an IPv6
+        # address, matching the legacy engine). "ipv4" exists for an ePDG
+        # that assigns only IPv4 and then rejects every CHILD_SA rekey still
+        # proposing ::/0 with INVALID_SELECTORS (#107).
+        vips = @VIPS@
 
         local {
             auth = eap-aka
@@ -72,7 +80,7 @@ connections {
         }
         children {
             @CONN_NAME@ {
-                remote_ts = 0.0.0.0/0, ::/0
+                remote_ts = @REMOTE_TS@
                 updown = @UPDOWN@
 
                 # Same reasoning as `proposals` below, for the CHILD_SA.
