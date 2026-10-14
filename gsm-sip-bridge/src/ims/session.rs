@@ -410,22 +410,38 @@ pub(crate) fn send_sms_delivery_report(
     }
 }
 
-/// One `<contact>` element's `state`/`event` attributes from a reg-event
-/// NOTIFY body (RFC 3680 §4.1 / TS 24.229 §5.1.1.3).
+/// One `<contact>` element of a reg-event NOTIFY body (RFC 3680 §4.1 / TS
+/// 24.229 §5.1.1.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReginfoContact {
     pub(crate) state: String,
     pub(crate) event: String,
+    /// The binding's address, from `<uri>` (see [`contact_uri_addr`]). `None`
+    /// when there is no address to check either way — research R2.
+    pub(crate) addr: Option<SocketAddr>,
+    /// The `retry-after` attribute, in seconds (RFC 3680 §5.1): how long the
+    /// network wants a `probation`/`rejected` contact to stay away.
+    pub(crate) retry_after: Option<u64>,
+    /// `state` of the enclosing `<registration>` element — `terminated` there
+    /// means the whole public identity was deregistered, not just this binding
+    /// (research R6). `None` for a contact not nested in one.
+    pub(crate) registration_state: Option<String>,
+}
+
+/// One `<contact>` element's raw text and the opening tag of the
+/// `<registration>` element enclosing it, if any.
+struct ContactBlock<'a> {
+    text: &'a str,
+    registration_tag: Option<&'a str>,
 }
 
 /// Every `<contact ...>` element in `body`, as its raw text — the opening
 /// tag alone when self-closing, or through the matching `</contact>`
-/// otherwise. Not a general XML parser: just enough of reginfo's shape
-/// ([`find_own_contacts`]'s only caller) to isolate one element at a time so
-/// its `state`/`event` attributes can be read without another element's
-/// same-named attribute (there are none in this schema, but nothing here
-/// assumes that) getting matched first.
-fn contact_blocks(body: &str) -> Vec<&str> {
+/// otherwise — with its enclosing `<registration ...>` opening tag. Not a
+/// general XML parser: just enough of reginfo's shape ([`find_own_contacts`]'s
+/// only caller) to isolate one element at a time so its attributes can be read
+/// without another element's same-named attribute getting matched first.
+fn contact_blocks(body: &str) -> Vec<ContactBlock<'_>> {
     let mut blocks = Vec::new();
     let mut cursor = 0usize;
     while let Some(rel_start) = body[cursor..].find("<contact") {
@@ -444,13 +460,30 @@ fn contact_blocks(body: &str) -> Vec<&str> {
         } else {
             (&body[start..], body.len()) // malformed: no closing tag
         };
-        blocks.push(block);
+        blocks.push(ContactBlock {
+            text: block,
+            registration_tag: enclosing_registration_tag(&body[..start]),
+        });
         cursor = next_cursor;
         if cursor >= body.len() {
             break;
         }
     }
     blocks
+}
+
+/// The opening tag of the `<registration>` element still open at the end of
+/// `before` — the nearest preceding `<registration` with no `</registration>`
+/// after it. `None` when the contact is not nested in one.
+fn enclosing_registration_tag(before: &str) -> Option<&str> {
+    let open = before.rfind("<registration")?;
+    if before[open..].contains("</registration>") {
+        return None;
+    }
+    let end = before[open..]
+        .find('>')
+        .map_or(before.len(), |e| open + e + 1);
+    Some(&before[open..end])
 }
 
 /// The value of `name="..."` anywhere in `tag` — attribute order isn't
@@ -462,10 +495,19 @@ fn extract_attr(tag: &str, name: &str) -> Option<String> {
     Some(tag[start..end].to_string())
 }
 
-fn parse_contact_attrs(block: &str) -> Option<ReginfoContact> {
+fn parse_contact_attrs(block: &ContactBlock) -> Option<ReginfoContact> {
+    let text = block.text;
+    // `retry-after` is read from the opening tag only: a child element is
+    // free to carry an attribute of the same name.
+    let open_tag = text.find('>').map_or(text, |e| &text[..=e]);
     Some(ReginfoContact {
-        state: extract_attr(block, "state")?,
-        event: extract_attr(block, "event").unwrap_or_default(),
+        state: extract_attr(text, "state")?,
+        event: extract_attr(text, "event").unwrap_or_default(),
+        addr: contact_uri_addr(text),
+        retry_after: extract_attr(open_tag, "retry-after").and_then(|v| v.trim().parse().ok()),
+        registration_state: block
+            .registration_tag
+            .and_then(|t| extract_attr(t, "state")),
     })
 }
 
@@ -490,7 +532,8 @@ fn contact_uri_addr(block: &str) -> Option<SocketAddr> {
 /// How [`find_own_contacts`] decided which `<contact>` entries are ours.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Attribution {
-    /// The entry echoes our `+sip.instance` IMEI.
+    /// The entry echoes our `+sip.instance` IMEI and carries no address to
+    /// check — never one naming another address, which is a retired binding.
     Imei,
     /// The entry's `<uri>` names the address we advertised in our Contact.
     ContactAddr,
@@ -515,7 +558,11 @@ impl std::fmt::Display for Attribution {
 /// binding, and how they were recognised.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OwnContacts {
+    /// Entries for the binding this line holds now.
     pub(crate) entries: Vec<ReginfoContact>,
+    /// Entries echoing our IMEI at another address: a binding of ours that a
+    /// renewal has since replaced (issue #124). Logged, never acted on.
+    pub(crate) retired: Vec<ReginfoContact>,
     pub(crate) matched_by: Attribution,
 }
 
@@ -525,28 +572,35 @@ impl OwnContacts {
     /// binding can appear several times (the SIP and tel AORs of an implicit
     /// set, issue #117); losing any of them is reason enough to re-register,
     /// which restores the whole set.
+    #[cfg(test)]
     pub(crate) fn deregistered(&self) -> bool {
         self.entries.iter().any(contact_reports_deregistration)
     }
 }
 
-/// Finds every `<contact>` element in a reg-event NOTIFY body that is *ours*.
+/// Sorts every `<contact>` element in a reg-event NOTIFY body into ours now,
+/// ours from before, and someone else's (research R1).
 ///
-/// An element is ours when either of these holds (all such elements are
-/// collected, whichever identified them):
+/// The address decides first. An entry whose `<uri>` names `contact_addr`,
+/// the address our current Contact advertised, is ours: its port is a fresh
+/// ephemeral one per registration, so nothing else can name it. This is also
+/// what identifies us on a carrier that never echoes the IMEI (issue #117: the
+/// same contact under both a SIP and a tel AOR).
 ///
-/// 1. It mentions our own IMEI — every `Contact` we register carries
-///    `+sip.instance="<urn:gsma:imei:...>"`, and some registrars echo it back
-///    in an `<unknown-param>`.
-/// 2. Its `<uri>` names `contact_addr`, the address our Contact
-///    advertised. Its port is a fresh ephemeral one per registration, so this
-///    also leaves out a binding from a session a renewal has replaced. This is
-///    what identifies us on a carrier that never echoes the IMEI (issue #117:
-///    the same contact under both a SIP and a tel AOR, which the old
-///    "exactly one contact" rule could not attribute at all).
+/// The IMEI only identifies the *device*, not the binding. TS 24.229
+/// §5.1.1.4.1 NOTE 10 and §5.4.2.1.2 NOTE 2 let one instance hold more than
+/// one contact, and after a renewal on a new port the network retires the old
+/// one in a NOTIFY that still echoes our `+sip.instance`. Reading that as our
+/// current binding being lost re-registered the line, which retired the
+/// binding it had just made, about once per renewal (issue #124). So:
 ///
-/// Failing both, the document's only element is taken — but only when it
-/// carries no address to check. A sole contact naming a *different* address
+/// - an entry echoing our IMEI at a *different* address is `retired`;
+/// - an entry echoing our IMEI with no checkable address is current, since
+///   nothing proves it is an old binding and dropping it would make the line
+///   deaf on a carrier that omits or rewrites `<uri>`.
+///
+/// Failing all of that, the document's only element is taken — but only when
+/// it carries no address to check. A sole contact naming a *different* address
 /// is someone else's: a `state="partial"` NOTIFY about a paired handset
 /// carries just that handset's contact, and reading it as ours would force a
 /// re-registration this line never needed.
@@ -554,37 +608,43 @@ impl OwnContacts {
 /// Every match is collected, not just the first: one binding appears once
 /// per public identity.
 pub(crate) fn find_own_contacts(body: &str, imei: &str, contact_addr: SocketAddr) -> OwnContacts {
-    let contacts = contact_blocks(body);
-    let collect = |pred: &dyn Fn(&str) -> bool| -> Vec<ReginfoContact> {
-        contacts
-            .iter()
-            .filter(|b| pred(b))
-            .filter_map(|b| parse_contact_attrs(b))
-            .collect()
-    };
-    // Either identifier is enough, and both are collected together: a
-    // registrar may echo the IMEI under one public identity and not another,
-    // and an entry naming our own address on our own ephemeral port can only
-    // be ours.
-    let by_imei = |b: &str| !imei.is_empty() && b.contains(imei);
-    let by_addr = |b: &str| contact_uri_addr(b) == Some(contact_addr);
-    let entries = collect(&|b| by_imei(b) || by_addr(b));
-    if !entries.is_empty() {
-        let matched_by = if contacts.iter().any(|b| by_imei(b)) {
-            Attribution::Imei
-        } else {
-            Attribution::ContactAddr
+    let blocks = contact_blocks(body);
+    let echoes_imei = |b: &ContactBlock| !imei.is_empty() && b.text.contains(imei);
+    let mut entries = Vec::new();
+    let mut retired = Vec::new();
+    let mut any_by_addr = false;
+    for block in &blocks {
+        let Some(c) = parse_contact_attrs(block) else {
+            continue;
         };
+        match c.addr {
+            Some(a) if a == contact_addr => {
+                any_by_addr = true;
+                entries.push(c);
+            }
+            Some(_) if echoes_imei(block) => retired.push(c),
+            Some(_) => {}
+            None if echoes_imei(block) => entries.push(c),
+            None => {}
+        }
+    }
+    if !entries.is_empty() {
         return OwnContacts {
             entries,
-            matched_by,
+            retired,
+            matched_by: if any_by_addr {
+                Attribution::ContactAddr
+            } else {
+                Attribution::Imei
+            },
         };
     }
-    if let [only] = contacts.as_slice() {
-        if contact_uri_addr(only).is_none() {
+    if let [only] = blocks.as_slice() {
+        if contact_uri_addr(only.text).is_none() {
             if let Some(c) = parse_contact_attrs(only) {
                 return OwnContacts {
                     entries: vec![c],
+                    retired,
                     matched_by: Attribution::SoleContact,
                 };
             }
@@ -592,19 +652,154 @@ pub(crate) fn find_own_contacts(body: &str, imei: &str, contact_addr: SocketAddr
     }
     OwnContacts {
         entries: Vec::new(),
+        retired,
         matched_by: Attribution::None,
     }
 }
 
+/// A deregistration event RFC 3680 §4.1 pairs with `state="terminated"`,
+/// ordered by how restrictive the response TS 24.229 §5.1.1.7 asks for is —
+/// so when one NOTIFY reports several, the `max()` is the one to act on
+/// (FR-014).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DeregEvent {
+    Unregistered,
+    Probation,
+    Deactivated,
+    Rejected,
+}
+
+impl DeregEvent {
+    /// The event a contact reports, if it is a deregistration at all.
+    /// `expired` is our own scheduled renewal running its course, not the
+    /// network dropping us, so it is deliberately excluded (FR-013), as is
+    /// any contact whose `state` is not `terminated`.
+    pub(crate) fn from_contact(c: &ReginfoContact) -> Option<Self> {
+        if !c.state.eq_ignore_ascii_case("terminated") {
+            return None;
+        }
+        match c.event.to_ascii_lowercase().as_str() {
+            "unregistered" => Some(Self::Unregistered),
+            "probation" => Some(Self::Probation),
+            "deactivated" => Some(Self::Deactivated),
+            "rejected" => Some(Self::Rejected),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for DeregEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Unregistered => "unregistered",
+            Self::Probation => "probation",
+            Self::Deactivated => "deactivated",
+            Self::Rejected => "rejected",
+        })
+    }
+}
+
 /// RFC 3680 §4.1: `state="terminated"` is only a deregistration when paired
-/// with one of these events — `expired` is our own scheduled renewal running
-/// its course, not the network dropping us, so it is deliberately excluded.
+/// with one of the [`DeregEvent`]s — see [`DeregEvent::from_contact`].
+#[cfg(test)]
 fn contact_reports_deregistration(c: &ReginfoContact) -> bool {
-    c.state.eq_ignore_ascii_case("terminated")
-        && matches!(
-            c.event.to_ascii_lowercase().as_str(),
-            "deactivated" | "probation" | "rejected" | "unregistered"
-        )
+    DeregEvent::from_contact(c).is_some()
+}
+
+/// Whether a deregistration took the whole public identity down or only our
+/// binding under it (FR-015). Reported, never acted on differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeregScope {
+    /// Every `<registration>` holding our current binding is `terminated`.
+    IdentityDeregistered,
+    /// The identity stays registered (another device's binding, or another
+    /// public identity of ours, is still active); only our binding went.
+    BindingRemoved,
+}
+
+impl std::fmt::Display for DeregScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::IdentityDeregistered => "identity-deregistered",
+            Self::BindingRemoved => "binding-removed",
+        })
+    }
+}
+
+/// The network deregistered our current binding: what the agent acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Deregistration {
+    /// The most restrictive event among our current entries (FR-014).
+    pub(crate) event: DeregEvent,
+    /// The longest `retry-after` the network asked for, from our entries'
+    /// attribute or the `Subscription-State` header's parameter.
+    pub(crate) retry_after: Option<Duration>,
+    pub(crate) scope: DeregScope,
+}
+
+/// What a reg-event NOTIFY says about this line: which entries are ours, and
+/// the deregistration to act on, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NotifyVerdict {
+    pub(crate) own: OwnContacts,
+    pub(crate) deregistration: Option<Deregistration>,
+}
+
+/// The `retry-after` parameter of a `Subscription-State` header value
+/// (RFC 6665 §8.2.3), e.g. `terminated;reason=probation;retry-after=900`.
+fn subscription_retry_after(subscription_state: &str) -> Option<u64> {
+    subscription_state.split(';').skip(1).find_map(|param| {
+        let (name, value) = param.split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("retry-after")
+            .then(|| value.trim().parse().ok())?
+    })
+}
+
+/// Classifies a reg-event NOTIFY body for this line: the pure decision behind
+/// [`handle_notify`], kept free of the socket so it can be tested on real
+/// bodies (research R3).
+pub(crate) fn classify_reg_notify(
+    body: &str,
+    subscription_state: &str,
+    imei: &str,
+    contact_addr: SocketAddr,
+) -> NotifyVerdict {
+    let own = find_own_contacts(body, imei, contact_addr);
+    let deregistration = own
+        .entries
+        .iter()
+        .filter_map(DeregEvent::from_contact)
+        .max()
+        .map(|event| {
+            let retry_after = own
+                .entries
+                .iter()
+                .filter_map(|c| c.retry_after)
+                .chain(subscription_retry_after(subscription_state))
+                .max()
+                .map(Duration::from_secs);
+            // Research R6: the identity as a whole went only when every
+            // registration holding our binding is itself terminated.
+            let identity_gone = own.entries.iter().all(|c| {
+                c.registration_state
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("terminated"))
+            });
+            Deregistration {
+                event,
+                retry_after,
+                scope: if identity_gone {
+                    DeregScope::IdentityDeregistered
+                } else {
+                    DeregScope::BindingRemoved
+                },
+            }
+        });
+    NotifyVerdict {
+        own,
+        deregistration,
+    }
 }
 
 /// Acknowledges a `NOTIFY` and surfaces its payload. For `Event: reg` the
@@ -613,85 +808,90 @@ fn contact_reports_deregistration(c: &ReginfoContact) -> bool {
 /// calls. The `To` header already carries our tag (it echoes our SUBSCRIBE's
 /// `From` tag), so no tag is added.
 ///
-/// Returns `true` when any entry for our own binding (see
-/// [`find_own_contacts`]) was reported deregistered — `state="terminated"`
-/// with `event` one of `deactivated`/`probation`/`rejected`/`unregistered`
-/// (RFC 3680 §4.1) — so the caller can force a re-registration. Before this, any such NOTIFY was only logged: the line
-/// would keep reporting itself `Registered` and silently receive nothing
-/// until the next scheduled renewal, up to an hour later (specs/041
-/// conformance review, MT-09).
+/// Returns the deregistration of our own binding (see [`find_own_contacts`]
+/// and [`classify_reg_notify`]), if the NOTIFY reported one — so the caller
+/// can apply the policy for its event. Before this, any such NOTIFY was only
+/// logged: the line would keep reporting itself `Registered` and silently
+/// receive nothing until the next scheduled renewal, up to an hour later
+/// (specs/041 conformance review, MT-09).
 ///
-/// This bridge always retries rather than giving up outright — the
-/// same philosophy `GmConnectionState::Failed` already follows (not
-/// terminal, keeps retrying on backoff) — so `rejected`/`unregistered` are
-/// handled the same as `deactivated`/`probation`: force a fresh attempt, and
-/// let the renewal-failure backoff take over if the network keeps refusing
-/// the bindings it has just accepted (the caller's
-/// `on_network_deregistration`).
+/// What the line does about each event is the caller's policy
+/// (`on_network_deregistration`, TS 24.229 §5.1.1.7).
 pub(crate) fn handle_notify(
     session: &super::RegisteredSession,
     sink: &SipSink,
     req: &SipRequest,
-) -> bool {
+) -> Option<Deregistration> {
     let _ = sink.send(&build_uas_response(200, "OK", req, None, None, None));
     let event = req.header("Event").unwrap_or("?").to_string();
     let sub_state = req.header("Subscription-State").unwrap_or("?").to_string();
 
-    let own = event
-        .eq_ignore_ascii_case("reg")
-        .then(|| find_own_contacts(&req.body, &session.imei, session.contact_addr));
-    let deregistered = own.as_ref().is_some_and(OwnContacts::deregistered);
+    if !event.eq_ignore_ascii_case("reg") {
+        tracing::info!(event = %event, subscription_state = %sub_state, body = %req.body, "received NOTIFY");
+        return None;
+    }
+    let verdict = classify_reg_notify(&req.body, &sub_state, &session.imei, session.contact_addr);
+    log_reg_notify(&verdict, session.contact_addr, &sub_state, &req.body);
+    verdict.deregistration
+}
 
-    match &own {
-        Some(own) if !own.entries.is_empty() => {
-            let states = own
-                .entries
-                .iter()
-                .map(|c| format!("{}/{}", c.state, c.event))
-                .collect::<Vec<_>>()
-                .join(",");
-            if deregistered {
-                // The body is the evidence for *why* — logged here too, not
-                // only when nothing could be attributed (issue #117).
-                tracing::warn!(
-                    event = %event,
-                    subscription_state = %sub_state,
-                    attribution = %own.matched_by,
-                    own_entries = own.entries.len(),
-                    contact_states = %states,
-                    body = %req.body,
-                    "reg-event NOTIFY reports our own binding was deregistered; forcing a \
-                     re-registration"
-                );
+/// The FR-016 line every reg-event NOTIFY gets, plus one FR-005 line per
+/// replaced binding the network retired. Field names are a contract
+/// (`specs/089-reg-notify-binding-attribution/contracts/observability.md`).
+fn log_reg_notify(verdict: &NotifyVerdict, contact_addr: SocketAddr, sub_state: &str, body: &str) {
+    let own = &verdict.own;
+    for r in own
+        .retired
+        .iter()
+        .filter(|r| r.state.eq_ignore_ascii_case("terminated"))
+    {
+        tracing::info!(
+            retired_addr = %r.addr.map(|a| a.to_string()).unwrap_or_default(),
+            state = %r.state,
+            event = %r.event,
+            contact_addr = %contact_addr,
+            "replaced binding retired"
+        );
+    }
+    let states = own
+        .entries
+        .iter()
+        .map(|c| format!("{}/{}", c.state, c.event))
+        .collect::<Vec<_>>()
+        .join(",");
+    match &verdict.deregistration {
+        Some(d) => tracing::warn!(
+            attribution = %own.matched_by,
+            contact_addr = %contact_addr,
+            own_entries = own.entries.len(),
+            retired_entries = own.retired.len(),
+            contact_states = %states,
+            applied = %d.event,
+            retry_after_secs = d.retry_after.map(|r| r.as_secs()),
+            scope = %d.scope,
+            subscription_state = %sub_state,
+            body = %body,
+            "reg-event NOTIFY: our current binding was deregistered"
+        ),
+        None => {
+            let message = if own.entries.is_empty() {
+                "reg-event NOTIFY, nothing attributable to our current binding"
             } else {
-                tracing::info!(
-                    event = %event,
-                    subscription_state = %sub_state,
-                    attribution = %own.matched_by,
-                    own_entries = own.entries.len(),
-                    contact_states = %states,
-                    "received reg-event NOTIFY for our own binding"
-                );
-            }
-        }
-        _ if req.body.contains("terminated") => {
-            // Either not a reg-event NOTIFY, an unparseable body, or a
-            // document none of whose contacts is ours — still worth a
-            // warning, but nothing to act on with confidence.
-            tracing::warn!(
-                event = %event,
+                "reg-event NOTIFY for our binding"
+            };
+            tracing::info!(
+                attribution = %own.matched_by,
+                contact_addr = %contact_addr,
+                own_entries = own.entries.len(),
+                retired_entries = own.retired.len(),
+                contact_states = %states,
+                applied = "none",
                 subscription_state = %sub_state,
-                contact_addr = %session.contact_addr,
-                body = %req.body,
-                "NOTIFY body mentions a terminated state, but not attributably to our own contact"
+                body = %body,
+                "{message}"
             );
         }
-        _ => {
-            tracing::info!(event = %event, subscription_state = %sub_state, body = %req.body, "received NOTIFY");
-        }
     }
-
-    deregistered
 }
 
 /// Answers on the connection a request arrived on, logging rather than
@@ -939,22 +1139,24 @@ mod tests {
     /// modelled on the Jio reginfo (a paired handset's contact alongside
     /// ours) that motivated matching by IMEI instead of always taking "the"
     /// contact.
+    ///
+    /// Issue #124 changed this fixture: it used to give each contact a `<uri>`
+    /// at an address other than our current one and still expect the IMEI to
+    /// claim it. That is exactly the retired-binding case, so the IMEI now
+    /// only decides for entries carrying no address to check.
     #[test]
     fn our_contact_is_picked_out_by_imei_among_several() {
         let body = r#"<?xml version="1.0"?>
 <reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="0" state="full">
   <registration aor="sip:+919000000000@ims.example" id="a1" state="active">
     <contact id="watch" state="active" event="registered" expires="3600">
-      <uri>sip:+919000000000@192.168.1.50:5060</uri>
       <unknown-param name="+sip.instance">"&lt;urn:gsma:imei:490154203237518&gt;"</unknown-param>
     </contact>
     <contact id="phone" state="terminated" event="deactivated" expires="0">
-      <uri>sip:+919000000000@10.0.0.1:5060;transport=tcp</uri>
       <unknown-param name="+sip.instance">"&lt;urn:gsma:imei:860000000000000&gt;"</unknown-param>
     </contact>
   </registration>
 </reginfo>"#;
-        // The address alone would match nothing here: the IMEI is what finds us.
         let own = find_own_contacts(body, "860000000000000", addr("10.0.0.9:5064"));
         assert_eq!(own.matched_by, Attribution::Imei);
         assert_eq!(own.entries.len(), 1);
@@ -1010,10 +1212,7 @@ mod tests {
     /// re-registration as a genuine deregistration.
     #[test]
     fn an_expired_event_is_not_treated_as_a_deregistration() {
-        let contact = ReginfoContact {
-            state: "terminated".to_string(),
-            event: "expired".to_string(),
-        };
+        let contact = contact("terminated", "expired");
         assert!(!contact_reports_deregistration(&contact));
     }
 
@@ -1021,10 +1220,7 @@ mod tests {
     /// the state is the gate, not just the event name.
     #[test]
     fn an_active_contact_is_never_a_deregistration_even_with_a_deregistration_style_event() {
-        let contact = ReginfoContact {
-            state: "active".to_string(),
-            event: "deactivated".to_string(),
-        };
+        let contact = contact("active", "deactivated");
         assert!(!contact_reports_deregistration(&contact));
     }
 
@@ -1033,10 +1229,7 @@ mod tests {
     #[test]
     fn every_deregistration_event_is_recognized() {
         for event in ["deactivated", "probation", "rejected", "unregistered"] {
-            let contact = ReginfoContact {
-                state: "terminated".to_string(),
-                event: event.to_string(),
-            };
+            let contact = contact("terminated", event);
             assert!(
                 contact_reports_deregistration(&contact),
                 "{event} must be recognized as a deregistration"
@@ -1207,8 +1400,426 @@ mod tests {
   </registration>
 </reginfo>"#;
         let own = find_own_contacts(body, "860000000000000", addr("10.0.0.1:5064"));
-        assert_eq!(own.matched_by, Attribution::Imei);
+        // Both entries name our address, so the address is what is reported
+        // even though one also echoes the IMEI (issue #124: the address is
+        // the stronger proof, and the label says which proof was used).
+        assert_eq!(own.matched_by, Attribution::ContactAddr);
         assert_eq!(own.entries.len(), 2);
+        assert!(own.retired.is_empty());
         assert!(own.deregistered());
+    }
+
+    fn contact(state: &str, event: &str) -> ReginfoContact {
+        ReginfoContact {
+            state: state.to_string(),
+            event: event.to_string(),
+            addr: None,
+            retry_after: None,
+            registration_state: None,
+        }
+    }
+
+    /// The only contact of `body`, as parsed.
+    fn only_contact(body: &str) -> ReginfoContact {
+        let blocks = contact_blocks(body);
+        assert_eq!(blocks.len(), 1, "{body}");
+        parse_contact_attrs(&blocks[0]).expect("a parseable contact")
+    }
+
+    #[test]
+    fn a_contact_carries_its_uri_address() {
+        let c = only_contact(
+            r#"<contact state="active" event="registered"><uri>sip:+919000000000@10.0.0.1:5070;transport=tcp</uri></contact>"#,
+        );
+        assert_eq!(c.addr, Some(addr("10.0.0.1:5070")));
+        let c = only_contact(
+            r#"<contact state="active" event="registered"><uri>sip:+919000000000@[2001:db8::1]:5070</uri></contact>"#,
+        );
+        assert_eq!(c.addr, Some(addr("[2001:db8::1]:5070")));
+    }
+
+    #[test]
+    fn a_contact_without_a_literal_address_has_none() {
+        let c = only_contact(r#"<contact state="active" event="registered"/>"#);
+        assert_eq!(c.addr, None);
+        let c = only_contact(
+            r#"<contact state="active" event="registered"><uri>sip:u@pcscf.example:5060</uri></contact>"#,
+        );
+        assert_eq!(c.addr, None);
+    }
+
+    #[test]
+    fn a_contact_carries_its_retry_after() {
+        let c = only_contact(
+            r#"<contact state="terminated" event="probation" retry-after="600"><uri>sip:u@10.0.0.1:5070</uri></contact>"#,
+        );
+        assert_eq!(c.retry_after, Some(600));
+        assert_eq!(
+            only_contact(r#"<contact state="active"/>"#).retry_after,
+            None
+        );
+    }
+
+    #[test]
+    fn a_contact_reads_its_enclosing_registration_state() {
+        let bare = only_contact(r#"<reginfo><contact state="active"/></reginfo>"#);
+        assert_eq!(bare.registration_state, None);
+
+        let body = r#"<reginfo>
+  <registration aor="sip:+919000000000@ims.example" id="a1" state="active">
+    <contact id="c1" state="active" event="registered"/>
+  </registration>
+  <registration aor="tel:+919000000000" id="a2" state="terminated">
+    <contact id="c2" state="terminated" event="unregistered"/>
+  </registration>
+</reginfo>"#;
+        let contacts: Vec<_> = contact_blocks(body)
+            .iter()
+            .filter_map(parse_contact_attrs)
+            .collect();
+        assert_eq!(contacts.len(), 2);
+        assert_eq!(contacts[0].registration_state.as_deref(), Some("active"));
+        // The second registration's state, not the first's.
+        assert_eq!(
+            contacts[1].registration_state.as_deref(),
+            Some("terminated")
+        );
+    }
+
+    #[test]
+    fn a_contact_after_a_closed_registration_is_not_nested_in_it() {
+        let body = r#"<reginfo><registration state="terminated"></registration><contact state="active"/></reginfo>"#;
+        assert_eq!(only_contact(body).registration_state, None);
+    }
+
+    #[test]
+    fn dereg_event_parses_only_terminated_deregistrations() {
+        assert_eq!(
+            DeregEvent::from_contact(&contact("TERMINATED", "Rejected")),
+            Some(DeregEvent::Rejected)
+        );
+        assert_eq!(
+            DeregEvent::from_contact(&contact("terminated", "deactivated")),
+            Some(DeregEvent::Deactivated)
+        );
+        assert_eq!(
+            DeregEvent::from_contact(&contact("terminated", "probation")),
+            Some(DeregEvent::Probation)
+        );
+        assert_eq!(
+            DeregEvent::from_contact(&contact("terminated", "unregistered")),
+            Some(DeregEvent::Unregistered)
+        );
+        for (state, event) in [
+            ("terminated", "expired"),
+            ("terminated", "registered"),
+            ("active", "rejected"),
+            ("active", "registered"),
+        ] {
+            assert_eq!(
+                DeregEvent::from_contact(&contact(state, event)),
+                None,
+                "{state}/{event}"
+            );
+        }
+    }
+
+    /// FR-014: the most restrictive event wins.
+    #[test]
+    fn the_most_restrictive_dereg_event_is_the_max() {
+        let events = [
+            DeregEvent::Unregistered,
+            DeregEvent::Rejected,
+            DeregEvent::Deactivated,
+        ];
+        assert_eq!(events.into_iter().max(), Some(DeregEvent::Rejected));
+        assert!(DeregEvent::Unregistered < DeregEvent::Probation);
+        assert!(DeregEvent::Probation < DeregEvent::Deactivated);
+        assert!(DeregEvent::Deactivated < DeregEvent::Rejected);
+    }
+
+    const IMEI: &str = "860000000000000";
+
+    /// `classify_reg_notify` finds exactly what `find_own_contacts` does, on
+    /// every fixture in this module.
+    #[test]
+    fn classification_attributes_like_find_own_contacts() {
+        for (body, current) in [
+            (ISSUE_117_BODY, "198.51.100.10:42934"),
+            (ISSUE_117_BODY, "198.51.100.10:42936"),
+            (
+                r#"<reginfo><registration><contact id="c1" state="terminated" event="probation"/></registration></reginfo>"#,
+                "10.0.0.1:5060",
+            ),
+            ("<reginfo></reginfo>", "10.0.0.1:5060"),
+        ] {
+            let verdict = classify_reg_notify(body, "active", IMEI, addr(current));
+            assert_eq!(verdict.own, find_own_contacts(body, IMEI, addr(current)));
+            assert_eq!(
+                verdict.deregistration.is_some(),
+                verdict.own.deregistered(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn classification_picks_the_most_restrictive_event_and_longest_retry_after() {
+        let body = r#"<reginfo>
+  <registration aor="sip:+919000000000@ims.example" id="a1" state="terminated">
+    <contact id="c1" state="terminated" event="probation" retry-after="600">
+      <uri>sip:+919000000000@10.0.0.1:5070</uri>
+    </contact>
+  </registration>
+  <registration aor="tel:+919000000000" id="a2" state="terminated">
+    <contact id="c1" state="terminated" event="rejected" retry-after="300">
+      <uri>sip:+919000000000@10.0.0.1:5070</uri>
+    </contact>
+  </registration>
+</reginfo>"#;
+        let current = addr("10.0.0.1:5070");
+        let d = classify_reg_notify(body, "active;expires=600000", IMEI, current)
+            .deregistration
+            .expect("a deregistration");
+        assert_eq!(d.event, DeregEvent::Rejected);
+        assert_eq!(d.retry_after, Some(Duration::from_secs(600)));
+
+        let d = classify_reg_notify(
+            body,
+            "terminated;reason=probation;retry-after=900",
+            IMEI,
+            current,
+        )
+        .deregistration
+        .expect("a deregistration");
+        assert_eq!(d.retry_after, Some(Duration::from_secs(900)));
+    }
+
+    #[test]
+    fn classification_finds_no_deregistration_when_our_entries_are_active_or_expired() {
+        let body = r#"<reginfo>
+  <registration aor="sip:+919000000000@ims.example" id="a1" state="active">
+    <contact id="c1" state="active" event="registered"><uri>sip:+919000000000@10.0.0.1:5070</uri></contact>
+    <contact id="c0" state="terminated" event="expired"><uri>sip:+919000000000@10.0.0.1:5070</uri></contact>
+  </registration>
+</reginfo>"#;
+        let verdict = classify_reg_notify(body, "active", IMEI, addr("10.0.0.1:5070"));
+        assert_eq!(verdict.own.entries.len(), 2);
+        assert_eq!(verdict.deregistration, None);
+    }
+
+    #[test]
+    fn subscription_state_retry_after_is_read_from_its_parameters() {
+        assert_eq!(
+            subscription_retry_after("terminated;reason=probation;retry-after=900"),
+            Some(900)
+        );
+        assert_eq!(
+            subscription_retry_after("terminated; Retry-After = 60"),
+            Some(60)
+        );
+        assert_eq!(subscription_retry_after("active;expires=600000"), None);
+        assert_eq!(subscription_retry_after("retry-after=5"), None);
+    }
+
+    const OLD: &str = "10.0.0.1:5064";
+    const CURRENT: &str = "10.0.0.1:5070";
+
+    /// One `<contact>` element at `ip_port` echoing our IMEI.
+    fn imei_contact(id: &str, state: &str, event: &str, ip_port: &str) -> String {
+        format!(
+            r#"<contact id="{id}" state="{state}" event="{event}">
+      <uri>sip:+919000000000@{ip_port};transport=tcp</uri>
+      <unknown-param name="+sip.instance">"&lt;urn:gsma:imei:{IMEI}&gt;"</unknown-param>
+    </contact>"#
+        )
+    }
+
+    fn reginfo(registration_state: &str, contacts: &[String]) -> String {
+        format!(
+            r#"<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="4" state="full">
+  <registration aor="sip:+919000000000@ims.example" id="a1" state="{registration_state}">
+    {}
+  </registration>
+</reginfo>"#,
+            contacts.join("\n    ")
+        )
+    }
+
+    /// Research R1, scenario 1 — issue #124 itself: after a renewal moved us
+    /// to `:5070`, the network retires the `:5064` binding, still echoing our
+    /// IMEI. That is not our current binding, and nothing is to be done.
+    #[test]
+    fn a_retired_previous_binding_is_not_our_current_binding() {
+        let body = reginfo(
+            "active",
+            &[imei_contact("old", "terminated", "rejected", OLD)],
+        );
+        let verdict = classify_reg_notify(&body, "active;expires=600000", IMEI, addr(CURRENT));
+        assert!(verdict.own.entries.is_empty());
+        assert_eq!(verdict.own.retired.len(), 1);
+        assert_eq!(verdict.own.retired[0].addr, Some(addr(OLD)));
+        assert_eq!(verdict.own.matched_by, Attribution::None);
+        assert_eq!(verdict.deregistration, None);
+    }
+
+    /// R1 scenario 2: a full-state document listing both the retired binding
+    /// and the one we hold now.
+    #[test]
+    fn the_old_binding_is_retired_while_the_new_one_is_current() {
+        let body = reginfo(
+            "active",
+            &[
+                imei_contact("old", "terminated", "unregistered", OLD),
+                imei_contact("new", "active", "registered", CURRENT),
+            ],
+        );
+        let verdict = classify_reg_notify(&body, "active", IMEI, addr(CURRENT));
+        assert_eq!(verdict.own.matched_by, Attribution::ContactAddr);
+        assert_eq!(verdict.own.entries.len(), 1);
+        assert_eq!(verdict.own.entries[0].state, "active");
+        assert_eq!(verdict.own.retired.len(), 1);
+        assert_eq!(verdict.deregistration, None);
+    }
+
+    /// R1 scenario 3: the network really did deactivate the binding we hold.
+    #[test]
+    fn our_current_binding_deactivated_is_a_deregistration() {
+        let body = reginfo(
+            "active",
+            &[imei_contact("new", "terminated", "deactivated", CURRENT)],
+        );
+        let verdict = classify_reg_notify(&body, "active", IMEI, addr(CURRENT));
+        assert_eq!(verdict.own.matched_by, Attribution::ContactAddr);
+        assert_eq!(
+            verdict.deregistration.map(|d| d.event),
+            Some(DeregEvent::Deactivated)
+        );
+    }
+
+    /// R1 scenario 4 (issue #117, SC-005): both AOR entries name our current
+    /// address, and both stay ours.
+    #[test]
+    fn both_aor_entries_at_our_address_stay_current() {
+        let verdict =
+            classify_reg_notify(ISSUE_117_BODY, "active", IMEI, addr("198.51.100.10:42934"));
+        assert_eq!(verdict.own.entries.len(), 2);
+        assert!(verdict.own.retired.is_empty());
+        assert_eq!(
+            verdict.deregistration.map(|d| d.event),
+            Some(DeregEvent::Rejected)
+        );
+    }
+
+    /// An entry echoing our IMEI with no address to check cannot be proven to
+    /// be an old binding, so it stays ours — next to someone else's contact.
+    #[test]
+    fn an_imei_entry_without_an_address_is_current() {
+        let body = format!(
+            r#"<reginfo><registration state="active">
+    <contact id="other" state="active" event="registered"><uri>sip:u@192.0.2.7:5060</uri></contact>
+    <contact id="ours" state="terminated" event="probation">
+      <unknown-param name="+sip.instance">"&lt;urn:gsma:imei:{IMEI}&gt;"</unknown-param>
+    </contact>
+  </registration></reginfo>"#
+        );
+        let verdict = classify_reg_notify(&body, "active", IMEI, addr(CURRENT));
+        assert_eq!(verdict.own.matched_by, Attribution::Imei);
+        assert_eq!(verdict.own.entries.len(), 1);
+        assert_eq!(verdict.own.entries[0].event, "probation");
+        assert!(verdict.own.retired.is_empty());
+    }
+
+    /// Another device's binding is neither ours now nor ours before.
+    #[test]
+    fn a_foreign_address_without_our_imei_is_neither_current_nor_retired() {
+        let body = reginfo(
+            "active",
+            &[
+                r#"<contact id="other" state="terminated" event="rejected"><uri>sip:u@192.0.2.7:5060</uri></contact>"#
+                    .to_string(),
+                imei_contact("new", "active", "registered", CURRENT),
+            ],
+        );
+        let verdict = classify_reg_notify(&body, "active", IMEI, addr(CURRENT));
+        assert_eq!(verdict.own.entries.len(), 1);
+        assert!(verdict.own.retired.is_empty());
+        assert_eq!(verdict.deregistration, None);
+    }
+
+    /// An IPv6 current address is matched, and a `;Hpt=` suffix the network
+    /// appends does not change which binding the entry names.
+    #[test]
+    fn an_ipv6_current_address_with_uri_parameters_is_matched() {
+        let body = format!(
+            r#"<reginfo><registration state="active">
+    <contact id="new" state="active" event="registered">
+      <uri>sip:+919000000000@[2001:db8::1]:5070;Hpt=8f_ex;transport=tcp</uri>
+      <unknown-param name="+sip.instance">"&lt;urn:gsma:imei:{IMEI}&gt;"</unknown-param>
+    </contact>
+    <contact id="old" state="terminated" event="unregistered">
+      <uri>sip:+919000000000@[2001:db8::1]:5064;Hpt=8f_ex</uri>
+      <unknown-param name="+sip.instance">"&lt;urn:gsma:imei:{IMEI}&gt;"</unknown-param>
+    </contact>
+  </registration></reginfo>"#
+        );
+        let verdict = classify_reg_notify(&body, "active", IMEI, addr("[2001:db8::1]:5070"));
+        assert_eq!(verdict.own.matched_by, Attribution::ContactAddr);
+        assert_eq!(verdict.own.entries.len(), 1);
+        assert_eq!(verdict.own.retired.len(), 1);
+        assert_eq!(verdict.deregistration, None);
+    }
+
+    /// Story 3, scenario 1 (FR-015): the identity itself is deregistered.
+    #[test]
+    fn a_terminated_registration_is_an_identity_deregistration() {
+        let body = reginfo(
+            "terminated",
+            &[imei_contact("new", "terminated", "deactivated", CURRENT)],
+        );
+        let d = classify_reg_notify(&body, "active", IMEI, addr(CURRENT))
+            .deregistration
+            .expect("a deregistration");
+        assert_eq!(d.scope, DeregScope::IdentityDeregistered);
+        assert_eq!(d.event, DeregEvent::Deactivated);
+    }
+
+    /// Story 3, scenario 2: the identity stays registered through another
+    /// device; only our binding was removed.
+    #[test]
+    fn our_binding_removed_while_the_identity_stays_registered() {
+        let body = reginfo(
+            "active",
+            &[
+                imei_contact("new", "terminated", "rejected", CURRENT),
+                r#"<contact id="other" state="active" event="registered"><uri>sip:u@192.0.2.7:5060</uri></contact>"#
+                    .to_string(),
+            ],
+        );
+        let d = classify_reg_notify(&body, "active", IMEI, addr(CURRENT))
+            .deregistration
+            .expect("a deregistration");
+        assert_eq!(d.scope, DeregScope::BindingRemoved);
+        assert_eq!(d.event, DeregEvent::Rejected);
+    }
+
+    /// Issue #117's body: both registrations holding our binding terminated.
+    #[test]
+    fn both_aors_terminated_is_an_identity_deregistration() {
+        let d = classify_reg_notify(ISSUE_117_BODY, "active", IMEI, addr("198.51.100.10:42934"))
+            .deregistration
+            .expect("a deregistration");
+        assert_eq!(d.scope, DeregScope::IdentityDeregistered);
+    }
+
+    /// A contact not nested in any `<registration>` says nothing about the
+    /// identity, so only the binding is known to be gone.
+    #[test]
+    fn a_bare_contact_is_a_removed_binding() {
+        let body = r#"<reginfo><contact id="c1" state="terminated" event="probation"/></reginfo>"#;
+        let d = classify_reg_notify(body, "active", "", addr(CURRENT))
+            .deregistration
+            .expect("a deregistration");
+        assert_eq!(d.scope, DeregScope::BindingRemoved);
     }
 }

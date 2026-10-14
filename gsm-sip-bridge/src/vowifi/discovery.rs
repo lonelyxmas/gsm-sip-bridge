@@ -426,6 +426,9 @@ fn resolve_one_line(index: u32, modem: &ProbedModem, base: &VowifiConfig) -> Res
     config.mnc = mnc.clone();
     config.imsi_override = imsi_override.clone();
     config.imei_override = imei_override.clone();
+    if let Some(cooldown) = over.and_then(|o| o.reg_rejected_cooldown_sec) {
+        config.reg_rejected_cooldown_sec = cooldown;
+    }
     // Not meaningful on a per-line derived config — overrides have already
     // been applied above.
     config.line_overrides = Vec::new();
@@ -562,6 +565,9 @@ fn resolve_one_pcsc_line(
     config.imsi_override = imsi_override.clone();
     config.imei_override = imei_override.clone();
     config.pcsc_reader = true;
+    if let Some(cooldown) = over.reg_rejected_cooldown_sec {
+        config.reg_rejected_cooldown_sec = cooldown;
+    }
     config.line_overrides = Vec::new();
 
     derive_line_resources(&mut config, base, index);
@@ -1272,6 +1278,36 @@ mod tests {
     /// config, so the number has to be recorded as a first-class field at the
     /// point of match — reconstructing it afterward from `line_overrides` always
     /// returns `None`, which had made every VoWiFi SMS render `Phone: unknown`.
+    /// specs/089 FR-010: a `[[vowifi.line]]` cooldown override reaches the
+    /// per-line config the agent reads; a line without one keeps `[vowifi]`'s.
+    #[test]
+    fn a_lines_reg_rejected_cooldown_override_reaches_its_config() {
+        let base = VowifiConfig {
+            reg_rejected_cooldown_sec: 600,
+            line_overrides: vec![VowifiLineOverride {
+                modem_port: Some("/dev/ttyUSB3".to_string()),
+                reg_rejected_cooldown_sec: Some(120),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let modems = vec![
+            ready_modem("ec20-ABCDEF", "/dev/ttyUSB3", false, "404011111111111"),
+            ready_modem("ec20-FEDCBA", "/dev/ttyUSB7", false, "404012222222222"),
+        ];
+        let assignment = RoleAssignment::from_probed(&modems, &base.line_overrides, false);
+        let result = resolve_lines(&assignment, &base);
+        let cooldown_for = |port: &str| {
+            result
+                .lines
+                .iter()
+                .find(|l| l.modem_port == std::path::Path::new(port))
+                .map(|l| l.config.reg_rejected_cooldown_sec)
+        };
+        assert_eq!(cooldown_for("/dev/ttyUSB3"), Some(120));
+        assert_eq!(cooldown_for("/dev/ttyUSB7"), Some(600));
+    }
+
     #[test]
     fn a_configured_lines_msisdn_reaches_the_resolution_entry() {
         let base = VowifiConfig {

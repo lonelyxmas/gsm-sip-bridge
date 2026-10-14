@@ -302,6 +302,13 @@ sms_delivery_report = true
 # where the onward leg is already fully trusted and showing the real name
 # always is preferred.
 respect_caller_privacy = true
+# How long (seconds) a reg-event NOTIFY reporting this line's registration
+# "rejected" holds it off before one more attempt (TS 24.229 Sec5.1.1.7).
+# The network's own retry-after wins when longer. Never counts against the
+# renewal-failure budget, so a network that keeps rejecting the line does not
+# restart the agent. 60..=86400; overridable per [[vowifi.line]]. [volte]
+# inherits this value when its own key is unset.
+# reg_rejected_cooldown_sec = 1800
 # Optional originating (INVITE) headers, by name. Empty (the default) is the
 # minimal header set every carrier in production here places calls on --
 # except P-Access-Network-Info, which is unconditionally "IEEE-802.11"
@@ -383,6 +390,7 @@ max_lines = 8
 # imsi_override = "404940123456789" # override the IMSI from the SIM for this line
 # imei_override = "864650053414154" # override the IMEI from the modem for this line
 # msisdn = "+919000000001"         # this line's phone number, shown in its alerts
+# reg_rejected_cooldown_sec = 1800 # this line's reg-event "rejected" cooldown
 #
 # Setting both imsi_override and imei_override (alongside mcc/mnc above)
 # pins this line's network identity completely, so vowifi-ims-agent never
@@ -480,6 +488,9 @@ sms_delivery_report = true
 # Same meaning as [vowifi]'s field of the same name above, and the same
 # inherits-when-absent behaviour as sms_delivery_report just above.
 respect_caller_privacy = true
+# Same meaning as [vowifi]'s field of the same name above; inherits its value
+# when unset. Overridable per [[volte.line]].
+# reg_rejected_cooldown_sec = 1800
 
 # --- Per-line configuration --------------------------------------------
 # Omit entirely for full auto-discovery: every SIM-ready modem becomes its
@@ -494,6 +505,7 @@ respect_caller_privacy = true
 # pcscf = "2400:5200:a100:819::6" # (default "" = auto-discover)
 # iface = "wwan1"                # this modem's data interface (default "" = auto-detect)
 # msisdn = "919000000001"        # advertised in P-Preferred-Identity
+# reg_rejected_cooldown_sec = 1800 # this line's reg-event "rejected" cooldown
 
 # Per-line network isolation (specs/020-volte-line-netns): each
 # auto-discovered line's LTE interface and carrier-facing traffic run

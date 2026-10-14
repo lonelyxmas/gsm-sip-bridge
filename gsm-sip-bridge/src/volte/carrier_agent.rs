@@ -231,6 +231,12 @@ pub(crate) fn run(
         respond_on_client: app_config.volte.respond_on_client,
         sms_delivery_report: app_config.volte.sms_delivery_report,
         respect_caller_privacy: app_config.volte.respect_caller_privacy,
+        // `[[volte.line]]`'s override, else `[volte]` (itself inheriting
+        // `[vowifi]` when unset).
+        reg_rejected_cooldown: std::time::Duration::from_secs(
+            line.reg_rejected_cooldown_sec
+                .unwrap_or(app_config.volte.reg_rejected_cooldown_sec),
+        ),
         answer_preference: sdp::AnswerPreference::cellular(),
         // Must equal the telephony line's `sip_leg_port`. They come from this
         // line's single derivation so they cannot drift apart.

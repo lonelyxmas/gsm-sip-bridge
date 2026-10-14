@@ -283,6 +283,7 @@ gets discovered/resolved.
 | `epdg_ip` | string | unset (resolve `epdg_fqdn`) | Skip DNS and dial this ePDG IP directly — shared across every line if set |
 | `src_addr` | string | unset (auto-select) | Force the tunnel's local source address — shared across every line if set |
 | `keepalive_interval_sec` | integer | 20 | Idle-tunnel TCP keepalive interval |
+| `reg_rejected_cooldown_sec` | integer | `1800` | How long a reg-event NOTIFY reporting this line's registration `rejected` holds it off before one more attempt (specs/089, TS 24.229 §5.1.1.7). The network's own `retry-after` wins when it is longer. The cooldown never counts against the renewal-failure budget, so a network that keeps rejecting the line does not restart the agent; `vowifi-status` shows it as `rejection_cooldown`. Accepted range `60..=86400` — the floor stops a short value from turning a rejection into a re-registration loop. Overridable per `[[vowifi.line]]`; `[volte]` inherits it when its own key is unset |
 | `tunnel_engine` | enum | `strongswan` | `strongswan` or `swu` (specs/012-strongswan-epdg). **`swu` requires the full image** (`ghcr.io/selvakn/gsm-sip-bridge:<version>-swu`): the default slim image ships without the SWu/Python engine and fails fast at startup if this is set to `swu` (specs/033-slim-optional-swu-image) |
 | `vpcd_host` | string | `127.0.0.1` | pcscd's vpcd virtual reader host (strongswan engine) |
 | `vpcd_port` | integer | 15963 | Base TCP port pcscd's shared vpcd reader listens on — one reader serves every line, at `base + line-index`. Unlike the other per-line fields, this **is** a genuine config key: keep the base **below** the kernel's ephemeral range (`net.ipv4.ip_local_port_range`, 32768-60999 by default) — see [operations.md](operations.md#vowifi-no-smart-card-reader--vpcd-connection-refused) |
@@ -304,6 +305,7 @@ network identity. Every field is optional except the matcher.
 | `imsi_override` | string | unset (read via AT+CIMI) | Diagnostic escape hatch: use this IMSI instead of reading it from the SIM |
 | `imei_override` | string | unset (read via AT+CGSN, or auto-generated for a `pcsc_reader` line) | Diagnostic escape hatch: use this IMEI instead of reading it from the modem |
 | `msisdn` | string | none | This line's phone number, shown in its alert notifications (specs/034-alert-identity) |
+| `reg_rejected_cooldown_sec` | integer | inherits `[vowifi].reg_rejected_cooldown_sec` | This line's reg-event `rejected` cooldown, `60..=86400` |
 | `pcsc_reader` | bool | `false` | This line's SIM comes from a physical PC/SC reader (e.g. OmniKey AG 3x21) instead of a modem (specs/023-omnikey-pcsc-vowifi) — see [docs/omnikey-pcsc-vowifi.md](omnikey-pcsc-vowifi.md). `imsi_override` becomes mandatory — not because the IMSI is unreadable (it is read from `EF_IMSI` over PC/SC) but because it names which reader's card this line owns, which must be known before any card session exists; run `gsm-sip-bridge pcsc-list` to see every attached reader's card (IMSI, MCC/MNC, carrier) before writing this in. `mcc`/`mnc` stay optional and auto-derive from the card's own `EF_IMSI`/`EF_AD` via `vowifi-plmn --pcsc-imsi`; pin them only for a card whose `EF_AD` omits the MNC-length byte, which fails at startup saying so. `imei_override` stays optional — left unset, a stable, Luhn-valid IMEI is auto-generated from the line's IMSI (an IMEI is a device identity, genuinely not on the card). Requires `[vowifi].tunnel_engine = "strongswan"` (the default); the `swu` engine has no PC/SC support and refuses to start with this set |
 
 **SMS delivery** (specs/038-reliable-sms-delivery): a VoWiFi registration
@@ -344,6 +346,7 @@ infrastructure with no config knob at all.
 | `respond_on_client` | boolean | `true` | Same meaning as `[vowifi]`'s field above — this path installs its own Gm IPsec SAs just like the ePDG one, so Jio's refusal of responses sent from `port_us` applies here too. Unlike `[vowifi]`, defaults on: confirmed required on Jio and harmless on Vodafone. Set `false` for a carrier proven to need RFC 3261 §18.2.2's normal behaviour instead |
 | `sms_delivery_report` | boolean | inherits `[vowifi].sms_delivery_report` | Same meaning as `[vowifi]`'s field above — SMS-over-IP's RP-layer acknowledgement is the same TS 24.341 procedure regardless of access. Settable independently, but **when this key is absent it inherits `[vowifi]`'s value** rather than defaulting to `true` on its own — a config that set `[vowifi].sms_delivery_report` before `[volte]` had this key already relied on it governing VoLTE too (both paths share one dispatcher), so an upgrade must not silently flip VoLTE's behaviour back. A VoLTE-only deployment with no `[vowifi]` section gets `true`, `[vowifi]`'s own default |
 | `respect_caller_privacy` | boolean | inherits `[vowifi].respect_caller_privacy` | Same meaning as `[vowifi]`'s field above — the RFC 3325 `Privacy` header is a SIP/IMS-layer signal, not an access one. Inherits `[vowifi]`'s value when absent, settable independently, for the same upgrade-compatibility reason as `sms_delivery_report` above |
+| `reg_rejected_cooldown_sec` | integer | inherits `[vowifi].reg_rejected_cooldown_sec` | Same meaning as `[vowifi]`'s field above; `volte-status` shows it as `rejection_cooldown`. Inherits `[vowifi]`'s value when absent, `60..=86400` |
 
 #### `[[volte.line]]`
 
@@ -360,6 +363,7 @@ Every field is optional except the matcher.
 | `pcscf` | string | unset (auto-discover) | This line's explicit P-CSCF address. Unset falls back to `pcscf_source_path`, then on-modem discovery — which does not work on every carrier |
 | `iface` | string | unset (auto-detect) | Host data interface bound to this line's IMS PDN. Unset auto-detects from the modem's own USB device |
 | `msisdn` | string | none | This line's own MSISDN, advertised in the P-Preferred-Identity |
+| `reg_rejected_cooldown_sec` | integer | inherits `[volte].reg_rejected_cooldown_sec` | This line's reg-event `rejected` cooldown, `60..=86400` |
 
 ### `[sip_server]`
 

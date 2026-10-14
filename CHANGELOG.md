@@ -10,6 +10,13 @@ across releases.
 
 ### Added
 
+- **`reg_rejected_cooldown_sec`.** How long a reg-event `rejected` holds a
+  line's registration off before one more attempt (default 1800,
+  `60..=86400`), under `[vowifi]`, `[[vowifi.line]]`, `[volte]` and
+  `[[volte.line]]`. `vowifi-status`/`volte-status` print it as
+  `rejection_cooldown`
+  ([#124](https://github.com/selvakn/gsm-sip-bridge/issues/124)).
+
 - **Caller keypad digits relayed to the phone.** RFC 4733 digits received
   on the carrier leg of a VoWiFi/VoLTE call are re-sent on the paired phone
   or PBX leg (the conference bridge between them carries PCM only).
@@ -30,6 +37,19 @@ across releases.
   circuit-switched path is unchanged.
 
 ### Fixed
+
+- **Renewal re-registration loop.** A reg-event NOTIFY retiring the binding a
+  renewal replaced was read as the current binding being lost, because it
+  still echoed the IMEI. Contacts are now attributed by the registered
+  address first; an IMEI-echoing entry at another address is logged as
+  `replaced binding retired` and ignored
+  ([#124](https://github.com/selvakn/gsm-sip-bridge/issues/124)).
+- **Per-event deregistration policy.** `deactivated` re-registers at once,
+  `unregistered`/`probation` wait on the backoff (at least the network's
+  `retry-after`), and `rejected` ends the call and starts a cooldown that
+  never spends the renewal-failure budget and refuses outbound calls so they
+  go out on another line (TS 24.229 §5.1.1.7)
+  ([#124](https://github.com/selvakn/gsm-sip-bridge/issues/124)).
 
 - **Carrier-deleted IKE_SA recovered, with its cause.** The supervisor now
   tells a lost IKE_SA from a lost CHILD_SA, re-initiates, and restarts the

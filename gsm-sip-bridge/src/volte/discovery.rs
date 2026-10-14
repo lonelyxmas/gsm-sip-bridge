@@ -67,6 +67,9 @@ pub struct ResolvedVolteLine {
     /// PDN only, skip host interface configuration — the base behaviour).
     pub iface: String,
     pub msisdn: Option<String>,
+    /// `[[volte.line]].reg_rejected_cooldown_sec`, if this line's override
+    /// set one; `None` falls back to `[volte]`'s value at runtime.
+    pub reg_rejected_cooldown_sec: Option<u64>,
     pub sip_leg_port: u16,
     pub control_port: u16,
     pub status_port: u16,
@@ -166,6 +169,7 @@ fn resolve_one_volte_line(
         .or_else(|| modem.net_device.clone())
         .unwrap_or_default();
     let msisdn = over.and_then(|o| o.msisdn.clone());
+    let reg_rejected_cooldown_sec = over.and_then(|o| o.reg_rejected_cooldown_sec);
 
     // Namespace/veth derivation (specs/020-volte-line-netns research.md R4).
     // Isolation is unconditional (FR-004b): there is no "no netns" branch for
@@ -198,6 +202,7 @@ fn resolve_one_volte_line(
         pcscf,
         iface,
         msisdn,
+        reg_rejected_cooldown_sec,
         sip_leg_port: sip_leg_port(index),
         control_port: control_port(index),
         status_port: status_port(index),
@@ -268,6 +273,11 @@ pub struct VolteLineManifestEntry {
     /// split carrier-agent/bridge processes only ever see this line via the
     /// manifest, not the original config.
     pub msisdn: String,
+    /// This line's `[[volte.line]].reg_rejected_cooldown_sec` override, if
+    /// any — round-trips for the same reason as `msisdn`. `#[serde(default)]`
+    /// so a manifest from an older build still reads (as no override).
+    #[serde(default)]
+    pub reg_rejected_cooldown_sec: Option<u64>,
 }
 
 /// Default path for the running bridge's line manifest.
@@ -315,6 +325,7 @@ pub fn write_manifest(
                 veth_telephony_addr: l.veth_telephony_addr.clone(),
                 pcscf: l.pcscf.clone().unwrap_or_default(),
                 msisdn: l.msisdn.clone().unwrap_or_default(),
+                reg_rejected_cooldown_sec: l.reg_rejected_cooldown_sec,
             })
             .collect(),
     };
@@ -494,11 +505,13 @@ mod tests {
             pcscf: Some("2400:5200:a100:819::6".to_string()),
             iface: Some("wwan7".to_string()),
             msisdn: Some("919000000001".to_string()),
+            reg_rejected_cooldown_sec: Some(300),
             ..Default::default()
         }];
         let modems = vec![ready("ec20-AAAAAA", "/dev/ttyUSB0")];
         let result = resolve_volte_lines(&modems, &b);
         let l = &result.lines[0];
+        assert_eq!(l.reg_rejected_cooldown_sec, Some(300));
         assert_eq!(l.cid, 5);
         assert_eq!(l.pcscf.as_deref(), Some("2400:5200:a100:819::6"));
         assert_eq!(l.iface, "wwan7");
@@ -657,6 +670,7 @@ mod tests {
                 veth_telephony_addr: "10.98.0.2".to_string(),
                 pcscf: String::new(),
                 msisdn: String::new(),
+                reg_rejected_cooldown_sec: Some(600),
             }],
         };
         let json = serde_json::to_string(&manifest).unwrap();
@@ -704,6 +718,7 @@ mod tests {
             pcscf: None,
             iface: "wwan0".to_string(),
             msisdn: Some("919000000001".to_string()),
+            reg_rejected_cooldown_sec: Some(300),
             sip_leg_port: LOOPBACK_SIP_PORT,
             control_port: LOOPBACK_CONTROL_PORT,
             status_port: LOOPBACK_STATUS_PORT,
@@ -720,6 +735,11 @@ mod tests {
         assert_eq!(
             manifest.lines[0].msisdn, "919000000001",
             "msisdn must not be dropped"
+        );
+        assert_eq!(
+            manifest.lines[0].reg_rejected_cooldown_sec,
+            Some(300),
+            "the per-line cooldown override must not be dropped"
         );
         std::env::remove_var(MANIFEST_PATH_ENV);
     }

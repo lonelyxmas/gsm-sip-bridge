@@ -17,6 +17,13 @@ const LOGGING_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
 
 const DEFAULT_SMS_DB_PATH: &str = "/var/lib/gsm-sip-bridge/store.db";
 pub const DEFAULT_CONTROL_SOCKET: &str = "/tmp/gsm-sip-bridge.sock";
+/// How long a reg-event `rejected` holds registration off by default
+/// (`reg_rejected_cooldown_sec`, specs/089 FR-010).
+pub const DEFAULT_REG_REJECTED_COOLDOWN_SEC: u64 = 1800;
+
+fn default_reg_rejected_cooldown_sec() -> u64 {
+    DEFAULT_REG_REJECTED_COOLDOWN_SEC
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SipTransport {
@@ -789,6 +796,14 @@ pub struct VowifiConfig {
     /// see `VolteConfig::respect_caller_privacy`, VoLTE's own copy, kept
     /// separate for the same reason as `sms_delivery_report` above.
     pub respect_caller_privacy: bool,
+    /// How long, in seconds, a reg-event NOTIFY reporting our registration
+    /// `rejected` holds this line off before its one next attempt
+    /// (specs/089, TS 24.229 §5.1.1.7). The network's own `retry-after`
+    /// wins when it is longer. Never counted against the renewal-failure
+    /// budget, so a network that keeps rejecting us does not restart the
+    /// agent. `60..=86400`; per line via `[[vowifi.line]]`.
+    #[serde(default = "default_reg_rejected_cooldown_sec")]
+    pub reg_rejected_cooldown_sec: u64,
     /// Extra originating (INVITE) headers a carrier's TAS may want before it
     /// will treat the request as an MMTel voice call.
     ///
@@ -960,6 +975,9 @@ pub struct VowifiLineOverride {
     /// notifications. Mirrors `VolteLineOverride::msisdn`. Optional; unset ⇒
     /// alerts for this line show `unknown` in the phone field.
     pub msisdn: Option<String>,
+    /// Overrides `VowifiConfig::reg_rejected_cooldown_sec` for this line.
+    #[serde(default)]
+    pub reg_rejected_cooldown_sec: Option<u64>,
 }
 
 impl Default for VowifiConfig {
@@ -976,6 +994,7 @@ impl Default for VowifiConfig {
             gm_cipher_alg: String::new(),
             respond_on_client: false,
             sms_delivery_report: true,
+            reg_rejected_cooldown_sec: DEFAULT_REG_REJECTED_COOLDOWN_SEC,
             respect_caller_privacy: true,
             originating_headers: OriginatingHeaders::default(),
             pcscf_source_path: "/tmp/pcscf".to_string(),
@@ -1088,6 +1107,10 @@ pub struct VolteConfig {
     /// absent, for the same upgrade-compatibility reason as
     /// `sms_delivery_report` above.
     pub respect_caller_privacy: bool,
+    /// The LTE counterpart to `VowifiConfig::reg_rejected_cooldown_sec`.
+    /// Inherits `[vowifi]`'s value when the `[volte]` key is absent, like
+    /// `sms_delivery_report` above; per line via `[[volte.line]]`.
+    pub reg_rejected_cooldown_sec: u64,
     /// Base network namespace name for a line's carrier-facing half
     /// (specs/020-volte-line-netns). Line 0 uses this unindexed; later lines
     /// append their index — the LTE analogue of `[vowifi].netns`, on a
@@ -1140,6 +1163,8 @@ pub struct VolteLineOverride {
     pub iface: Option<String>,
     /// This line's own MSISDN, advertised in the P-Preferred-Identity.
     pub msisdn: Option<String>,
+    /// Overrides `VolteConfig::reg_rejected_cooldown_sec` for this line.
+    pub reg_rejected_cooldown_sec: Option<u64>,
 }
 
 impl Default for VolteConfig {
@@ -1157,6 +1182,7 @@ impl Default for VolteConfig {
             register_request_uri: "home-domain".to_string(),
             respond_on_client: true,
             sms_delivery_report: true,
+            reg_rejected_cooldown_sec: DEFAULT_REG_REJECTED_COOLDOWN_SEC,
             respect_caller_privacy: true,
             netns: "volte".to_string(),
             veth_carrier_iface: "veth-volte-ims".to_string(),
@@ -3047,5 +3073,73 @@ password = "s3cret"
         .unwrap_err()
         .to_string();
         assert!(err.contains("sip_server.account.realm"), "got: {err}");
+    }
+
+    /// specs/089 FR-010: the reg-event `rejected` cooldown defaults to 30
+    /// minutes on both paths.
+    #[test]
+    fn reg_rejected_cooldown_defaults_to_thirty_minutes() {
+        let c = parse(MINIMAL_TOML);
+        assert_eq!(c.vowifi.reg_rejected_cooldown_sec, 1800);
+        assert_eq!(c.volte.reg_rejected_cooldown_sec, 1800);
+    }
+
+    #[test]
+    fn reg_rejected_cooldown_is_settable_per_section_and_per_line() {
+        let c = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nreg_rejected_cooldown_sec = 600\n\
+             [[vowifi.line]]\nmodem_port = \"/dev/ttyUSB2\"\nreg_rejected_cooldown_sec = 120\n"
+        ));
+        assert_eq!(c.vowifi.reg_rejected_cooldown_sec, 600);
+        assert_eq!(
+            c.vowifi.line_overrides[0].reg_rejected_cooldown_sec,
+            Some(120)
+        );
+        // [volte] absent inherits [vowifi].
+        assert_eq!(c.volte.reg_rejected_cooldown_sec, 600);
+
+        let c = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nreg_rejected_cooldown_sec = 600\n\
+             [volte]\nreg_rejected_cooldown_sec = 900\n\
+             [[volte.line]]\nmodem_port = \"/dev/ttyUSB2\"\nreg_rejected_cooldown_sec = 300\n"
+        ));
+        assert_eq!(c.volte.reg_rejected_cooldown_sec, 900);
+        assert_eq!(
+            c.volte.line_overrides[0].reg_rejected_cooldown_sec,
+            Some(300)
+        );
+    }
+
+    /// The floor keeps an operator from configuring the #124 loop back in.
+    #[test]
+    fn an_out_of_range_reg_rejected_cooldown_is_rejected_naming_the_key() {
+        for (section, value) in [
+            ("[vowifi]", 59),
+            ("[vowifi]", 86401),
+            ("[volte]", 59),
+            ("[[vowifi.line]]\nmodem_port = \"/dev/ttyUSB2\"", 86401),
+            ("[[volte.line]]\nmodem_port = \"/dev/ttyUSB2\"", 59),
+        ] {
+            let err = try_parse(&format!(
+                "{MINIMAL_TOML}\n{section}\nreg_rejected_cooldown_sec = {value}\n"
+            ))
+            .expect_err("out of range")
+            .to_string();
+            assert!(
+                err.contains("reg_rejected_cooldown_sec"),
+                "{section}: {err}"
+            );
+            assert!(err.contains("60..=86400"), "{section}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_misspelt_reg_rejected_cooldown_is_still_an_unknown_key() {
+        let err = try_parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nreg_rejected_cooldown_secs = 600\n"
+        ))
+        .expect_err("strict parsing")
+        .to_string();
+        assert!(err.contains("reg_rejected_cooldown_secs"), "{err}");
     }
 }

@@ -106,6 +106,9 @@ pub struct BridgeLine {
     /// independently.
     pub settings: VolteSettings,
     pub msisdn: Option<String>,
+    /// This line's `[[volte.line]].reg_rejected_cooldown_sec` override;
+    /// `None` uses `[volte]`'s value.
+    pub reg_rejected_cooldown_sec: Option<u64>,
     /// This line's carrier↔telephony leg port, control port, and status port —
     /// derived per line by [`super::discovery`] so several lines share one
     /// namespace without racing for a bind.
@@ -450,6 +453,7 @@ fn write_manifest(lines: &[BridgeLine]) {
                 veth_telephony_addr: l.veth_telephony_addr.clone(),
                 pcscf: l.settings.pcscf.map(|a| a.to_string()).unwrap_or_default(),
                 msisdn: l.msisdn.clone().unwrap_or_default(),
+                reg_rejected_cooldown_sec: l.reg_rejected_cooldown_sec,
             })
             .collect(),
     };
@@ -558,6 +562,7 @@ fn print_line_live_status(
             can_answer,
             blocked_reason,
             gm_connection,
+            rejection_cooldown_until,
         }) => (
             state,
             registered_at,
@@ -566,6 +571,7 @@ fn print_line_live_status(
             can_answer,
             blocked_reason,
             gm_connection,
+            rejection_cooldown_until,
         ),
         // Unreachable, or an unexpected reply, both mean this line's carrier
         // half is not answering.
@@ -575,8 +581,16 @@ fn print_line_live_status(
         }
     };
 
-    let (state, registered_at, expires_at, last_failure, can_answer, blocked_reason, gm_connection) =
-        reg;
+    let (
+        state,
+        registered_at,
+        expires_at,
+        last_failure,
+        can_answer,
+        blocked_reason,
+        gm_connection,
+        rejection_cooldown_until,
+    ) = reg;
     println!("  registration:");
     println!("    state: {state}");
     println!("    registered_at: {}", format_unix(registered_at));
@@ -588,6 +602,13 @@ fn print_line_live_status(
         } else {
             &gm_connection
         }
+    );
+    println!(
+        "    rejection_cooldown: {}",
+        crate::vowifi::format_rejection_cooldown(
+            rejection_cooldown_until,
+            crate::vowifi::unix_now()
+        )
     );
     match last_failure {
         Some((t, msg)) => println!("    last_failure: {} {msg}", format_unix(Some(t))),
@@ -676,6 +697,7 @@ mod tests {
             card_id: "ec20-test".to_string(),
             settings: super::super::VolteSettings::default(),
             msisdn: None,
+            reg_rejected_cooldown_sec: None,
             sip_leg_port: LOOPBACK_SIP_PORT,
             control_port: LOOPBACK_CONTROL_PORT,
             status_port: LOOPBACK_STATUS_PORT + super::super::discovery::LINE_PORT_STRIDE,

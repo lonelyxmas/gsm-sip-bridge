@@ -586,6 +586,10 @@ pub struct RegistrationStatus {
     /// persists only the first four fields, so a status read from disk
     /// carries the `Up` default. See [`GmConnectionState`].
     pub gm_connection: GmConnectionState,
+    /// When a reg-event `rejected` cooldown ends and the next registration
+    /// attempt goes out (specs/089 FR-017); `None` when none is running.
+    /// In-memory only, like `gm_connection`.
+    pub rejected_until: Option<std::time::SystemTime>,
 }
 
 impl Default for RegistrationStatus {
@@ -600,6 +604,7 @@ impl Default for RegistrationStatus {
             pbx_registered: true,
             deferred_maintenance: None,
             gm_connection: GmConnectionState::Up,
+            rejected_until: None,
         }
     }
 }
