@@ -2008,6 +2008,14 @@ impl LoopState {
                 };
                 if let Some(floor) = deregistration.retry_after.map(|r| now + r) {
                     self.next_renewal_attempt = self.next_renewal_attempt.max(Some(floor));
+                    // A rejection cooldown already running is held longer
+                    // too; status reports its deadline, so move that with it.
+                    if let Some(r) = &mut self.rejection {
+                        if floor > r.until {
+                            r.until_wall += floor - r.until;
+                            r.until = floor;
+                        }
+                    }
                 }
                 self.log_backoff_retry(deregistration.event, age, now);
                 result
@@ -5104,5 +5112,43 @@ mod tests {
         // The cooldown's own attempt starts (`on_idle_tick` takes it).
         st.rejection.take();
         assert_eq!(st.outbound_refusal(), None);
+    }
+
+    /// A notice that extends the wait during a rejection cooldown moves the
+    /// cooldown's reported deadline with it (PR #125 review).
+    #[test]
+    fn a_longer_wait_during_a_rejection_cooldown_moves_its_deadline() {
+        let mut st = LoopState::new();
+        let now = st.last_registered + Duration::from_secs(1);
+        st.on_network_deregistration(now, false, &dereg(DeregEvent::Rejected), COOLDOWN)
+            .expect("never an exit");
+        let before = st.rejection.expect("a cooldown is running");
+
+        st.on_network_deregistration(
+            now,
+            false,
+            &dereg_after(DeregEvent::Probation, 3600),
+            COOLDOWN,
+        )
+        .expect("never an exit");
+        let after = st.rejection.expect("still cooling down");
+        let extended = Duration::from_secs(3600) - COOLDOWN;
+        assert_eq!(after.until, now + Duration::from_secs(3600));
+        assert_eq!(st.next_renewal_attempt, Some(after.until));
+        assert_eq!(after.until_wall, before.until_wall + extended);
+        assert_eq!(
+            st.consecutive_renewal_failures, 0,
+            "the rejection is not counted"
+        );
+
+        // A shorter retry-after leaves the cooldown alone.
+        st.on_network_deregistration(
+            now,
+            false,
+            &dereg_after(DeregEvent::Unregistered, 60),
+            COOLDOWN,
+        )
+        .expect("never an exit");
+        assert_eq!(st.rejection, Some(after));
     }
 }
