@@ -24,6 +24,9 @@
 
 pub mod agent;
 mod amr_rtp;
+/// The MIME body decoder every SDP consumer goes through (specs/088): a SIP
+/// body may be `multipart/*` (RFC 5621 §4.2), never assume bare SDP.
+pub(crate) mod body;
 pub mod call;
 /// `pub` rather than `pub(crate)`: `sip::server`'s registrar verifies inbound
 /// REGISTER credentials with the same RFC 2617 math this module computes

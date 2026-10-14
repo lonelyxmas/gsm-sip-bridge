@@ -758,16 +758,13 @@ pub fn parse_offer(body: &str) -> BridgeResult<SdpOffer> {
     })
 }
 
-/// One `a=curr:qos`/`a=conf:qos` line this bridge's answer will emit —
-/// already answer-relative (i.e. already inverted from whatever the offer
-/// said, per RFC 3312 §5.2). `strength` is `None` when only `a=curr`
-/// should be emitted (the offer's line didn't ask for confirmation);
-/// `Some` also emits the matching `a=conf:qos` line.
+/// One `a=curr:qos` line this bridge's answer will emit — already
+/// answer-relative (i.e. already inverted from whatever the offer said, per
+/// RFC 3312 §5.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QosAnswerLine {
     pub status_type: QosStatusType,
     pub met: QosDirection,
-    pub confirm: bool,
 }
 
 /// The bridge's own accept/decline decision for an offer's precondition
@@ -777,23 +774,19 @@ pub struct QosAnswerLine {
 /// rather than the `Require` header alone — see research.md Decisions 1-2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreconditionVerdict {
-    /// No precondition lines, or every one is honestly answerable.
-    Proceed(Vec<QosAnswerLine>),
+    /// No precondition lines, or every one is honestly answerable. Both lists
+    /// are answer-relative, in offer order: `current` renders as
+    /// `a=curr:qos`, `desired` as `a=des:qos`.
+    Proceed {
+        current: Vec<QosAnswerLine>,
+        desired: Vec<QosDesired>,
+    },
     /// At least one `e2e`/`mandatory` line cannot be honestly confirmed
     /// without a synchronization mechanism (`UPDATE`/`100rel`) this bridge
     /// does not implement (research.md Decision 2).
     Decline,
 }
 
-/// Decide whether `offer`'s precondition content (if any) can be honoured,
-/// and what the answer should say about it. RFC 3312 §4's local/remote
-/// tags are relative to whoever generated the SDP and invert between offer
-/// and answer — see [`QosStatusType`]'s doc comment and research.md
-/// Decision 1. This bridge's own segment is the offer's `Remote` status
-/// type (inverted to `Local` in the answer); the offerer's own segment is
-/// the offer's `Local` status type (inverted to `Remote`, mirrored not
-/// asserted — User Story 3); `E2e` is not relative and, at `mandatory`
-/// strength, cannot be unilaterally confirmed (User Story 2).
 /// RFC 3312 §4/§5.2: `send`/`recv` are relative to whoever generated the
 /// SDP, exactly like `local`/`remote` (research.md Decision 1) — the
 /// offerer's "send" (offerer→answerer) is the answerer's "recv", and vice
@@ -810,8 +803,55 @@ fn invert_qos_direction(direction: QosDirection) -> QosDirection {
     }
 }
 
+/// RFC 3312 §5.2 Table 4: the offer's `local` is the answer's `remote` and
+/// vice versa; `e2e` is not relative.
+fn invert_qos_status_type(status_type: QosStatusType) -> QosStatusType {
+    match status_type {
+        QosStatusType::Local => QosStatusType::Remote,
+        QosStatusType::Remote => QosStatusType::Local,
+        QosStatusType::E2e => QosStatusType::E2e,
+    }
+}
+
+/// Decide whether `offer`'s precondition content (if any) can be honoured,
+/// and what the answer should say about it. RFC 3312 §4's local/remote
+/// tags are relative to whoever generated the SDP and invert between offer
+/// and answer — see [`QosStatusType`]'s doc comment and research.md
+/// Decision 1.
+///
+/// Current status (`a=curr:qos`):
+/// - this bridge's own segment (the offer's `Remote`, inverted to `Local`)
+///   is always met, in exactly the direction asked;
+/// - the offerer's own segment (the offer's `Local`, inverted to `Remote`)
+///   is mirrored from the offer's `a=curr:qos local`, never asserted;
+/// - `e2e` is reported only as met as the offerer says it is (its
+///   `a=curr:qos e2e`, else its `a=curr:qos local`), else `none` (specs/088
+///   Clarification Q3) — this bridge can't vouch for the offerer's half. At
+///   `mandatory` strength `e2e` cannot be unilaterally confirmed at all, so
+///   the call is declined.
+///
+/// Desired status (`a=des:qos`): every offer line, inverted, at the same
+/// strength — RFC 3312 §5.2 never lets the answer downgrade it (specs/088).
+///
+/// Never `a=conf:qos` (specs/088 research.md Decision 8): RFC 3312 §6 needs
+/// it only from a UAS that cannot meet the mandatory preconditions on its
+/// own, and receiving it obliges the carrier to send an `UPDATE` once they
+/// are met — which this bridge would answer `405`.
 pub fn precondition_verdict(offer: &SdpOffer) -> PreconditionVerdict {
-    let mut answer_lines = Vec::new();
+    let mut current = Vec::new();
+
+    // What the offerer itself says about the end-to-end status, inverted.
+    let offerer_e2e = offer
+        .offerer_curr
+        .iter()
+        .find(|s| s.status_type == QosStatusType::E2e)
+        .or_else(|| {
+            offer
+                .offerer_curr
+                .iter()
+                .find(|s| s.status_type == QosStatusType::Local)
+        })
+        .map_or(QosDirection::None, |s| invert_qos_direction(s.met));
 
     for line in &offer.preconditions {
         match line.status_type {
@@ -823,17 +863,11 @@ pub fn precondition_verdict(offer: &SdpOffer) -> PreconditionVerdict {
                 // exists". Reported as exactly the requested direction,
                 // not unconditionally `sendrecv`: the relay's own
                 // capability is always full-duplex, but the answer
-                // confirms what was asked, not more than was asked
-                // (Greptile review, PR #68) — and the direction itself
-                // must invert (`invert_qos_direction`), same as the
-                // status-type already does.
-                answer_lines.push(QosAnswerLine {
+                // states what was asked, not more than was asked
+                // (Greptile review, PR #68).
+                current.push(QosAnswerLine {
                     status_type: QosStatusType::Local,
                     met: invert_qos_direction(line.direction),
-                    confirm: matches!(
-                        line.strength,
-                        QosStrength::Mandatory | QosStrength::Optional
-                    ),
                 });
             }
             QosStatusType::E2e => {
@@ -843,15 +877,9 @@ pub fn precondition_verdict(offer: &SdpOffer) -> PreconditionVerdict {
                     // no `100rel` (research.md Decision 2).
                     return PreconditionVerdict::Decline;
                 }
-                // Reports only what this bridge itself can attest to —
-                // never the offerer's contribution — and only for the
-                // requested direction, inverted the same as `Remote`
-                // above (the tag relativity rule isn't specific to
-                // segment lines).
-                answer_lines.push(QosAnswerLine {
+                current.push(QosAnswerLine {
                     status_type: QosStatusType::E2e,
-                    met: invert_qos_direction(line.direction),
-                    confirm: false,
+                    met: offerer_e2e,
                 });
             }
             QosStatusType::Local => {
@@ -862,21 +890,96 @@ pub fn precondition_verdict(offer: &SdpOffer) -> PreconditionVerdict {
         }
     }
 
-    // The offerer's own self-reported current status (User Story 3):
-    // mirrored through inverted — both the status-type (`Local`→`Remote`)
+    // The offerer's own self-reported current status (specs/048 User Story
+    // 3): mirrored through inverted — both the status-type (`Local`→`Remote`)
     // and the direction (`invert_qos_direction`) — never a value this
     // bridge computed itself.
     for status in &offer.offerer_curr {
         if status.status_type == QosStatusType::Local {
-            answer_lines.push(QosAnswerLine {
+            current.push(QosAnswerLine {
                 status_type: QosStatusType::Remote,
                 met: invert_qos_direction(status.met),
-                confirm: false,
             });
         }
     }
 
-    PreconditionVerdict::Proceed(answer_lines)
+    let desired = offer
+        .preconditions
+        .iter()
+        .map(|line| QosDesired {
+            strength: line.strength,
+            status_type: invert_qos_status_type(line.status_type),
+            direction: invert_qos_direction(line.direction),
+        })
+        .collect();
+
+    PreconditionVerdict::Proceed { current, desired }
+}
+
+/// The halves of `desired` that `met` does not cover.
+fn qos_shortfall(desired: QosDirection, met: QosDirection) -> QosDirection {
+    let has = |d: QosDirection, half: QosDirection| d == half || d == QosDirection::SendRecv;
+    let send = has(desired, QosDirection::Send) && !has(met, QosDirection::Send);
+    let recv = has(desired, QosDirection::Recv) && !has(met, QosDirection::Recv);
+    match (send, recv) {
+        (true, true) => QosDirection::SendRecv,
+        (true, false) => QosDirection::Send,
+        (false, true) => QosDirection::Recv,
+        (false, false) => QosDirection::None,
+    }
+}
+
+/// The offerer's own mandatory preconditions it says are not yet met: every
+/// `a=des:qos mandatory local <dir>` whose `a=curr:qos local` (absent = none)
+/// does not cover `<dir>`, as `(Local, <the missing halves>)`, offer-relative.
+///
+/// Diagnostic only (specs/088 FR-018a, Clarification Q2): the call proceeds
+/// anyway — waiting for the offerer to finish its reservation would need the
+/// `UPDATE` this bridge does not implement, and the carrier's own policy, not
+/// ours, governs whether its segment is ready.
+pub fn offerer_unmet_mandatory(offer: &SdpOffer) -> Vec<(QosStatusType, QosDirection)> {
+    let met = offer
+        .offerer_curr
+        .iter()
+        .find(|s| s.status_type == QosStatusType::Local)
+        .map_or(QosDirection::None, |s| s.met);
+    offer
+        .preconditions
+        .iter()
+        .filter(|d| d.strength == QosStrength::Mandatory && d.status_type == QosStatusType::Local)
+        .map(|d| qos_shortfall(d.direction, met))
+        .filter(|missing| *missing != QosDirection::None)
+        .map(|missing| (QosStatusType::Local, missing))
+        .collect()
+}
+
+fn qos_status_type_token(status_type: QosStatusType) -> &'static str {
+    match status_type {
+        QosStatusType::E2e => "e2e",
+        QosStatusType::Local => "local",
+        QosStatusType::Remote => "remote",
+    }
+}
+
+fn qos_direction_token(direction: QosDirection) -> &'static str {
+    match direction {
+        QosDirection::None => "none",
+        QosDirection::Send => "send",
+        QosDirection::Recv => "recv",
+        QosDirection::SendRecv => "sendrecv",
+    }
+}
+
+/// `None` for [`QosStrength::Unknown`]: there is no token to echo, so that
+/// line is left out of the answer rather than invented.
+fn qos_strength_token(strength: QosStrength) -> Option<&'static str> {
+    match strength {
+        QosStrength::Mandatory => Some("mandatory"),
+        QosStrength::Optional => Some("optional"),
+        QosStrength::None => Some("none"),
+        QosStrength::Failure => Some("failure"),
+        QosStrength::Unknown => None,
+    }
 }
 
 /// Which codec of a **carrier's** offer we'd answer with, if any — the single
@@ -1188,30 +1291,29 @@ fn build_answer_for(
         None => String::new(),
     };
 
-    // Precondition status/confirmation lines (specs/048 MT-06) — only ever
+    // Precondition status lines (specs/048 MT-06, specs/088) — only ever
     // present when the offer itself carried `a=des:qos`/`a=curr:qos` lines;
     // an ordinary offer (no preconditions) produces none, so this is a
-    // pure addition with no effect on any offer shape that predates this
-    // feature. `Decline` never reaches here: `handle_invite` declines the
-    // call with `580` before `build_answer`/`build_veth_answer` is called
-    // (see `agent::inbound::handle_invite`), so it renders as no lines.
+    // pure addition with no effect on any offer shape that predates them.
+    // `Decline` never reaches here: `handle_invite` declines the call with
+    // `580` before `build_answer`/`build_veth_answer` is called (see
+    // `agent::inbound::handle_invite`), so it renders as no lines.
     let mut qos_lines = String::new();
-    if let PreconditionVerdict::Proceed(answer_lines) = precondition_verdict(offer) {
-        for line in answer_lines {
-            let status_type = match line.status_type {
-                QosStatusType::E2e => "e2e",
-                QosStatusType::Local => "local",
-                QosStatusType::Remote => "remote",
-            };
-            let met = match line.met {
-                QosDirection::None => "none",
-                QosDirection::Send => "send",
-                QosDirection::Recv => "recv",
-                QosDirection::SendRecv => "sendrecv",
-            };
-            qos_lines.push_str(&format!("a=curr:qos {status_type} {met}\r\n"));
-            if line.confirm {
-                qos_lines.push_str(&format!("a=conf:qos {status_type} {met}\r\n"));
+    if let PreconditionVerdict::Proceed { current, desired } = precondition_verdict(offer) {
+        for line in current {
+            qos_lines.push_str(&format!(
+                "a=curr:qos {} {}\r\n",
+                qos_status_type_token(line.status_type),
+                qos_direction_token(line.met)
+            ));
+        }
+        for line in desired {
+            if let Some(strength) = qos_strength_token(line.strength) {
+                qos_lines.push_str(&format!(
+                    "a=des:qos {strength} {} {}\r\n",
+                    qos_status_type_token(line.status_type),
+                    qos_direction_token(line.direction)
+                ));
             }
         }
     }
@@ -1318,6 +1420,31 @@ mod codec_offer_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// specs/088 (#103): the SDP part of T2's multipart INVITE parses as the
+    /// offer it is — including the `/1` channel count on every AMR rtpmap.
+    #[test]
+    fn the_t2_sdp_part_parses_to_its_offer() {
+        use crate::ims::body::fixtures::T2_SDP;
+        let offer = parse_offer(T2_SDP).unwrap();
+        assert_eq!(offer.remote_rtp, "203.0.113.30:21892".parse().unwrap());
+        assert_eq!(offer.proto, "RTP/AVP");
+        let codecs: Vec<_> = offer
+            .offered
+            .iter()
+            .map(|c| (c.payload_type, c.codec))
+            .collect();
+        assert_eq!(
+            codecs,
+            vec![
+                (104, NegotiatedCodec::AmrWb),
+                (110, NegotiatedCodec::AmrWb),
+                (102, NegotiatedCodec::AmrNb),
+                (108, NegotiatedCodec::AmrNb),
+            ]
+        );
+        assert_eq!(offer.dtmf, vec![(96, 16000), (97, 8000)]);
+    }
 
     /// An inbound offer listing exactly `codecs`, e.g. `[(0, "PCMU/8000")]`.
     fn offer_of(codecs: &[(u8, &str)]) -> SdpOffer {
@@ -2611,45 +2738,85 @@ mod tests {
     /// `strength`/`direction` tokens verbatim, e.g.
     /// `offer_with_precondition("remote", "mandatory", "sendrecv")`.
     fn offer_with_precondition(status_type: &str, strength: &str, direction: &str) -> SdpOffer {
+        offer_with_qos(&format!(
+            "a=des:qos {strength} {status_type} {direction}\r\n"
+        ))
+    }
+
+    /// A PCMU offer whose audio section ends with `qos_lines` verbatim.
+    fn offer_with_qos(qos_lines: &str) -> SdpOffer {
         let body = format!(
             "v=0\r\no=- 1 1 IN IP4 5.6.7.8\r\ns=-\r\nc=IN IP4 5.6.7.8\r\n\
              t=0 0\r\nm=audio 40000 RTP/AVP 0\r\n\
-             a=rtpmap:0 PCMU/8000\r\n\
-             a=des:qos {strength} {status_type} {direction}\r\n"
+             a=rtpmap:0 PCMU/8000\r\n{qos_lines}"
         );
         parse_offer(&body).expect("test offer must parse")
     }
 
-    #[test]
-    fn a_remote_mandatory_precondition_is_confirmed_local_in_the_answer() {
-        let offer = offer_with_precondition("remote", "mandatory", "sendrecv");
-        assert_eq!(
-            precondition_verdict(&offer),
-            PreconditionVerdict::Proceed(vec![QosAnswerLine {
-                status_type: QosStatusType::Local,
-                met: QosDirection::SendRecv,
-                confirm: true,
-            }])
-        );
-        let (sdp, _) = build_answer(
+    fn cur(status_type: QosStatusType, met: QosDirection) -> QosAnswerLine {
+        QosAnswerLine { status_type, met }
+    }
+
+    fn des(
+        strength: QosStrength,
+        status_type: QosStatusType,
+        direction: QosDirection,
+    ) -> QosDesired {
+        QosDesired {
+            strength,
+            status_type,
+            direction,
+        }
+    }
+
+    fn answer_to(offer: &SdpOffer, preference: AnswerPreference) -> String {
+        build_answer(
             "10.0.0.1".parse().unwrap(),
             40000,
             1,
-            &offer,
+            offer,
             true,
             true,
-            AnswerPreference::Legacy,
+            preference,
             None,
         )
-        .unwrap();
-        assert!(sdp.contains("a=curr:qos local sendrecv\r\n"));
-        assert!(sdp.contains("a=conf:qos local sendrecv\r\n"));
+        .unwrap()
+        .0
+    }
+
+    /// Just the answer's `qos` lines, in order.
+    fn qos_lines(sdp: &str) -> Vec<&str> {
+        sdp.lines().filter(|l| l.contains(":qos ")).collect()
+    }
+
+    use QosDirection as Dir;
+    use QosStatusType as Seg;
+    use QosStrength as Str;
+
+    #[test]
+    fn a_remote_mandatory_precondition_is_met_local_in_the_answer() {
+        let offer = offer_with_precondition("remote", "mandatory", "sendrecv");
+        assert_eq!(
+            precondition_verdict(&offer),
+            PreconditionVerdict::Proceed {
+                current: vec![cur(Seg::Local, Dir::SendRecv)],
+                desired: vec![des(Str::Mandatory, Seg::Local, Dir::SendRecv)],
+            }
+        );
+        let sdp = answer_to(&offer, AnswerPreference::Legacy);
+        assert_eq!(
+            qos_lines(&sdp),
+            [
+                "a=curr:qos local sendrecv",
+                "a=des:qos mandatory local sendrecv"
+            ]
+        );
     }
 
     /// PR #68 Greptile review, round 1: a directional precondition
     /// (`recv` only) must be answered with a bounded direction, not
     /// unconditionally `sendrecv` — this bridge's relay is always
-    /// full-duplex, but the answer must confirm what was asked, never
+    /// full-duplex, but the answer must state what was asked, never
     /// claim more than was asked.
     ///
     /// PR #68 Greptile review, round 2: `send`/`recv` are relative to
@@ -2658,29 +2825,17 @@ mod tests {
     /// offerer's own receive direction) is the *answerer's* `send`
     /// direction for that same physical flow, not the answerer's `recv`.
     #[test]
-    fn a_recv_only_precondition_is_confirmed_as_send_in_the_answer() {
+    fn a_recv_only_precondition_is_met_as_send_in_the_answer() {
         let offer = offer_with_precondition("remote", "mandatory", "recv");
         assert_eq!(
             precondition_verdict(&offer),
-            PreconditionVerdict::Proceed(vec![QosAnswerLine {
-                status_type: QosStatusType::Local,
-                met: QosDirection::Send,
-                confirm: true,
-            }])
+            PreconditionVerdict::Proceed {
+                current: vec![cur(Seg::Local, Dir::Send)],
+                desired: vec![des(Str::Mandatory, Seg::Local, Dir::Send)],
+            }
         );
-        let (sdp, _) = build_answer(
-            "10.0.0.1".parse().unwrap(),
-            40000,
-            1,
-            &offer,
-            true,
-            true,
-            AnswerPreference::Legacy,
-            None,
-        )
-        .unwrap();
+        let sdp = answer_to(&offer, AnswerPreference::Legacy);
         assert!(sdp.contains("a=curr:qos local send\r\n"));
-        assert!(sdp.contains("a=conf:qos local send\r\n"));
         assert!(!sdp.contains("local sendrecv"), "must not overclaim: {sdp}");
         assert!(
             !sdp.contains("local recv"),
@@ -2691,15 +2846,14 @@ mod tests {
     /// The complementary case: the offer's `send` inverts to the
     /// answer's `recv`.
     #[test]
-    fn a_send_only_precondition_is_confirmed_as_recv_in_the_answer() {
+    fn a_send_only_precondition_is_met_as_recv_in_the_answer() {
         let offer = offer_with_precondition("remote", "mandatory", "send");
         assert_eq!(
             precondition_verdict(&offer),
-            PreconditionVerdict::Proceed(vec![QosAnswerLine {
-                status_type: QosStatusType::Local,
-                met: QosDirection::Recv,
-                confirm: true,
-            }])
+            PreconditionVerdict::Proceed {
+                current: vec![cur(Seg::Local, Dir::Recv)],
+                desired: vec![des(Str::Mandatory, Seg::Local, Dir::Recv)],
+            }
         );
     }
 
@@ -2708,47 +2862,43 @@ mod tests {
     /// `a=curr:qos remote recv` in the answer, not `remote send`.
     #[test]
     fn the_offerers_own_segment_mirroring_inverts_direction_too() {
-        let body = "v=0\r\no=- 1 1 IN IP4 5.6.7.8\r\ns=-\r\nc=IN IP4 5.6.7.8\r\n\
-             t=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
-             a=des:qos mandatory local send\r\n\
-             a=curr:qos local send\r\n";
-        let offer = parse_offer(body).unwrap();
+        let offer = offer_with_qos("a=des:qos mandatory local send\r\na=curr:qos local send\r\n");
         assert_eq!(
             precondition_verdict(&offer),
-            PreconditionVerdict::Proceed(vec![QosAnswerLine {
-                status_type: QosStatusType::Remote,
-                met: QosDirection::Recv,
-                confirm: false,
-            }])
+            PreconditionVerdict::Proceed {
+                current: vec![cur(Seg::Remote, Dir::Recv)],
+                desired: vec![des(Str::Mandatory, Seg::Remote, Dir::Recv)],
+            }
         );
     }
 
     #[test]
-    fn a_remote_optional_precondition_is_also_confirmed() {
+    fn a_remote_optional_precondition_is_also_met() {
         let offer = offer_with_precondition("remote", "optional", "sendrecv");
         assert_eq!(
             precondition_verdict(&offer),
-            PreconditionVerdict::Proceed(vec![QosAnswerLine {
-                status_type: QosStatusType::Local,
-                met: QosDirection::SendRecv,
-                confirm: true,
-            }])
+            PreconditionVerdict::Proceed {
+                current: vec![cur(Seg::Local, Dir::SendRecv)],
+                desired: vec![des(Str::Optional, Seg::Local, Dir::SendRecv)],
+            }
         );
     }
 
+    /// `none`/`failure` strengths are echoed as they came; an unrecognised
+    /// strength has no token to echo, so its `des` line is left out rather
+    /// than invented — and no strength ever produces `a=conf:qos`.
     #[test]
-    fn a_remote_precondition_with_no_confirmation_strength_gets_curr_only() {
-        for strength in ["none", "failure", "unknown-token"] {
+    fn other_strengths_are_echoed_and_an_unknown_one_is_left_out() {
+        for (strength, echoed) in [("none", true), ("failure", true), ("unknown-token", false)] {
             let offer = offer_with_precondition("remote", strength, "sendrecv");
+            let sdp = answer_to(&offer, AnswerPreference::Legacy);
+            assert!(sdp.contains("a=curr:qos local sendrecv\r\n"), "{sdp}");
             assert_eq!(
-                precondition_verdict(&offer),
-                PreconditionVerdict::Proceed(vec![QosAnswerLine {
-                    status_type: QosStatusType::Local,
-                    met: QosDirection::SendRecv,
-                    confirm: false,
-                }]),
-                "strength {strength} must not produce a=conf"
+                sdp.contains(&format!("a=des:qos {strength} local sendrecv\r\n")),
+                echoed,
+                "{strength}: {sdp}"
             );
+            assert!(!sdp.contains("a=conf:qos"), "{strength}: {sdp}");
         }
     }
 
@@ -2757,19 +2907,12 @@ mod tests {
         let offer = offer_of(&[(0, "PCMU/8000")]);
         assert_eq!(
             precondition_verdict(&offer),
-            PreconditionVerdict::Proceed(vec![])
+            PreconditionVerdict::Proceed {
+                current: vec![],
+                desired: vec![]
+            }
         );
-        let (sdp, _) = build_answer(
-            "10.0.0.1".parse().unwrap(),
-            40000,
-            1,
-            &offer,
-            true,
-            true,
-            AnswerPreference::Legacy,
-            None,
-        )
-        .unwrap();
+        let sdp = answer_to(&offer, AnswerPreference::Legacy);
         assert!(
             !sdp.contains("qos"),
             "no precondition lines were offered: {sdp}"
@@ -2782,26 +2925,46 @@ mod tests {
         assert_eq!(precondition_verdict(&offer), PreconditionVerdict::Decline);
     }
 
+    /// specs/088 Clarification Q3: with no word from the offerer about its
+    /// own half, `e2e` is `none`, never "met" on this bridge's say-so.
     #[test]
-    fn an_e2e_optional_precondition_proceeds_reporting_only_our_own_segment() {
+    fn an_e2e_optional_precondition_with_no_offerer_status_is_none() {
         let offer = offer_with_precondition("e2e", "optional", "sendrecv");
         assert_eq!(
             precondition_verdict(&offer),
-            PreconditionVerdict::Proceed(vec![QosAnswerLine {
-                status_type: QosStatusType::E2e,
-                met: QosDirection::SendRecv,
-                confirm: false,
-            }])
+            PreconditionVerdict::Proceed {
+                current: vec![cur(Seg::E2e, Dir::None)],
+                desired: vec![des(Str::Optional, Seg::E2e, Dir::SendRecv)],
+            }
         );
+    }
+
+    /// specs/088 T019: the `e2e` current status is the offerer's own, inverted
+    /// — from its `a=curr:qos e2e`, falling back to its `a=curr:qos local`.
+    #[test]
+    fn the_e2e_current_status_follows_what_the_offerer_says() {
+        for (curr, expected) in [
+            ("a=curr:qos e2e send\r\n", Dir::Recv),
+            ("a=curr:qos e2e none\r\n", Dir::None),
+            ("a=curr:qos local send\r\n", Dir::Recv),
+            (
+                "a=curr:qos e2e sendrecv\r\na=curr:qos local none\r\n",
+                Dir::SendRecv,
+            ),
+        ] {
+            let offer = offer_with_qos(&format!("a=des:qos optional e2e sendrecv\r\n{curr}"));
+            let PreconditionVerdict::Proceed { current, .. } = precondition_verdict(&offer) else {
+                panic!("{curr}: declined");
+            };
+            assert_eq!(current[0], cur(Seg::E2e, expected), "{curr}");
+        }
     }
 
     #[test]
     fn a_remote_mandatory_line_combined_with_an_e2e_mandatory_line_still_declines() {
-        let body = "v=0\r\no=- 1 1 IN IP4 5.6.7.8\r\ns=-\r\nc=IN IP4 5.6.7.8\r\n\
-             t=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
-             a=des:qos mandatory remote sendrecv\r\n\
-             a=des:qos mandatory e2e sendrecv\r\n";
-        let offer = parse_offer(body).unwrap();
+        let offer = offer_with_qos(
+            "a=des:qos mandatory remote sendrecv\r\na=des:qos mandatory e2e sendrecv\r\n",
+        );
         assert_eq!(
             precondition_verdict(&offer),
             PreconditionVerdict::Decline,
@@ -2810,12 +2973,11 @@ mod tests {
     }
 
     #[test]
-    fn two_remote_lines_with_different_directions_each_get_their_own_answer_line() {
-        let body = "v=0\r\no=- 1 1 IN IP4 5.6.7.8\r\ns=-\r\nc=IN IP4 5.6.7.8\r\n\
-             t=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
-             a=des:qos mandatory remote sendrecv\r\n\
-             a=des:qos optional remote recvonly-is-not-a-real-token\r\n";
-        let offer = parse_offer(body).unwrap();
+    fn a_malformed_qos_line_is_skipped_and_the_rest_still_answered() {
+        let offer = offer_with_qos(
+            "a=des:qos mandatory remote sendrecv\r\n\
+             a=des:qos optional remote recvonly-is-not-a-real-token\r\n",
+        );
         // The second line's malformed direction token is simply skipped
         // (parse_qos_direction returns None) — only the first line
         // survives into `preconditions`, proving multiple lines are each
@@ -2823,11 +2985,10 @@ mod tests {
         assert_eq!(offer.preconditions.len(), 1);
         assert_eq!(
             precondition_verdict(&offer),
-            PreconditionVerdict::Proceed(vec![QosAnswerLine {
-                status_type: QosStatusType::Local,
-                met: QosDirection::SendRecv,
-                confirm: true,
-            }])
+            PreconditionVerdict::Proceed {
+                current: vec![cur(Seg::Local, Dir::SendRecv)],
+                desired: vec![des(Str::Mandatory, Seg::Local, Dir::SendRecv)],
+            }
         );
     }
 
@@ -2836,29 +2997,28 @@ mod tests {
     /// invents.
     #[test]
     fn the_offerers_own_segment_is_mirrored_not_invented() {
-        let body = "v=0\r\no=- 1 1 IN IP4 5.6.7.8\r\ns=-\r\nc=IN IP4 5.6.7.8\r\n\
-             t=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n\
-             a=des:qos mandatory local sendrecv\r\n\
-             a=curr:qos local none\r\n";
-        let offer = parse_offer(body).unwrap();
+        let offer =
+            offer_with_qos("a=des:qos mandatory local sendrecv\r\na=curr:qos local none\r\n");
         assert_eq!(
             precondition_verdict(&offer),
-            PreconditionVerdict::Proceed(vec![QosAnswerLine {
-                status_type: QosStatusType::Remote,
-                met: QosDirection::None,
-                confirm: false,
-            }]),
-            "a local-status-type a=des line must not itself produce an answer line; \
+            PreconditionVerdict::Proceed {
+                current: vec![cur(Seg::Remote, Dir::None)],
+                desired: vec![des(Str::Mandatory, Seg::Remote, Dir::SendRecv)],
+            },
+            "a local-status-type a=des line must not itself produce a curr line; \
              only the offer's own a=curr:qos local claim, mirrored, may"
         );
     }
 
     #[test]
-    fn a_local_status_type_line_with_no_matching_curr_line_produces_nothing() {
+    fn a_local_status_type_line_with_no_matching_curr_line_states_no_current_status() {
         let offer = offer_with_precondition("local", "mandatory", "sendrecv");
         assert_eq!(
             precondition_verdict(&offer),
-            PreconditionVerdict::Proceed(vec![]),
+            PreconditionVerdict::Proceed {
+                current: vec![],
+                desired: vec![des(Str::Mandatory, Seg::Remote, Dir::SendRecv)],
+            },
             "no a=curr:qos local line was offered, so nothing may be fabricated for it"
         );
     }
@@ -2871,7 +3031,144 @@ mod tests {
         assert!(offer.preconditions.is_empty());
         assert_eq!(
             precondition_verdict(&offer),
-            PreconditionVerdict::Proceed(vec![])
+            PreconditionVerdict::Proceed {
+                current: vec![],
+                desired: vec![]
+            }
+        );
+    }
+
+    /// specs/088 T018 golden: T2's offer is answered with exactly RFC 3312
+    /// §13.2 SDP2's shape — our segment met, the offerer's mirrored, its
+    /// desired status inverted at the same strength, and no `a=conf:qos`
+    /// (which would invite an `UPDATE` this bridge answers `405`).
+    #[test]
+    fn the_t2_offer_gets_the_rfc_3312_answer() {
+        use crate::ims::body::fixtures::T2_SDP;
+        let offer = parse_offer(T2_SDP).unwrap();
+        for preference in [AnswerPreference::Cellular, AnswerPreference::Legacy] {
+            let sdp = answer_to(&offer, preference);
+            assert_eq!(
+                qos_lines(&sdp),
+                [
+                    "a=curr:qos local sendrecv",
+                    "a=curr:qos remote sendrecv",
+                    "a=des:qos mandatory remote sendrecv",
+                    "a=des:qos optional local sendrecv",
+                ],
+                "{preference:?}: {sdp}"
+            );
+            assert!(!sdp.contains("a=conf:qos"), "{sdp}");
+            assert!(sdp.contains("m=audio 40000 RTP/AVP 110 96\r\n"), "{sdp}");
+        }
+        assert!(offerer_unmet_mandatory(&offer).is_empty());
+    }
+
+    /// specs/088 T019: RFC 3312 §13.2's SDP1 (both segments unreserved,
+    /// both mandatory). The answer's desired lines match SDP2's; its current
+    /// lines differ from SDP2 only where this bridge is better placed than
+    /// the RFC's answerer — its own segment is already met — and it never
+    /// asks the offerer to confirm (no `a=conf:qos remote`).
+    #[test]
+    fn rfc_3312_section_13_2_sdp1_is_answered_like_sdp2() {
+        let offer = offer_with_qos(
+            "a=curr:qos local none\r\n\
+             a=curr:qos remote none\r\n\
+             a=des:qos mandatory local sendrecv\r\n\
+             a=des:qos mandatory remote sendrecv\r\n",
+        );
+        let sdp = answer_to(&offer, AnswerPreference::Legacy);
+        assert_eq!(
+            qos_lines(&sdp),
+            [
+                "a=curr:qos local sendrecv",
+                "a=curr:qos remote none",
+                "a=des:qos mandatory remote sendrecv",
+                "a=des:qos mandatory local sendrecv",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_directional_desired_line_inverts_type_and_direction() {
+        let offer = offer_with_precondition("local", "optional", "send");
+        let sdp = answer_to(&offer, AnswerPreference::Legacy);
+        assert_eq!(qos_lines(&sdp), ["a=des:qos optional remote recv"]);
+    }
+
+    /// specs/088 T020 (FR-018a): the offerer's mandatory segment it says
+    /// is unmet, reported by the missing halves only.
+    #[test]
+    fn offerer_unmet_mandatory_names_the_missing_halves() {
+        let none =
+            offer_with_qos("a=curr:qos local none\r\na=des:qos mandatory local sendrecv\r\n");
+        assert_eq!(
+            offerer_unmet_mandatory(&none),
+            [(Seg::Local, Dir::SendRecv)]
+        );
+
+        let send =
+            offer_with_qos("a=curr:qos local send\r\na=des:qos mandatory local sendrecv\r\n");
+        assert_eq!(offerer_unmet_mandatory(&send), [(Seg::Local, Dir::Recv)]);
+
+        let absent = offer_with_precondition("local", "mandatory", "send");
+        assert_eq!(offerer_unmet_mandatory(&absent), [(Seg::Local, Dir::Send)]);
+
+        // Optional, or our own segment: never reported.
+        let optional =
+            offer_with_qos("a=curr:qos local none\r\na=des:qos optional local sendrecv\r\n");
+        assert!(offerer_unmet_mandatory(&optional).is_empty());
+        let ours = offer_with_precondition("remote", "mandatory", "sendrecv");
+        assert!(offerer_unmet_mandatory(&ours).is_empty());
+    }
+
+    /// specs/088 T021: offers with no precondition lines are answered
+    /// byte-for-byte as v8.20.0 answered them (captured before the change).
+    #[test]
+    fn answers_to_offers_without_preconditions_are_unchanged() {
+        for (offer, expected) in [
+            (
+                JIO_MT_OFFER,
+                "v=0\r\no=- 7 7 IN IP4 192.0.2.1\r\ns=gsm-sip-bridge vowifi bridge\r\n\
+                 c=IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 40000 RTP/AVP 110 105\r\nb=AS:49\r\n\
+                 b=RS:800\r\nb=RR:2400\r\na=rtpmap:110 AMR-WB/16000\r\n\
+                 a=fmtp:110 mode-set=0,1,2,3;octet-align=1; mode-change-capability=2\r\n\
+                 a=rtpmap:105 telephone-event/16000\r\na=fmtp:105 0-15\r\na=ptime:20\r\n\
+                 a=maxptime:240\r\na=sendrecv\r\n",
+            ),
+            (
+                AIRTEL_LIKE_OFFER,
+                "v=0\r\no=- 7 7 IN IP4 192.0.2.1\r\ns=gsm-sip-bridge vowifi bridge\r\n\
+                 c=IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 40000 RTP/AVP 96\r\nb=AS:49\r\n\
+                 b=RS:800\r\nb=RR:2400\r\na=rtpmap:96 AMR-WB/16000\r\na=fmtp:96 octet-align=1\r\n\
+                 a=ptime:20\r\na=sendrecv\r\n",
+            ),
+        ] {
+            let offer = parse_offer(offer).unwrap();
+            let (sdp, _) = build_answer(
+                "192.0.2.1".parse().unwrap(),
+                40000,
+                7,
+                &offer,
+                true,
+                true,
+                AnswerPreference::Cellular,
+                None,
+            )
+            .unwrap();
+            assert_eq!(sdp, expected);
+        }
+
+        let offer = parse_offer(PJSIP_REAL_VETH_OFFER).unwrap();
+        let (sdp, _) =
+            build_veth_answer("10.99.0.1".parse().unwrap(), 40000, 7, &offer, true).unwrap();
+        assert_eq!(
+            sdp,
+            "v=0\r\no=- 7 7 IN IP4 10.99.0.1\r\ns=gsm-sip-bridge vowifi bridge\r\n\
+             c=IN IP4 10.99.0.1\r\nt=0 0\r\nm=audio 40000 RTP/AVP 100 120\r\nb=AS:280\r\n\
+             b=RS:800\r\nb=RR:2400\r\na=rtpmap:100 L16/16000\r\n\
+             a=rtpmap:120 telephone-event/8000\r\na=fmtp:120 0-15\r\na=ptime:20\r\n\
+             a=sendrecv\r\nm=text 0 RTP/AVP 100 98\r\n"
         );
     }
 }

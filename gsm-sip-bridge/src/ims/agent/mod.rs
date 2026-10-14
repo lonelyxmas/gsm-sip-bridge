@@ -441,7 +441,8 @@ fn unsupported_required_extensions(req: &SipRequest) -> Vec<String> {
 /// Answers the carrier's `OPTIONS` — the keepalive a P-CSCF (and our own
 /// `ping`, in the other direction) uses to decide whether a UE is still there.
 /// Silence is indistinguishable from a UE that has gone away, and RFC 3261
-/// §11.2 wants the same `Allow` a 200 to an INVITE carries.
+/// §11.2 wants the same `Allow` a 200 to an INVITE carries, and an `Accept`
+/// naming the bodies an INVITE may carry (specs/088: multipart too).
 fn options_response(req: &SipRequest, to_tag: &str) -> String {
     build_uas_response_with_headers(
         200,
@@ -450,7 +451,7 @@ fn options_response(req: &SipRequest, to_tag: &str) -> String {
         Some(to_tag),
         None,
         None,
-        &[("Allow", ALLOW), ("Accept", "application/sdp")],
+        &[("Allow", ALLOW), ("Accept", inbound::INVITE_BODY_ACCEPT)],
     )
 }
 
@@ -1059,19 +1060,18 @@ const SUPPORTED_MESSAGE_CONTENT_TYPES: &[&str] = &["application/vnd.3gpp.sms", "
 fn message_content_type_supported(req: &SipRequest) -> bool {
     match req.header("Content-Type") {
         None => true,
-        Some(ct) => {
-            let media_type = ct.split(';').next().unwrap_or("").trim();
-            SUPPORTED_MESSAGE_CONTENT_TYPES
-                .iter()
-                .any(|t| t.eq_ignore_ascii_case(media_type))
-        }
+        Some(ct) => crate::ims::body::MediaType::parse(ct)
+            .is_some_and(|mt| SUPPORTED_MESSAGE_CONTENT_TYPES.iter().any(|t| mt.is(t))),
     }
 }
 
 fn decode_pdu_body(req: &SipRequest) -> Option<crate::ims::sms_pdu::DecodedRp> {
+    // Parameters ignored, the same comparison `message_content_type_supported`
+    // makes (specs/088 FR-019): a parameterised SMS type is still binary SMS.
     let is_3gpp_sms = req
         .header("Content-Type")
-        .is_some_and(|ct| ct.trim().eq_ignore_ascii_case("application/vnd.3gpp.sms"));
+        .and_then(crate::ims::body::MediaType::parse)
+        .is_some_and(|mt| mt.is("application/vnd.3gpp.sms"));
     if !is_3gpp_sms {
         return None;
     }
@@ -3664,21 +3664,40 @@ mod tests {
     /// element's own hostname on a real carrier) or the raw undecoded bytes.
     #[test]
     fn decode_pdu_body_decodes_a_3gpp_sms_message() {
-        let pdu = a_3gpp_sms_pdu();
-        let mut raw = b"MESSAGE sip:x SIP/2.0\r\n\
-             From: <sip:gateway.ims.example>\r\n\
-             Call-ID: c\r\nCSeq: 1 MESSAGE\r\n\
-             Content-Type: application/vnd.3gpp.sms\r\n"
-            .to_vec();
-        raw.extend_from_slice(format!("Content-Length: {}\r\n\r\n", pdu.len()).as_bytes());
-        raw.extend_from_slice(&pdu);
-
-        let (req, _) = SipRequest::try_parse(&raw).unwrap().unwrap();
-        let decoded = decode_pdu_body(&req).expect("a 3GPP SMS body must decode");
+        let decoded = decode_pdu_body(&sms_message_with_content_type("application/vnd.3gpp.sms"))
+            .expect("a 3GPP SMS body must decode");
         let crate::ims::sms_pdu::DecodedRp::Message(decoded) = decoded else {
             panic!("RP-DATA must decode to DecodedRp::Message");
         };
         assert_eq!(decoded.sender, "+919000000001");
+        assert_eq!(decoded.text, "Hi");
+    }
+
+    /// A `MESSAGE` carrying [`a_3gpp_sms_pdu`] under `content_type`.
+    fn sms_message_with_content_type(content_type: &str) -> SipRequest {
+        let pdu = a_3gpp_sms_pdu();
+        let mut raw = format!(
+            "MESSAGE sip:x SIP/2.0\r\n\
+             From: <sip:gateway.ims.example>\r\n\
+             Call-ID: c\r\nCSeq: 1 MESSAGE\r\n\
+             Content-Type: {content_type}\r\n\
+             Content-Length: {}\r\n\r\n",
+            pdu.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(&pdu);
+        SipRequest::try_parse(&raw).unwrap().unwrap().0
+    }
+
+    /// specs/088 FR-019: parameters on the media type don't stop a 3GPP SMS
+    /// body being decoded as one.
+    #[test]
+    fn a_parameterised_3gpp_sms_content_type_decodes_the_same() {
+        let req = sms_message_with_content_type("Application/Vnd.3gpp.SMS; charset=x");
+        assert!(message_content_type_supported(&req));
+        let Some(crate::ims::sms_pdu::DecodedRp::Message(decoded)) = decode_pdu_body(&req) else {
+            panic!("a parameterised 3GPP SMS body must decode as a message");
+        };
         assert_eq!(decoded.text, "Hi");
     }
 
@@ -3919,6 +3938,12 @@ mod tests {
         let resp = options_response(&request("OPTIONS"), "totag1");
         assert!(resp.starts_with("SIP/2.0 200 OK\r\n"), "{resp}");
         assert!(resp.contains(&format!("\r\nAllow: {ALLOW}\r\n")), "{resp}");
+        assert!(
+            resp.contains(
+                "\r\nAccept: application/sdp, multipart/mixed, multipart/alternative\r\n"
+            ),
+            "{resp}"
+        );
         assert!(resp.contains("\r\nCSeq: 3 OPTIONS\r\n"), "{resp}");
     }
 
