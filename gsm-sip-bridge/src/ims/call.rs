@@ -11,8 +11,8 @@
 //! place a call, exchange audio for a fixed duration, and hang up.
 
 use super::sdp::NegotiatedCodec;
-use super::sip_client::{format_sip_addr, random_hex, sec_agree_headers};
-use super::{sdp, ImsRegisterConfig};
+use super::sip_client::{format_sip_addr, random_hex, sec_agree_headers, SipResponse};
+use super::{body, sdp, ImsRegisterConfig};
 use crate::error::{BridgeError, BridgeResult};
 use std::io;
 use std::net::UdpSocket;
@@ -284,7 +284,7 @@ pub fn run_call(cfg: &CallConfig) -> BridgeResult<CallOutcome> {
         .header("To")
         .ok_or_else(|| BridgeError::Ims("200 OK to INVITE missing To header".into()))?
         .to_string();
-    let answer = sdp::parse_answer(&resp.body)?;
+    let answer = sdp::parse_answer(&answer_sdp(&resp)?)?;
     tracing::info!(remote_rtp = %answer.remote_rtp, codec = ?answer.codec, "call answered, starting RTP");
 
     let ack_branch = format!("z9hG4bK{}", random_hex(6));
@@ -872,6 +872,21 @@ pub(crate) fn build_prack(p: &AckParts, rack: &str) -> String {
 /// A request-line URI with its scheme: callers pass either a bare
 /// `user@host` (the dialled URI) or a full URI taken from a `Contact`
 /// (`sip:`, `sips:`, `tel:`, any case) — which must not gain a second scheme.
+/// The SDP answer in an outbound INVITE's `2xx`, decoded like any other SIP
+/// body (specs/088: RFC 5621 §4.2 has UACs parse multipart responses too). A
+/// `2xx` with no usable SDP fails the call through the usual error path.
+fn answer_sdp(resp: &SipResponse) -> BridgeResult<String> {
+    match body::extract_sdp(resp.header("Content-Type"), resp.body.as_bytes()) {
+        Ok(body::Decoded::Sdp { text, .. }) => Ok(text),
+        Ok(body::Decoded::Empty) => Err(BridgeError::Ims(
+            "2xx to INVITE carried no SDP answer".into(),
+        )),
+        Err(rejection) => Err(BridgeError::Ims(format!(
+            "2xx to INVITE has no usable SDP answer: {rejection}"
+        ))),
+    }
+}
+
 fn request_line_uri(uri: &str) -> std::borrow::Cow<'_, str> {
     let lower = uri.to_ascii_lowercase();
     if ["sip:", "sips:", "tel:"]
@@ -923,6 +938,47 @@ fn build_in_dialog_request(method: &str, p: &AckParts, extra_headers: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ok_with(content_type: Option<&str>, body: &str) -> SipResponse {
+        let mut headers = vec![(
+            "To".to_string(),
+            "<sip:a@example.invalid>;tag=t".to_string(),
+        )];
+        if let Some(ct) = content_type {
+            headers.push(("Content-Type".to_string(), ct.to_string()));
+        }
+        SipResponse {
+            status: 200,
+            reason: "OK".into(),
+            headers,
+            body: body.into(),
+        }
+    }
+
+    /// specs/088 T029: a multipart `2xx` yields the same answer as its bare
+    /// SDP; one with no usable SDP is an error, not a misparse.
+    #[test]
+    fn a_2xx_answer_is_decoded_from_any_body_shape() {
+        let sdp = "v=0\r\nc=IN IP4 192.0.2.7\r\nm=audio 5000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        let multipart = format!(
+            "--b\r\nContent-Type: application/pidf+xml\r\n\r\n<presence/>\r\n\
+             --b\r\nContent-Type: application/sdp\r\n\r\n{sdp}\r\n--b--\r\n"
+        );
+        let wrapped = answer_sdp(&ok_with(Some("multipart/mixed;boundary=b"), &multipart)).unwrap();
+        let bare = answer_sdp(&ok_with(Some("application/sdp"), sdp)).unwrap();
+        assert_eq!(wrapped, bare);
+        let parsed = sdp::parse_answer(&wrapped).unwrap();
+        assert_eq!(parsed.remote_rtp, "192.0.2.7:5000".parse().unwrap());
+
+        for (ct, body) in [
+            (Some("multipart/mixed;boundary=b"), "--b\r\n\r\nx\r\n"),
+            (Some("text/plain"), "hello"),
+            (Some("application/sdp"), ""),
+        ] {
+            let err = answer_sdp(&ok_with(ct, body)).unwrap_err();
+            assert!(matches!(err, BridgeError::Ims(_)), "{ct:?}: {err:?}");
+        }
+    }
 
     #[test]
     fn tone_pattern_period_matches_segment_sum() {

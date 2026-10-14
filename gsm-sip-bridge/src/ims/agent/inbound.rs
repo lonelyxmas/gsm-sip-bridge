@@ -161,6 +161,17 @@ fn invite_body_decision(req: &SipRequest, to_tag: &str) -> InviteBody {
     }
 }
 
+/// The SDP answer an offerless call's `ACK` carries (RFC 3264 §3), decoded
+/// the same way as an INVITE's body (specs/088) — `None` when the ACK has no
+/// body or none this bridge can read as SDP. The ACK itself still arrived;
+/// the caller tells that apart from a timeout.
+fn ack_answer(ack: &SipRequest) -> Option<String> {
+    match body::extract_sdp(ack.header("Content-Type"), &ack.body_bytes) {
+        Ok(body::Decoded::Sdp { text, .. }) => Some(text),
+        Ok(body::Decoded::Empty) | Err(_) => None,
+    }
+}
+
 /// The caller's display name, suitable for re-presenting to Agent B/the PBX
 /// — unlike `extract_caller_name` alone, this also honours RFC 3325 §9.1
 /// `Privacy: id`/`user` on the inbound INVITE (when `respect_caller_privacy`,
@@ -901,7 +912,9 @@ fn handle_offerless_invite(
     // bridge sends its *own*, redundant `BYE` for a dialog already ended
     // from the other side (code review finding, 2026-08-28).
     let deadline = Instant::now() + OFFERLESS_ACK_TIMEOUT;
-    let mut ack_body: Option<String> = None;
+    // Outer `Some`: the ACK arrived. Inner: the SDP answer it carried, if
+    // its body had a usable one (`ack_answer`).
+    let mut ack: Option<Option<String>> = None;
     let mut caller_bye = false;
     'wait_for_ack: while Instant::now() < deadline {
         while let Ok((msg, req_sink)) = inbound.rx.try_recv() {
@@ -915,7 +928,7 @@ fn handle_offerless_invite(
                 req.header("From").unwrap_or_default(),
             );
             if candidate.method == "ACK" && this_dialog {
-                ack_body = Some(candidate.body.clone());
+                ack = Some(ack_answer(&candidate));
                 break 'wait_for_ack;
             }
             if candidate.method == "BYE" && this_dialog {
@@ -966,7 +979,7 @@ fn handle_offerless_invite(
         tracing::info!(call_id = %call_id, reason, "offerless call answered but not completed; tore it down");
     };
 
-    let Some(ack_body) = ack_body else {
+    let Some(ack_sdp) = ack else {
         // research.md Decision 4: no automatic 2xx retransmission exists in
         // this codebase's transaction-lite design, so a `BYE` — not a
         // second final response — is the honest way to end a dialog whose
@@ -981,7 +994,9 @@ fn handle_offerless_invite(
         return Ok(None);
     };
 
-    let answer = sdp::parse_answer(&ack_body);
+    let answer = ack_sdp
+        .ok_or_else(|| BridgeError::Ims("offerless ACK carried no usable SDP answer".into()))
+        .and_then(|text| sdp::parse_answer(&text));
     let chosen = answer
         .as_ref()
         .ok()
@@ -1519,6 +1534,38 @@ mod tests {
             body
         );
         SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    fn ack_with(content_type: Option<&str>, body: &str) -> SipRequest {
+        let mut req = invite_with(content_type, body);
+        req.method = "ACK".into();
+        req
+    }
+
+    /// specs/088 T027: an offerless call's ACK is decoded like an INVITE.
+    #[test]
+    fn an_acks_sdp_answer_is_decoded_from_any_body_shape() {
+        let multipart = format!(
+            "--b\r\nContent-Type: application/pidf+xml\r\n\r\n<presence/>\r\n\
+             --b\r\nContent-Type: application/sdp\r\n\r\n{BARE_SDP}\r\n--b--\r\n"
+        );
+        assert_eq!(
+            ack_answer(&ack_with(Some("multipart/mixed;boundary=b"), &multipart)).as_deref(),
+            Some(BARE_SDP)
+        );
+        assert_eq!(
+            ack_answer(&ack_with(Some("application/sdp"), BARE_SDP)).as_deref(),
+            Some(BARE_SDP)
+        );
+        let unclosed = "--b\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n";
+        for (ct, body) in [
+            (Some("multipart/mixed;boundary=b"), unclosed),
+            (Some("text/plain"), "hello"),
+            (Some("application/sdp"), ""),
+            (None, ""),
+        ] {
+            assert_eq!(ack_answer(&ack_with(ct, body)), None, "{ct:?} {body:?}");
+        }
     }
 
     /// specs/047-offerless-invite-sms-reassembly (SDP-04), T018: an INVITE

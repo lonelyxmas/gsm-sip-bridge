@@ -105,10 +105,10 @@ real parsed `SipRequest`s; no mocks. Fixtures are synthetic only
 
 **Independent Test**: multipart ACK/2xx bodies yield the same `SdpAnswer` as their bare SDP; malformed ones take the existing failure path.
 
-- [ ] T027 [P] [US4] Write failing tests for a pure helper `fn ack_answer(ack: &SipRequest) -> Option<String>` in `gsm-sip-bridge/src/ims/agent/inbound.rs`: multipart ACK → SDP part; bare SDP → whole body; malformed / no SDP / empty → `None`
-- [ ] T028 [US4] Implement `ack_answer` and change the offerless wait loop (`gsm-sip-bridge/src/ims/agent/inbound.rs` ≈ 877–957) to store `ack_answer(&candidate)` instead of `candidate.body.clone()`; distinguish "ACK arrived but unusable" (→ `teardown("offerless_ack_incompatible")`) from "no ACK" (→ existing `offerless_ack_timeout`)
-- [ ] T029 [P] [US4] Write failing test + implement a pure `fn answer_sdp(resp: &SipResponse) -> BridgeResult<String>` in `gsm-sip-bridge/src/ims/call.rs` (decode `resp.body.as_bytes()` with `Content-Type`/`Content-Disposition`; `Empty`/`Rejection` → `BridgeError::Ims` naming the outcome) and use it before `sdp::parse_answer` at `gsm-sip-bridge/src/ims/call.rs:287`
-- [ ] T030 [US4] Commit "fix(ims): decode multipart bodies in offerless ACK and outbound 2xx" after `make format && make lint && make test`
+- [X] T027 [P] [US4] Write failing tests for a pure helper `fn ack_answer(ack: &SipRequest) -> Option<String>` in `gsm-sip-bridge/src/ims/agent/inbound.rs`: multipart ACK → SDP part; bare SDP → whole body; malformed / no SDP / empty → `None`
+- [X] T028 [US4] Implement `ack_answer` and change the offerless wait loop (`gsm-sip-bridge/src/ims/agent/inbound.rs` ≈ 877–957) to store `ack_answer(&candidate)` instead of `candidate.body.clone()`; distinguish "ACK arrived but unusable" (→ `teardown("offerless_ack_incompatible")`) from "no ACK" (→ existing `offerless_ack_timeout`)
+- [X] T029 [P] [US4] Write failing test + implement a pure `fn answer_sdp(resp: &SipResponse) -> BridgeResult<String>` in `gsm-sip-bridge/src/ims/call.rs` (decode `resp.body.as_bytes()` with `Content-Type`/`Content-Disposition`; `Empty`/`Rejection` → `BridgeError::Ims` naming the outcome) and use it before `sdp::parse_answer` at `gsm-sip-bridge/src/ims/call.rs:287`
+- [X] T030 [US4] Commit "fix(ims): decode multipart bodies in offerless ACK and outbound 2xx" after `make format && make lint && make test`
 
 ---
 
