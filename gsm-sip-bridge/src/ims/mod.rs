@@ -43,6 +43,7 @@ pub(crate) mod identity;
 pub mod lifecycle;
 pub mod media_stats;
 pub mod observability;
+pub mod pcscf_files;
 mod rtcp;
 /// `pub` rather than private: `siptest` (specs/037-siptest-softphone,
 /// research.md R1) reuses RTP framing, the μ-law codec and the WAV writer

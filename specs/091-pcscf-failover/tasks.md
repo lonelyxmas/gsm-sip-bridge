@@ -78,13 +78,13 @@ take the same paths, and nothing is marked yet.
   - `StrongswanEngine::fresh_pcscf_pool_since(runner, mark)`.
 
   Leave `extract_latest_pcscf`, `extract_pcscf_after` and `pick_stable_pcscf` untouched (FR-004). Commit.
-- [ ] T004 [P] Write failing tests in `orchestrate.rs` with the existing `MockCommandRunner` for a new
+- [X] T004 [P] Write failing tests in `orchestrate.rs` with the existing `MockCommandRunner` for a new
   `publish_pcscf_pool(runner, pcscf_source_path, pool)`:
   - It writes `<path>.pool.tmp`, then renames it to `<path>.pool`. Add `CommandRunner::rename` if the runner has no
     rename; the mock records it.
   - Content is one address per line with a trailing newline.
   - It prints `[supervise] line N: P-CSCF pool: a, b` (contracts/observability.md).
-- [ ] T005 Implement `publish_pcscf_pool` in `orchestrate.rs` and call it **before** each of the existing selection
+- [X] T005 Implement `publish_pcscf_pool` in `orchestrate.rs` and call it **before** each of the existing selection
   writes: establishment, `PcscfChanged`, and the post-recovery `fresh` sync, in `start_vowifi_line_strongswan` and
   `start_vowifi_line_swu`. Use `engine.latest_pcscf_pool` / `fresh_pcscf_pool_since`. Add `let mut current_pool` beside
   `current_pcscf`. Commit.
@@ -245,7 +245,7 @@ AS1–AS5).
   - `on_failure(addr, ..)` with `addr != active` returns `None`, changes nothing, and logs
     `"failure not attributed to the P-CSCF; not marking"` with `why=not-active`.
   - After `on_registered(B)`, a late `on_failure(A, GmKeepalive)` does not mark B or A.
-- [ ] T025 [P] [US2] Write failing tests in `orchestrate.rs` (mock runner) for a steady tick:
+- [X] T025 [P] [US2] Write failing tests in `orchestrate.rs` (mock runner) for a steady tick:
   - A reorder of the same set (`[B, A]` for published `[A, B]`) writes nothing, runs no `pkill`, and does not print
     `P-CSCF changed` (US2 AS2, SC-002).
   - Adding C (`[A, B, C]`) rewrites `.pool` only, with no `pkill`, and prints
@@ -257,7 +257,7 @@ AS1–AS5).
   Fix what doesn't, and log `"failure not attributed to the P-CSCF; not marking"` with `why=no-route` when
   `route_to` fails. Commit.
 - [ ] T027 [US2] Make T024 pass in `pcscf_pool.rs`. Commit.
-- [ ] T028 [US2] Implement the set-change publication in both steady loops in `orchestrate.rs`: after each tick,
+- [X] T028 [US2] Implement the set-change publication in both steady loops in `orchestrate.rs`: after each tick,
   compare the `engine.latest_pcscf_pool` set with the `current_pool` set; when they differ and the selection did not
   change, call `publish_pcscf_pool` only. Make T025 pass. Commit.
 

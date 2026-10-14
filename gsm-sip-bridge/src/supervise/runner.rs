@@ -182,6 +182,14 @@ pub trait CommandRunner: Send + Sync {
     /// Writes a rendered asset or state file.
     fn write_file(&self, path: &Path, contents: &str) -> io::Result<()>;
 
+    /// Writes a file another process reads concurrently, so the reader sees
+    /// either the old contents or the new, never a torn mix (specs/091
+    /// contracts/files.md). The real runner writes `<path>.tmp` and renames it
+    /// over `path`; a fake may simply store it.
+    fn write_file_atomic(&self, path: &Path, contents: &str) -> io::Result<()> {
+        self.write_file(path, contents)
+    }
+
     /// Starts a long-running child, returns a handle to it.
     fn spawn(&self, spec: ChildSpec) -> io::Result<ChildHandle>;
 
@@ -389,6 +397,10 @@ impl CommandRunner for RealCommandRunner {
 
     fn write_file(&self, path: &Path, contents: &str) -> io::Result<()> {
         std::fs::write(path, contents)
+    }
+
+    fn write_file_atomic(&self, path: &Path, contents: &str) -> io::Result<()> {
+        crate::ims::pcscf_files::write_atomic(path, contents)
     }
 
     fn spawn_detached(&self, spec: ChildSpec) -> io::Result<()> {
@@ -999,6 +1011,9 @@ mod mock {
         pub run_in_netns_calls: Mutex<Vec<(String, Vec<String>)>>,
         pub run_outputs: Mutex<Map<String, Output>>,
         pub files: Mutex<Map<std::path::PathBuf, String>>,
+        /// Every path written, in call order — `files` alone cannot show that
+        /// one file was written before another.
+        pub write_order: Mutex<Vec<std::path::PathBuf>>,
         pub spawn_specs: Mutex<Vec<ChildSpec>>,
         pub children: Mutex<Map<u64, MockChild>>,
         /// Every requested sleep duration, in call order — recorded instead
@@ -1209,6 +1224,7 @@ mod mock {
                 .lock()
                 .unwrap()
                 .insert(path.to_path_buf(), contents.to_string());
+            self.write_order.lock().unwrap().push(path.to_path_buf());
             Ok(())
         }
 

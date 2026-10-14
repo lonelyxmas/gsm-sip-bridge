@@ -1103,6 +1103,75 @@ mod resolve_epdg_ip_tests {
     use std::net::Ipv4Addr;
 
     #[test]
+    fn publish_pcscf_writes_the_pool_before_the_selection() {
+        let runner = MockCommandRunner::new();
+        let pool = vec!["10.0.1.10".to_string(), "10.0.0.10".to_string()];
+        publish_pcscf(&runner, 0, "/tmp/pcscf-0", "10.0.0.10", &pool);
+        assert_eq!(
+            *runner.write_order.lock().unwrap(),
+            vec![
+                PathBuf::from("/tmp/pcscf-0.pool"),
+                PathBuf::from("/tmp/pcscf-0")
+            ]
+        );
+        let files = runner.files.lock().unwrap();
+        assert_eq!(
+            files[&PathBuf::from("/tmp/pcscf-0.pool")],
+            "10.0.1.10\n10.0.0.10\n"
+        );
+        // The selection file keeps its single-address format (FR-004).
+        assert_eq!(files[&PathBuf::from("/tmp/pcscf-0")], "10.0.0.10");
+    }
+
+    fn addrs(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_reordered_pool_is_not_republished() {
+        // SC-002: the carrier reorders one pool freely; that is never news.
+        assert_eq!(
+            steady_pool_update(
+                &addrs(&["10.0.0.10", "10.0.1.10"]),
+                addrs(&["10.0.1.10", "10.0.0.10"])
+            ),
+            None
+        );
+        assert_eq!(steady_pool_update(&addrs(&["10.0.0.10"]), Vec::new()), None);
+    }
+
+    #[test]
+    fn an_added_address_republishes_the_pool_without_a_restart() {
+        // US2 AS3: a new member only joins the candidates.
+        let runner = MockCommandRunner::new();
+        let mut current = addrs(&["10.0.0.10", "10.0.1.10"]);
+        republish_pool_after_set_change(
+            &runner,
+            0,
+            "/tmp/pcscf-0",
+            &mut current,
+            addrs(&["10.0.1.10", "10.0.0.10", "10.0.2.10"]),
+        );
+        assert_eq!(current.len(), 3);
+        assert_eq!(
+            *runner.write_order.lock().unwrap(),
+            vec![PathBuf::from("/tmp/pcscf-0.pool")],
+            "the selection file is not rewritten"
+        );
+        assert!(runner.run_calls.lock().unwrap().is_empty(), "no pkill");
+    }
+
+    #[test]
+    fn publish_pcscf_with_no_pool_publishes_the_selection_as_the_pool() {
+        let runner = MockCommandRunner::new();
+        publish_pcscf(&runner, 1, "/tmp/pcscf-1", "10.0.0.10", &[]);
+        assert_eq!(
+            runner.files.lock().unwrap()[&PathBuf::from("/tmp/pcscf-1.pool")],
+            "10.0.0.10\n"
+        );
+    }
+
+    #[test]
     fn explicit_ip_override_short_circuits_before_dns() {
         let runner = MockCommandRunner::new();
         // No resolve_host seeding at all — the override must win regardless.
@@ -1632,7 +1701,17 @@ fn start_vowifi_line_strongswan(
     println!("[supervise] line {idx}: tunnel UP. P-CSCF: {pcscf}");
     signal.child_sa_up = true;
     report_tunnel(signal);
-    let _ = runner.write_file(Path::new(&line.pcscf_source_path), &pcscf);
+    let mut current_pool = runner
+        .read_file(&ctx.shared_charon.charon_log)
+        .map(|c| super::engines::extract_latest_pcscf_pool(&c, &vowifi_conn_name(idx)))
+        .unwrap_or_default();
+    publish_pcscf(
+        runner.as_ref(),
+        idx,
+        &line.pcscf_source_path,
+        &pcscf,
+        &current_pool,
+    );
 
     // Shared with the agent loop: set while a rebuild is syncing the P-CSCF.
     let rebuild_gate = Arc::new(RebuildGate::default());
@@ -1731,11 +1810,25 @@ fn start_vowifi_line_strongswan(
                 // recreate the pair the plan just deleted.
                 repair_line_veth(runner.as_ref(), idx, &netns, line);
                 drop(guard);
+                republish_pool_after_set_change(
+                    runner.as_ref(),
+                    idx,
+                    &line.pcscf_source_path,
+                    &mut current_pool,
+                    engine.latest_pcscf_pool(runner.as_ref()),
+                );
             }
             line_supervisor::SteadyOutcome::PcscfChanged { new_pcscf } => {
                 drop(guard);
                 println!("[supervise] line {idx}: P-CSCF changed ({current_pcscf} -> {new_pcscf}); refreshing");
-                let _ = runner.write_file(Path::new(&line.pcscf_source_path), &new_pcscf);
+                current_pool = engine.latest_pcscf_pool(runner.as_ref());
+                publish_pcscf(
+                    runner.as_ref(),
+                    idx,
+                    &line.pcscf_source_path,
+                    &new_pcscf,
+                    &current_pool,
+                );
                 current_pcscf = new_pcscf;
                 let _ = runner.run(&["pkill", "-f", &format!("vowifi-ims-agent --line {idx}$")]);
             }
@@ -1803,7 +1896,16 @@ fn start_vowifi_line_strongswan(
                             println!(
                                 "[supervise] line {idx}: P-CSCF synced from new negotiation: {p}"
                             );
-                            let _ = runner.write_file(Path::new(&line.pcscf_source_path), &p);
+                            current_pool = engine
+                                .fresh_pcscf_pool_since(runner.as_ref(), mark)
+                                .unwrap_or_default();
+                            publish_pcscf(
+                                runner.as_ref(),
+                                idx,
+                                &line.pcscf_source_path,
+                                &p,
+                                &current_pool,
+                            );
                             current_pcscf = p;
                         }
                         None if !stop() => println!(
@@ -1891,6 +1993,67 @@ impl RebuildGate {
 
     fn open(&self) {
         self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Publishes a line's P-CSCF for its agent: the whole pool first, then the
+/// single selection (specs/091 R2).
+///
+/// The order is the contract: an agent that reads the selection must never
+/// find a pool older than it. The pool is written atomically because the agent
+/// re-reads it before every registration attempt. An empty pool (an engine that
+/// logged only the one address) is published as the selection alone, so a
+/// pool left over from a previous run is never mistaken for this one.
+fn publish_pcscf(
+    runner: &dyn CommandRunner,
+    idx: u32,
+    selection_path: &str,
+    selection: &str,
+    pool: &[String],
+) {
+    let pool: Vec<&str> = if pool.is_empty() {
+        vec![selection]
+    } else {
+        pool.iter().map(String::as_str).collect()
+    };
+    let _ = runner.write_file_atomic(
+        &crate::ims::pcscf_files::pool_path(selection_path),
+        &crate::ims::pcscf_files::render_pool(&pool),
+    );
+    println!("[supervise] line {idx}: P-CSCF pool: {}", pool.join(", "));
+    let _ = runner.write_file(Path::new(selection_path), selection);
+}
+
+/// The pool to republish after a healthy steady-state tick, if the advertised
+/// *set* moved while the selection stayed put (specs/091 R2, US2 AS2/AS3).
+///
+/// A pure reorder returns `None`: the carrier reorders one pool freely, and
+/// rewriting the file for it would be noise. An empty reading (the log rotated,
+/// nothing parsed) is not a change either.
+fn steady_pool_update(published: &[String], latest: Vec<String>) -> Option<Vec<String>> {
+    let same_set = latest.len() == published.len() && latest.iter().all(|a| published.contains(a));
+    (!latest.is_empty() && !same_set).then_some(latest)
+}
+
+/// Republishes only the pool after a set change on a healthy line: no agent
+/// restart, and the selection file is not touched (FR-004).
+fn republish_pool_after_set_change(
+    runner: &dyn CommandRunner,
+    idx: u32,
+    selection_path: &str,
+    current_pool: &mut Vec<String>,
+    latest: Vec<String>,
+) {
+    if let Some(pool) = steady_pool_update(current_pool, latest) {
+        let _ = runner.write_file_atomic(
+            &crate::ims::pcscf_files::pool_path(selection_path),
+            &crate::ims::pcscf_files::render_pool(&pool),
+        );
+        println!(
+            "[supervise] line {idx}: P-CSCF pool changed (set): {}; not restarting",
+            pool.join(", ")
+        );
+        *current_pool = pool;
     }
 }
 
@@ -2389,7 +2552,14 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
     let Some(pcscf) = pcscf else { return };
 
     println!("[supervise] line {idx}: tunnel UP. P-CSCF: {pcscf}");
-    let _ = runner.write_file(Path::new(&line.pcscf_source_path), &pcscf);
+    let mut current_pool = engine.latest_pcscf_pool(runner.as_ref());
+    publish_pcscf(
+        runner.as_ref(),
+        idx,
+        &line.pcscf_source_path,
+        &pcscf,
+        &current_pool,
+    );
     {
         let mut st = started.lock().unwrap();
         st.started_netns.push(netns.clone());
@@ -2445,9 +2615,17 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
                 // recreate the pair the plan just deleted.
                 repair_line_veth(runner.as_ref(), idx, &netns, line);
                 drop(guard);
+                republish_pool_after_set_change(
+                    runner.as_ref(),
+                    idx,
+                    &line.pcscf_source_path,
+                    &mut current_pool,
+                    engine.latest_pcscf_pool(runner.as_ref()),
+                );
             }
             line_supervisor::SteadyOutcome::PcscfChanged { new_pcscf } => {
                 drop(guard);
+                current_pool = engine.latest_pcscf_pool(runner.as_ref());
                 current_pcscf = new_pcscf;
             }
             line_supervisor::SteadyOutcome::Recovered { reason, .. } => {
