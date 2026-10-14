@@ -398,7 +398,7 @@ logged.
 - [X] T045 Live gate quickstart Q2 and Q3 on the Jio Pi (blocking: SC-001, SC-004, SC-005, R9). Record the
   `"P-CSCF marked unavailable"` / `"failing over"` lines and the `vowifi-status` output (addresses redacted) in the
   PR description.
-- [ ] T046 Live gate quickstart Q4: 6 h steady state on the Vodafone rig (SC-002). There must be no marks and no
+- [X] T046 Live gate quickstart Q4: 6 h steady state on the Vodafone rig (SC-002). There must be no marks and no
   `P-CSCF changed` lines.
 
 ---
@@ -497,3 +497,24 @@ to A time out, and the route probe still finds a route.
 - **Rebuilds**: zero `recovered from …` and zero `P-CSCF changed` lines since the deploy.
 - **Not exercised live**: an inbound call after the failover. Registration, the confirmed reg-event subscription
   and `can_answer: true` on B were checked instead.
+
+## Live gate T046 (Vodafone rig, 2026-10-14)
+
+Image `gsm-sip-bridge:pcscf-failover-091-local` (built from the branch before the Greptile fixes), 17:34 to 23:34 UTC,
+sampled every 10 minutes. Vodafone advertises a single IPv6 P-CSCF.
+
+| Measure | Result |
+|---|---|
+| Samples not `Registered` | 0 of 36 |
+| `P-CSCF marked unavailable` / `failing over` | 0 / 0 |
+| `registration through P-CSCF` failed | 0 |
+| Renewals | 6 ok |
+| `P-CSCF selected` | 2, both `startup` |
+| Final `vowifi-status` | `Registered`, `gm_connection: up`, `reg_subscription: confirmed`, `pcscf_unavailable: none`, `can_answer: true` |
+
+- **One carrier-initiated rebuild, not a 091 event.** At about 20:44 the ePDG deleted the IKE SA. The supervisor logged
+  `recovered from IkeSaLost (cause: carrier DELETE)`, re-initiated, and the new negotiation advertised a different
+  P-CSCF (`P-CSCF synced from new negotiation`, pool of one). The agent was restarted as part of the rebuild, selected
+  the new address with reason `startup`, and registered 2 s later; the 20:44 sample was already `Registered`.
+- **SC-002**: no marks and no failovers in 6 h. The one P-CSCF change came from the carrier's new negotiation after its
+  DELETE, which is the existing rebuild path, not a failover.
