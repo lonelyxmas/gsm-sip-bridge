@@ -238,8 +238,8 @@ All paths are relative to the repo root:
 - [X] T038 [P] Add `RELEASE_NOTES.md` and `CHANGELOG.md` entries. Bold only the summary phrase (memory: release-notes bold scope), and cite #124
 - [X] T039 Audit the diff for SC-005: `grep -n "outside an active transaction"` must remain only on the non-SUBSCRIBE fallthrough, and every new log message must match contracts/observability.md word for word
 - [X] T040 Run quickstart Q0 (`make format && make lint && make test`) and commit the docs: `docs(090): status lines, log contract, release notes`
-- [ ] T041 Live gate, quickstart Q1 (**blocking before merge**): a 3-hour run on the Jio Pi (`respond_on_client` on) and on the Vodafone rig. Record the counts in the PR description. Any current-session `481` stops the merge (research R6)
-- [ ] T042 [P] Live, quickstart Q2 (best effort) and Q3 (status lines) on the Vodafone rig; note the results in the PR
+- [X] T041 Live gate, quickstart Q1 (**blocking before merge**): a 3-hour run on the Jio Pi (`respond_on_client` on) and on the Vodafone rig. Record the counts in the PR description. Any current-session `481` stops the merge (research R6)
+- [X] T042 [P] Live, quickstart Q2 (best effort) and Q3 (status lines) on the Vodafone rig; note the results in the PR (Q3 done on both rigs; Q2 not run)
 
 ---
 
