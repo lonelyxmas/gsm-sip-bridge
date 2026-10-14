@@ -555,6 +555,57 @@ impl GmConnectionState {
     }
 }
 
+/// Health of this line's reg-event subscription (specs/090 FR-020): reported
+/// beside the registration and the Gm connection, and an input to neither —
+/// a subscription can fail while the registration and transport are fine.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SubscriptionHealth {
+    /// No SUBSCRIBE has been sent yet.
+    #[default]
+    None,
+    /// Sent, and possibly accepted, but no NOTIFY yet: only a NOTIFY confirms
+    /// a subscription.
+    Pending { since: std::time::SystemTime },
+    /// A NOTIFY arrived in the subscription dialog. `expires_at` is `None`
+    /// until the network states a lifetime.
+    Confirmed {
+        expires_at: Option<std::time::SystemTime>,
+    },
+    /// The last subscription failed; `retry_at` is when the next one goes out,
+    /// if one is scheduled.
+    Unconfirmed {
+        since: std::time::SystemTime,
+        retry_at: Option<std::time::SystemTime>,
+    },
+    /// The network refused the reg event package for this registration.
+    Stopped { reason: String },
+}
+
+impl SubscriptionHealth {
+    /// Wire/CLI rendering (`specs/090-reg-event-subscription-tracking/contracts/control.md`).
+    /// Timestamps are RFC 3339 in UTC, as in [`GmConnectionState::render`].
+    pub fn render(&self) -> String {
+        fn ts(t: std::time::SystemTime) -> String {
+            chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()
+        }
+        match self {
+            SubscriptionHealth::None => "none".to_string(),
+            SubscriptionHealth::Pending { since } => format!("pending since {}", ts(*since)),
+            SubscriptionHealth::Confirmed {
+                expires_at: Some(e),
+            } => format!("confirmed, expires {}", ts(*e)),
+            SubscriptionHealth::Confirmed { expires_at: None } => "confirmed".to_string(),
+            SubscriptionHealth::Unconfirmed { since, retry_at } => match retry_at {
+                Some(r) => format!("unconfirmed since {}; retry at {}", ts(*since), ts(*r)),
+                None => format!("unconfirmed since {}", ts(*since)),
+            },
+            SubscriptionHealth::Stopped { reason } => {
+                format!("stopped until next registration ({reason})")
+            }
+        }
+    }
+}
+
 /// Snapshot of Agent A's registration health, per
 /// `specs/011-vowifi-sip-bridge/data-model.md`'s "VoWiFi Line Registration"
 /// entity — what FR-008/User Story 3's status reporting needs.
@@ -590,6 +641,12 @@ pub struct RegistrationStatus {
     /// attempt goes out (specs/089 FR-017); `None` when none is running.
     /// In-memory only, like `gm_connection`.
     pub rejected_until: Option<std::time::SystemTime>,
+    /// The reg-event subscription's health (specs/090 FR-020). In-memory only,
+    /// like `gm_connection`, and not an input to [`Self::health`].
+    pub reg_subscription: SubscriptionHealth,
+    /// The most recent subscription failure and when it happened. Kept after a
+    /// later success, so the last thing that went wrong stays visible.
+    pub reg_subscription_last_failure: Option<(std::time::SystemTime, String)>,
 }
 
 impl Default for RegistrationStatus {
@@ -605,6 +662,8 @@ impl Default for RegistrationStatus {
             deferred_maintenance: None,
             gm_connection: GmConnectionState::Up,
             rejected_until: None,
+            reg_subscription: SubscriptionHealth::None,
+            reg_subscription_last_failure: None,
         }
     }
 }
@@ -1403,6 +1462,82 @@ mod tests {
         let expires_at = SystemTime::now() + Duration::from_secs(3600);
         let now = SystemTime::now();
         assert!(!renewal_due(now, expires_at, Duration::from_secs(300)));
+    }
+
+    /// specs/090 contracts/control.md: every rendering.
+    #[test]
+    fn subscription_health_renders_every_variant() {
+        let t = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let later = t + Duration::from_secs(128);
+        assert_eq!(SubscriptionHealth::None.render(), "none");
+        assert_eq!(
+            SubscriptionHealth::Pending { since: t }.render(),
+            "pending since 2023-11-14T22:13:20+00:00"
+        );
+        assert_eq!(
+            SubscriptionHealth::Confirmed {
+                expires_at: Some(later)
+            }
+            .render(),
+            "confirmed, expires 2023-11-14T22:15:28+00:00"
+        );
+        assert_eq!(
+            SubscriptionHealth::Confirmed { expires_at: None }.render(),
+            "confirmed"
+        );
+        assert_eq!(
+            SubscriptionHealth::Unconfirmed {
+                since: t,
+                retry_at: Some(later)
+            }
+            .render(),
+            "unconfirmed since 2023-11-14T22:13:20+00:00; retry at 2023-11-14T22:15:28+00:00"
+        );
+        assert_eq!(
+            SubscriptionHealth::Unconfirmed {
+                since: t,
+                retry_at: None
+            }
+            .render(),
+            "unconfirmed since 2023-11-14T22:13:20+00:00"
+        );
+        assert_eq!(
+            SubscriptionHealth::Stopped {
+                reason: "489 Bad Event".into()
+            }
+            .render(),
+            "stopped until next registration (489 Bad Event)"
+        );
+    }
+
+    /// Research R11: subscription health is reported beside registration and
+    /// transport health, never folded into whether the line can answer.
+    #[test]
+    fn subscription_health_never_changes_can_answer() {
+        let base = RegistrationStatus {
+            state: RegistrationState::Registered,
+            ..Default::default()
+        };
+        assert_eq!(base.reg_subscription, SubscriptionHealth::None);
+        assert_eq!(base.reg_subscription_last_failure, None);
+        let t = std::time::SystemTime::now();
+        for h in [
+            SubscriptionHealth::Pending { since: t },
+            SubscriptionHealth::Unconfirmed {
+                since: t,
+                retry_at: None,
+            },
+            SubscriptionHealth::Stopped {
+                reason: "489 Bad Event".into(),
+            },
+        ] {
+            let s = RegistrationStatus {
+                reg_subscription: h,
+                reg_subscription_last_failure: Some((t, "x".into())),
+                ..base.clone()
+            };
+            assert_eq!(s.health().can_answer(), base.health().can_answer());
+        }
     }
 
     #[test]

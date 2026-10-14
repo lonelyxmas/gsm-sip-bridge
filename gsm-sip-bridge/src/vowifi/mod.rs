@@ -2198,6 +2198,8 @@ pub fn print_status(_config: &VowifiConfig) -> ExitCode {
                 blocked_reason,
                 gm_connection,
                 rejection_cooldown_until,
+                reg_subscription,
+                reg_subscription_last_failure,
             }) => {
                 println!("    state: {state}");
                 println!("    registered_at: {}", format_unix(registered_at));
@@ -2220,6 +2222,9 @@ pub fn print_status(_config: &VowifiConfig) -> ExitCode {
                         &gm_connection
                     }
                 );
+                for l in format_reg_subscription(&reg_subscription, reg_subscription_last_failure) {
+                    println!("    {l}");
+                }
                 println!(
                     "    rejection_cooldown: {}",
                     format_rejection_cooldown(rejection_cooldown_until, unix_now())
@@ -2340,6 +2345,28 @@ pub fn format_rejection_cooldown(until: Option<u64>, now: u64) -> String {
     }
 }
 
+/// The two reg-event subscription status lines (specs/090,
+/// `contracts/control.md`), shared by `vowifi-status` and `volte-status`:
+/// `unknown` when an older agent did not report the subscription, `none` when
+/// it has never failed.
+pub fn format_reg_subscription(health: &str, last_failure: Option<(u64, String)>) -> [String; 2] {
+    let health = if health.is_empty() { "unknown" } else { health };
+    let failure = match last_failure {
+        Some((t, msg)) => {
+            let at = i64::try_from(t)
+                .ok()
+                .and_then(|t| chrono::DateTime::<chrono::Utc>::from_timestamp(t, 0))
+                .map_or_else(|| t.to_string(), |t| t.to_rfc3339());
+            format!("{at} {msg}")
+        }
+        None => "none".to_string(),
+    };
+    [
+        format!("reg_subscription: {health}"),
+        format!("reg_subscription_last_failure: {failure}"),
+    ]
+}
+
 /// Seconds since the unix epoch, `0` if the clock is before it.
 pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -2383,6 +2410,30 @@ mod tests {
         assert!(
             format_rejection_cooldown(Some(1_700_000_000), 1_700_000_005)
                 .ends_with("(next attempt in 0s)")
+        );
+    }
+
+    /// specs/090 contracts/control.md: the two lines, for a healthy line, a
+    /// failure, and an older agent that reports no subscription at all.
+    #[test]
+    fn reg_subscription_lines_render_health_and_last_failure() {
+        assert_eq!(
+            format_reg_subscription("confirmed, expires 2026-10-14T11:02:11+00:00", None),
+            [
+                "reg_subscription: confirmed, expires 2026-10-14T11:02:11+00:00".to_string(),
+                "reg_subscription_last_failure: none".to_string(),
+            ]
+        );
+        assert_eq!(
+            format_reg_subscription(
+                "unconfirmed since 2023-11-14T22:13:20+00:00",
+                Some((1_700_000_000, "accepted but no NOTIFY within 128s".to_string()))
+            )[1],
+            "reg_subscription_last_failure: 2023-11-14T22:13:20+00:00 accepted but no NOTIFY within 128s"
+        );
+        assert_eq!(
+            format_reg_subscription("", None)[0],
+            "reg_subscription: unknown"
         );
     }
     use std::io::Write;

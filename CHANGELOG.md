@@ -10,6 +10,13 @@ across releases.
 
 ### Added
 
+- **Reg-event subscription tracking.** The reg-event `SUBSCRIBE` is
+  correlated with its response and NOTIFYs and refreshed in its dialog. An
+  unanswered one (Timer F, 128 s) is checked with an immediate Gm probe, and an
+  unanswered probe re-registers the line at once. `vowifi-status`/`volte-status`
+  print `reg_subscription` and `reg_subscription_last_failure`
+  ([#124](https://github.com/selvakn/gsm-sip-bridge/issues/124)).
+
 - **`reg_rejected_cooldown_sec`.** How long a reg-event `rejected` holds a
   line's registration off before one more attempt (default 1800,
   `60..=86400`), under `[vowifi]`, `[[vowifi.line]]`, `[volte]` and
@@ -37,6 +44,12 @@ across releases.
   circuit-switched path is unchanged.
 
 ### Fixed
+
+- **NOTIFYs answered per subscription dialog.** A reg-event `NOTIFY` for a
+  subscription a renewal replaced is acknowledged without being acted on, and
+  one for no subscription of ours is refused `481` (RFC 6665 §4.4.1); a late
+  `SUBSCRIBE` response can no longer be mistaken for the Gm keepalive's answer
+  ([#124](https://github.com/selvakn/gsm-sip-bridge/issues/124)).
 
 - **Renewal re-registration loop.** A reg-event NOTIFY retiring the binding a
   renewal replaced was read as the current binding being lost, because it

@@ -27,7 +27,7 @@ const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
 /// time, and 12× inside `PING_INTERVAL`. The unanswered-ping case is the one
 /// that catches a blackholed connection, where the `send` itself still
 /// succeeds (R2).
-const PING_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(super) const PING_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Consecutive failed transport rebuilds before escalating to a full
 /// re-registration. Three failures is strong evidence the layer underneath
 /// (the Gm IPsec SA) is the problem, which a bare TCP rebind cannot fix —

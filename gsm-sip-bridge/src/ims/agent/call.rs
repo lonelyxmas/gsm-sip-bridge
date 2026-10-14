@@ -636,7 +636,7 @@ pub(super) fn handle_bye(sink: &SipSink, req: &SipRequest, mut call: ActiveCall)
 /// or — when the URI carries no params or commas — the bare addr-spec form,
 /// whose trailing `;params` belong to the header, not the URI. `None` when
 /// nothing usable is there.
-fn contact_uri(value: &str) -> Option<String> {
+pub(super) fn contact_uri(value: &str) -> Option<String> {
     let value = value.trim();
     if let Some(start) = value.find('<') {
         let end = value[start..].find('>')? + start;

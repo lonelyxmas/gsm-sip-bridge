@@ -1,7 +1,7 @@
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan at
-`specs/089-reg-notify-binding-attribution/plan.md`.
+`specs/090-reg-event-subscription-tracking/plan.md`.
 <!-- SPECKIT END -->
 
 ## Pre-commit Checklist

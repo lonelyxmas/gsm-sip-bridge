@@ -142,6 +142,69 @@ During a rejection cooldown, `vowifi-status`/`volte-status` read `state: Failed`
 `can_answer: false`, and `rejection_cooldown: until <time> (next attempt in <N>s)`;
 otherwise `rejection_cooldown: none`.
 
+## Reg-event subscription logs
+
+The reg-event `SUBSCRIBE` is tracked as a transaction and a dialog (specs/090),
+identically on VoWiFi and VoLTE. Every SUBSCRIBE response and every NOTIFY
+produces one line naming which subscription it belongs to: the current one, one
+a renewal replaced (`superseded`), or none of ours (`unknown`).
+
+| Message | Level | Fields |
+|---|---|---|
+| `sent reg-event SUBSCRIBE` | INFO | `impu`, `call_id`, `cseq`, `kind` (`initial`/`refresh`), `expires` |
+| `failed to send reg-event SUBSCRIBE` | WARN | `error`, `call_id`, `kind` |
+| `reg-event SUBSCRIBE accepted` | INFO | `call_id`, `cseq`, `status`, `granted_expires`, `kind` |
+| `reg-event SUBSCRIBE interval too brief; resending` | INFO | `call_id`, `min_expires` |
+| `the network does not support the reg event package; not subscribing again for this registration` | WARN | `call_id` |
+| `reg-event SUBSCRIBE refused; retrying on backoff` | WARN | `call_id`, `status`, `reason`, `retry_in_secs`, `kind` |
+| `response to a superseded reg-event SUBSCRIBE; ignored` / `response to an unknown reg-event SUBSCRIBE; ignored` | INFO | `call_id`, `cseq`, `status` |
+| `reg-event subscription confirmed` | INFO | `call_id`, `expires_in_secs` |
+| `reg-event subscription accepted but never confirmed; retrying on backoff` | WARN | `call_id`, `retry_in_secs` (no NOTIFY within 128 s) |
+| `reg-event subscription terminated by the network` | WARN | `call_id`, `reason`, `retry_after_secs`, `next` (`now`/`backoff`/`after-retry-after`/`next-registration`), `retry_in_secs` |
+| `reg-event subscription expired without a successful refresh; resubscribing` | WARN | `call_id` |
+| `NOTIFY for a superseded reg-event subscription; acknowledged, not applied` | INFO | `call_id`, `subscription_state`, `attribution`, `own_entries`, `contact_states`, `body` |
+| `NOTIFY for no subscription of ours; refused 481` | INFO | `call_id`, `to_tag`, `event`, `subscription_state`, `current_call_id`, `current_local_tag` |
+| `NOTIFY without Subscription-State; treating as active` | WARN | `call_id` |
+
+The NOTIFY lines in the section above apply to the current subscription only, and
+carry `subscription=current`.
+
+A SUBSCRIBE with no final response within 128 s (Timer F), or one that could not
+be sent, is checked with one immediate Gm keepalive probe, even during a call:
+
+| Message | Level | Fields |
+|---|---|---|
+| `reg-event SUBSCRIBE unanswered; probing the Gm path` | WARN | `call_id`, `cause` (`subscribe-timeout`/`subscribe-send-failed`), `in_call` |
+| `Gm path answered; reg-event subscription failed, retrying on backoff` | WARN | `call_id`, `retry_in_secs` |
+| `qualifying endpoint failure: re-registering` | WARN | `cause`, `call_id`, `in_call` |
+| `qualifying endpoint failure while a re-registration is already pending` | INFO | `cause`, `call_id` |
+
+A qualifying endpoint failure re-registers at once, skipping the transport
+rebuild ladder; during a call the re-registration waits for the call to end, and
+the call is not dropped. Status reads `state: Failed`, `gm_connection: failed
+since <time>`, and `last_failure: reg-event SUBSCRIBE unanswered and the Gm
+keepalive probe failed; re-registering`.
+
+Subscription retries use their own backoff (5 s doubling to 600 s, never sooner
+than a network `Retry-After`), separate from registration renewal's, and never
+count against the renewal budget.
+
+`vowifi-status`/`volte-status` print two lines after `gm_connection`:
+
+```text
+    reg_subscription: confirmed, expires 2026-10-14T11:02:11+00:00
+    reg_subscription_last_failure: none
+```
+
+`reg_subscription` is one of `none`, `pending since <time>`, `confirmed, expires
+<time>`, `unconfirmed since <time>[; retry at <time>]` or `stopped until next
+registration (<reason>)`. `reg_subscription_last_failure` keeps the most recent
+subscription failure even after a later success: `accepted but no NOTIFY within
+128s`, `SUBSCRIBE unanswered within 128s (Gm path alive)`, `SUBSCRIBE could not be
+sent (Gm path alive)`, `SUBSCRIBE refused: <status> <reason>`, `terminated by the
+network: <reason>` or `expired without a successful refresh`. Neither line changes
+`can_answer`. An older agent that does not report them prints `unknown`.
+
 ## Grafana dashboard
 
 The "GSM-SIP Bridge" dashboard is auto-provisioned on first boot of the

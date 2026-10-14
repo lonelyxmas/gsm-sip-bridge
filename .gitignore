@@ -45,3 +45,4 @@ samples/
 /config-bak/
 
 .aide.yaml
+.worktrees
