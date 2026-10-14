@@ -27,6 +27,10 @@ In the IMS, T1 is 2 s, so Timer F and Timer N are both 128 s (TS 24.229 table 7.
 ### Session 2026-10-14
 
 - Q: On a carrier that never answers the SUBSCRIBE while the Gm keepalive (OPTIONS) is still answered, should Timer F on the SUBSCRIBE alone force a re-registration? → A: Confirm with a probe first. When Timer F fires (or the send fails), send an immediate Gm keepalive. No answer within the keepalive's own deadline (or the probe cannot be sent) → qualifying endpoint failure and forced re-registration. Answered → the path is alive, so it is a subscription failure only: re-subscribe on backoff. A deliberate, narrow deviation from TS 24.229 §5.1.2A.1.6, accepted to avoid re-registration churn on carriers that ignore SUBSCRIBE.
+- Q: When the confirming probe after Timer F goes unanswered, does it go through the existing Gm transport-rebuild ladder (TCP rebuild ×3, then re-registration) or straight to re-registration? → A: Straight to re-registration. The qualifying endpoint failure bypasses the transport-rebuild ladder, because only a re-registration renegotiates the Gm security association; the ladder still applies to ordinary idle-keepalive failures.
+- Q: How persistently should a subscription that keeps failing within one registration be retried? → A: For the whole registration, on a subscription-specific backoff: 5 s doubling, capped at 600 s, reset on a confirmed subscription and on each new registration.
+- Q: If Timer F fires during a call, is the confirming probe sent then, deferred, or skipped? → A: Sent immediately, even mid-call (an exception to the keepalive's usual in-call suppression). If it goes unanswered, the qualifying endpoint failure is recorded at once and the forced re-registration waits for the call to end.
+- Q: How long does a line remember a superseded subscription? → A: Until its granted expiry (the requested expiry if none was granted) plus a 128 s grace period, capped at 32 entries per line, oldest dropped first.
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -121,8 +125,9 @@ An operator querying line status sees three separate facts: whether the registra
 
 - A NOTIFY arrives before the SUBSCRIBE's response (so the network's tag is first learned from the NOTIFY): accepted, and the later response is matched to the same dialog.
 - The network forks or answers with a different tag in the `200 OK` than in the first NOTIFY: the dialog is identified by Call-ID and the line's own tag; the network tag from the first NOTIFY is kept.
-- A call is in progress when Timer F fires: the failure is recorded, and the forced re-registration waits for the call to end through the existing maintenance deferral.
+- A call is in progress when Timer F fires: the confirming probe is still sent immediately (the ordinary keepalive's in-call suppression does not apply to it). If it goes unanswered, the qualifying endpoint failure is recorded at once, and the forced re-registration waits for the call to end through the existing maintenance deferral.
 - Timer F fires while a re-registration is already pending (e.g. Gm keepalive escalation): no second escalation is stacked.
+- Timer F's confirming probe goes unanswered while the ordinary keepalive's transport-rebuild ladder is part-way through: the forced re-registration takes over and the ladder's remaining rebuild attempts are abandoned.
 - The network never supports the reg event package and answers `489` every time: one SUBSCRIBE per registration, never a retry loop.
 - A NOTIFY with no `Subscription-State` header: treated as `active` for matching purposes and logged as malformed.
 - The line was answered `481` for a stale-looking NOTIFY that was actually for the current subscription (identifier mismatch on the carrier side): logged with both sets of identifiers so it can be diagnosed.
@@ -136,7 +141,7 @@ An operator querying line status sees three separate facts: whether the registra
 **Subscription tracking**
 
 - **FR-001**: The system MUST keep, per line, the current reg-event subscription's identifiers (Call-ID, the line's tag, CSeq), when its SUBSCRIBE was sent, the network's tag once known, its granted expiry, and its state (pending, active, terminated).
-- **FR-002**: The system MUST remember the identifiers of the line's previous subscriptions made by the running agent, enough to recognise their NOTIFYs as superseded.
+- **FR-002**: The system MUST remember the identifiers of the line's previous subscriptions made by the running agent, so that their NOTIFYs are recognised as superseded. Each one MUST be remembered until its granted expiry has passed plus a 128 s grace period. If no expiry was granted, the requested expiry is used. At most 32 are kept per line; when the limit is reached, the oldest is dropped first. Once an entry is forgotten, its NOTIFYs are treated as unknown (FR-016).
 - **FR-003**: A successful registration renewal MUST start a fresh subscription and discard the previous subscription's pending timers and retries.
 
 **Responses to SUBSCRIBE**
@@ -147,12 +152,13 @@ An operator querying line status sees three separate facts: whether the registra
 - **FR-007**: On `503` with `Retry-After`, the system MUST NOT re-send the SUBSCRIBE before that interval elapses.
 - **FR-008**: On `489`, the system MUST stop subscribing for the current registration and log it.
 - **FR-009**: On any other 4xx, 5xx or 6xx, the system MUST log it and retry on bounded backoff.
+- **FR-009a**: Wherever this spec says "on backoff" or "bounded backoff", the system MUST use the subscription backoff: the first retry 5 s after the failure, doubling on each consecutive failure up to a cap of 600 s, retried for as long as the registration lasts. The backoff MUST reset when a subscription is confirmed (first NOTIFY received) and when a new registration starts. A `Retry-After` from the network (FR-007, FR-018) sets a floor on the next attempt, never a ceiling.
 
 **Timers**
 
 - **FR-010**: The system MUST apply a 128 s transaction timeout (Timer F) to each SUBSCRIBE.
 - **FR-011**: On Timer F expiry, or when sending the SUBSCRIBE fails with a transport error, the system MUST immediately send a Gm keepalive probe to confirm the signalling path.
-- **FR-011a**: If the confirming probe goes unanswered within the keepalive's existing response deadline, or cannot be sent, the system MUST raise a qualifying endpoint failure: report the registration as failed and force a re-registration through the existing escalation path. The failure MUST be available as a distinct signal for P-CSCF failover (spec 091).
+- **FR-011a**: If the confirming probe goes unanswered within the keepalive's existing response deadline, or cannot be sent, the system MUST raise a qualifying endpoint failure: report the registration as failed and force a re-registration immediately, bypassing the Gm transport-rebuild ladder (the rebuild attempts used for ordinary idle-keepalive failures). The failure MUST be available as a distinct signal for P-CSCF failover (spec 091).
 - **FR-011b**: If the confirming probe is answered, the system MUST treat the Timer F expiry as a subscription failure only: log it, keep registration state unchanged, and re-subscribe on bounded backoff.
 - **FR-012**: The system MUST apply a 128 s confirmation timeout (Timer N) from sending the SUBSCRIBE until the first NOTIFY of its dialog, MUST accept a NOTIFY that arrives before the SUBSCRIBE's 2xx as satisfying it, and on expiry MUST log a subscription-confirmation failure and re-subscribe on backoff without changing registration state.
 
@@ -173,12 +179,12 @@ An operator querying line status sees three separate facts: whether the registra
 
 - **FR-020**: Status queries MUST report registration acceptance, subscription confirmation (with the last failure and when it happened), and Gm transport health as three separate facts.
 - **FR-021**: The behaviour MUST be identical for VoWiFi and VoLTE lines.
-- **FR-022**: A qualifying endpoint failure raised during a call MUST NOT end the call; the forced re-registration waits for the call to end, as existing renewals do.
+- **FR-022**: The confirming probe (FR-011) MUST be sent even while a call is in progress. A qualifying endpoint failure raised during a call MUST NOT end the call; it is recorded immediately, and the forced re-registration waits for the call to end, as existing renewals do.
 
 ### Key Entities
 
 - **Reg-event subscription**: one per registration; identifiers, network tag, granted expiry, state, confirmation status.
-- **Superseded subscription**: an earlier subscription of the same line, kept only to recognise its late NOTIFYs.
+- **Superseded subscription**: an earlier subscription of the same line, kept only to recognise its late NOTIFYs, until its expiry plus 128 s (at most 32 per line).
 - **Qualifying endpoint failure**: a SUBSCRIBE Timer F expiry or transport send failure, confirmed by an unanswered keepalive probe; means the registered contact can no longer be assumed bound.
 - **Subscription-confirmation failure**: Timer N expiry; the subscription is unconfirmed but the registration is not in question.
 
@@ -198,6 +204,6 @@ An operator querying line status sees three separate facts: whether the registra
 - Spec 089 is in place: NOTIFY attribution is by contact address, and the per-event policy is applied to NOTIFYs this spec routes to it.
 - T1 is the IMS value of 2 s, so Timer F and Timer N are 128 s; no per-line override is needed.
 - Authentication challenges (`401`/`407`) are not expected on a SUBSCRIBE sent over an established Gm security association; if one arrives it is handled as "any other 4xx" (logged, retried on backoff), and the next registration renews credentials.
-- The existing renewal backoff and maintenance deferral (no maintenance during a call) are reused; this spec adds no new alert category.
+- The existing maintenance deferral (no maintenance during a call) is reused; subscription retries use their own backoff (FR-009a), not the registration-renewal backoff. This spec adds no new alert category.
 - Previous-subscription memory is in-process only; after an agent restart, NOTIFYs for subscriptions from before the restart get `481`, which is the correct response for them.
 - P-CSCF failover on a qualifying endpoint failure is specified in spec 091; here the failure only forces a re-registration to the same P-CSCF.
