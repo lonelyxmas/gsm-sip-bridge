@@ -1,15 +1,21 @@
 # Contract: status reply and status CLI (FR-020, SC-006)
 
-## `ControlMessage::RegistrationStatusReply`: new fields
+## `ControlMessage::RegistrationStatusReply`: new field
 
 | Field | Type | Default (older peer) | Meaning |
 |---|---|---|---|
-| `pcscf_active` | `String` | `""` | The P-CSCF the line is registered through, or is attempting |
-| `pcscf_pool` | `Vec<String>` | `[]` | Candidates in selection order (FR-005) |
-| `pcscf_unavailable` | `Vec<(String, u64)>` | `[]` | Each address currently marked, with its expiry in Unix seconds |
+| `pcscf` | `Option<Box<PcscfStatusReply>>` | `None` | The line's P-CSCF choice. It is boxed, because three inline lists would make this the one oversized variant (`clippy::large_enum_variant`). |
 
-All three fields are `#[serde(default)]`. A reply from an older agent still parses, and the CLI prints `unknown` for
-an empty `pcscf_active`.
+`PcscfStatusReply` (JSON object):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `active` | `String` | The P-CSCF the line is registered through, or is attempting |
+| `pool` | `Vec<String>` | Candidates in selection order (FR-005) |
+| `unavailable` | `Vec<(String, u64)>` | Each address currently marked, with its expiry in Unix seconds |
+
+`pcscf` is `#[serde(default)]`. A reply from an older agent still parses, and the CLI then prints `pcscf: unknown`
+and `pcscf_unavailable: none`.
 
 ## `vowifi-status` / `volte-status`
 

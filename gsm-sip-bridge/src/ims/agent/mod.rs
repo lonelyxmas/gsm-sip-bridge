@@ -1066,6 +1066,20 @@ fn run_status_listener(
                     reg_subscription_last_failure: snapshot
                         .reg_subscription_last_failure
                         .map(|(t, msg)| (to_unix(t).unwrap_or(0), msg)),
+                    pcscf: Some(Box::new(crate::vowifi::control::PcscfStatusReply {
+                        active: snapshot
+                            .pcscf
+                            .active
+                            .map(|a| a.to_string())
+                            .unwrap_or_default(),
+                        pool: snapshot.pcscf.pool.iter().map(|a| a.to_string()).collect(),
+                        unavailable: snapshot
+                            .pcscf
+                            .unavailable
+                            .iter()
+                            .map(|(a, t)| (a.to_string(), to_unix(*t).unwrap_or(0)))
+                            .collect(),
+                    })),
                 };
                 let _ = write_msg(&mut stream, &reply);
             }
@@ -2185,7 +2199,13 @@ impl LoopState {
             }
             None => {
                 let result = self.schedule_renewal_retry();
+                let soonest = self
+                    .pool
+                    .next_eligible(now + self.pool.soonest_expiry(now))
+                    .map(|a| a.to_string())
+                    .unwrap_or_default();
                 tracing::warn!(
+                    pcscf = %soonest,
                     pool = %self
                         .pool
                         .candidates(now)

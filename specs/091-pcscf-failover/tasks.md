@@ -350,10 +350,10 @@ logged.
 
 ### Tests for User Story 5
 
-- [ ] T037 [P] [US5] Write failing tests in `control.rs`: a `RegistrationStatusReply` round trip with `pcscf_active`,
+- [X] T037 [P] [US5] Write failing tests in `control.rs`: a `RegistrationStatusReply` round trip with `pcscf_active`,
   `pcscf_pool` and `pcscf_unavailable` set. A reply JSON *without* those fields (an older agent) still parses, with
   the defaults.
-- [ ] T038 [P] [US5] Write failing tests in `vowifi/mod.rs` for `format_pcscf_lines(active, pool, unavailable) ->
+- [X] T038 [P] [US5] Write failing tests in `vowifi/mod.rs` for `format_pcscf_lines(active, pool, unavailable) ->
   [String; 2]`:
   - `pcscf: 10.0.1.10 (pool: 10.0.1.10, 10.0.0.10)`;
   - `pcscf_unavailable: 10.0.0.10 until 2026-10-14T10:08:41+00:00`;
@@ -365,7 +365,7 @@ logged.
 
 ### Implementation for User Story 5
 
-- [ ] T040 [US5] Implement the status path:
+- [X] T040 [US5] Implement the status path:
   - `PcscfSnapshot` and `RegistrationStatus.pcscf` in `ims/mod.rs`, in memory only, with a default.
   - Sync it in `sync_shared_status` and once after the startup registration (`agent/mod.rs`).
   - Add the three `#[serde(default)]` reply fields in `control.rs`, filled in `run_status_listener`.
@@ -373,7 +373,7 @@ logged.
   - The same in `volte-status` (`bridge.rs`).
 
   Make T037–T039 pass. Commit.
-- [ ] T041 [US5] Audit every log line in contracts/observability.md against the code (messages and field names).
+- [X] T041 [US5] Audit every log line in contracts/observability.md against the code (messages and field names).
   Add any that are missing, for example `previous`/`candidates` on `"P-CSCF selected"`, and suppress the repeated
   same-address `sticky` line. Add one test asserting that a failover emits, in order: selected, failed, marked,
   failing over, selected. Capture with the existing tracing test-capture helper if one exists; otherwise assert on

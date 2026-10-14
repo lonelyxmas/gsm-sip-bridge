@@ -15,6 +15,21 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 
+/// The P-CSCF part of a [`ControlMessage::RegistrationStatusReply`]
+/// (specs/091 `contracts/control.md`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PcscfStatusReply {
+    /// The P-CSCF the line registers through, or is attempting.
+    pub active: String,
+    /// The candidates, in selection order.
+    #[serde(default)]
+    pub pool: Vec<String>,
+    /// Each P-CSCF currently marked unavailable, with the unix second its
+    /// mark ends.
+    #[serde(default)]
+    pub unavailable: Vec<(String, u64)>,
+}
+
 /// One lifecycle event exchanged between the two agents. `call_id` always
 /// correlates to the carrier-side SIP `Call-ID` for the call in question, so
 /// log lines on both agents can be joined.
@@ -105,6 +120,11 @@ pub enum ControlMessage {
         /// `None` when there has been none, and from an older peer.
         #[serde(default)]
         reg_subscription_last_failure: Option<(u64, String)>,
+        /// Which P-CSCF the line uses and which it avoids (specs/091
+        /// FR-020). `None` from an older peer, printed `unknown`. Boxed: the
+        /// lists would otherwise make this the one oversized variant.
+        #[serde(default)]
+        pcscf: Option<Box<PcscfStatusReply>>,
     },
     /// Agent B → `vowifi-status`. Recent call outcomes, newest first.
     CallHistoryReply { calls: Vec<CallRecord> },
@@ -631,6 +651,11 @@ mod tests {
                 1_699_999_500,
                 "accepted but no NOTIFY within 128s".to_string(),
             )),
+            pcscf: Some(Box::new(PcscfStatusReply {
+                active: "10.0.1.10".to_string(),
+                pool: vec!["10.0.1.10".to_string(), "10.0.0.10".to_string()],
+                unavailable: vec![("10.0.0.10".to_string(), 1_700_000_330)],
+            })),
         };
         assert_eq!(roundtrip(&msg), msg);
     }
@@ -648,6 +673,7 @@ mod tests {
             rejection_cooldown_until: Some(1_700_001_800),
             reg_subscription: "none".to_string(),
             reg_subscription_last_failure: None,
+            pcscf: None,
         };
         assert_eq!(roundtrip(&msg), msg);
     }
@@ -665,8 +691,11 @@ mod tests {
                 rejection_cooldown_until,
                 reg_subscription,
                 reg_subscription_last_failure,
+                pcscf,
                 ..
             } => {
+                // specs/091: nor of the P-CSCF pool.
+                assert_eq!(pcscf, None);
                 assert_eq!(gm_connection, "");
                 // specs/089: nor does it know of the rejection cooldown.
                 assert_eq!(rejection_cooldown_until, None);

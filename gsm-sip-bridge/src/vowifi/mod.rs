@@ -2200,6 +2200,7 @@ pub fn print_status(_config: &VowifiConfig) -> ExitCode {
                 rejection_cooldown_until,
                 reg_subscription,
                 reg_subscription_last_failure,
+                pcscf,
             }) => {
                 println!("    state: {state}");
                 println!("    registered_at: {}", format_unix(registered_at));
@@ -2223,6 +2224,9 @@ pub fn print_status(_config: &VowifiConfig) -> ExitCode {
                     }
                 );
                 for l in format_reg_subscription(&reg_subscription, reg_subscription_last_failure) {
+                    println!("    {l}");
+                }
+                for l in format_pcscf_lines(pcscf.as_deref()) {
                     println!("    {l}");
                 }
                 println!(
@@ -2367,6 +2371,40 @@ pub fn format_reg_subscription(health: &str, last_failure: Option<(u64, String)>
     ]
 }
 
+/// The two P-CSCF status lines (specs/091 `contracts/control.md`), shared by
+/// `vowifi-status` and `volte-status`: which P-CSCF the line uses among its
+/// candidates, and which it is avoiding until when.
+pub fn format_pcscf_lines(status: Option<&control::PcscfStatusReply>) -> [String; 2] {
+    let empty = control::PcscfStatusReply::default();
+    let status = status.unwrap_or(&empty);
+    let first = if status.active.is_empty() {
+        "pcscf: unknown".to_string()
+    } else {
+        format!(
+            "pcscf: {} (pool: {})",
+            status.active,
+            status.pool.join(", ")
+        )
+    };
+    let unavailable = &status.unavailable;
+    let marks = if unavailable.is_empty() {
+        "none".to_string()
+    } else {
+        unavailable
+            .iter()
+            .map(|(a, t)| {
+                let at = i64::try_from(*t)
+                    .ok()
+                    .and_then(|t| chrono::DateTime::<chrono::Utc>::from_timestamp(t, 0))
+                    .map_or_else(|| t.to_string(), |t| t.to_rfc3339());
+                format!("{a} until {at}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    [first, format!("pcscf_unavailable: {marks}")]
+}
+
 /// Seconds since the unix epoch, `0` if the clock is before it.
 pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -2434,6 +2472,43 @@ mod tests {
         assert_eq!(
             format_reg_subscription("", None)[0],
             "reg_subscription: unknown"
+        );
+    }
+    /// specs/091 contracts/control.md.
+    #[test]
+    fn pcscf_lines_render_the_choice_and_the_marks() {
+        let pool = vec!["10.0.1.10".to_string(), "10.0.0.10".to_string()];
+        let status = |active: &str, pool: &[String], unavailable: &[(String, u64)]| {
+            control::PcscfStatusReply {
+                active: active.to_string(),
+                pool: pool.to_vec(),
+                unavailable: unavailable.to_vec(),
+            }
+        };
+        assert_eq!(
+            format_pcscf_lines(Some(&status(
+                "10.0.1.10",
+                &pool,
+                &[("10.0.0.10".to_string(), 1_792_000_000)]
+            ))),
+            [
+                "pcscf: 10.0.1.10 (pool: 10.0.1.10, 10.0.0.10)".to_string(),
+                "pcscf_unavailable: 10.0.0.10 until 2026-10-14T17:46:40+00:00".to_string(),
+            ]
+        );
+        assert_eq!(
+            format_pcscf_lines(Some(&status("10.0.0.10", &pool[1..], &[])))[1],
+            "pcscf_unavailable: none"
+        );
+        assert_eq!(format_pcscf_lines(None)[0], "pcscf: unknown");
+        let two = [
+            ("10.0.0.10".to_string(), 1_792_000_000),
+            ("10.0.1.10".to_string(), 1_792_000_060),
+        ];
+        assert_eq!(
+            format_pcscf_lines(Some(&status("10.0.0.10", &pool, &two)))[1],
+            "pcscf_unavailable: 10.0.0.10 until 2026-10-14T17:46:40+00:00, \
+             10.0.1.10 until 2026-10-14T17:47:40+00:00"
         );
     }
     use std::io::Write;
