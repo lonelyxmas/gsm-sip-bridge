@@ -590,7 +590,7 @@ fn parse_contact_attrs(block: &ContactBlock) -> Option<ReginfoContact> {
         state: extract_attr(text, "state")?,
         event: extract_attr(text, "event").unwrap_or_default(),
         addr: contact_uri_addr(text),
-        retry_after: extract_attr(open_tag, "retry-after").and_then(|v| v.trim().parse().ok()),
+        retry_after: extract_attr(open_tag, "retry-after").and_then(|v| network_secs(&v)),
         registration_state: block
             .registration_tag
             .and_then(|t| extract_attr(t, "state")),
@@ -831,6 +831,21 @@ pub(crate) struct NotifyVerdict {
     pub(crate) deregistration: Option<Deregistration>,
 }
 
+/// The longest delay any network-supplied `expires` or `retry-after` is taken
+/// to mean. Larger values are clamped to it: they are nonsensical, and added to
+/// an `Instant` unchecked, a value near `u64::MAX` overflows and panics the
+/// agent — a crash any NOTIFY could trigger.
+pub(crate) const MAX_NETWORK_DELAY_SECS: u64 = 366 * 24 * 3600;
+
+/// A network-supplied number of seconds, clamped to [`MAX_NETWORK_DELAY_SECS`].
+fn network_secs(value: &str) -> Option<u64> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|v| v.min(MAX_NETWORK_DELAY_SECS))
+}
+
 /// The substate a `Subscription-State` header names (RFC 6665 §8.2.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubStateKind {
@@ -882,8 +897,8 @@ pub(crate) fn parse_subscription_state(value: &str) -> SubState {
         };
         let value = value.trim();
         match name.trim().to_ascii_lowercase().as_str() {
-            "expires" => parsed.expires = value.parse().ok(),
-            "retry-after" => parsed.retry_after = value.parse().ok(),
+            "expires" => parsed.expires = network_secs(value),
+            "retry-after" => parsed.retry_after = network_secs(value),
             "reason" => parsed.reason = Some(value.to_ascii_lowercase()),
             _ => {}
         }
@@ -1861,6 +1876,19 @@ mod tests {
         assert_eq!(
             parse_subscription_state("active;expires=soon;retry-after=x"),
             sub_state(SubStateKind::Active, None, None, None)
+        );
+        // An absurd value is clamped rather than allowed to overflow an
+        // `Instant` downstream.
+        assert_eq!(
+            parse_subscription_state(
+                "terminated;reason=probation;retry-after=18446744073709551615"
+            )
+            .retry_after,
+            Some(MAX_NETWORK_DELAY_SECS)
+        );
+        assert_eq!(
+            parse_subscription_state("active;expires=18446744073709551615").expires,
+            Some(MAX_NETWORK_DELAY_SECS)
         );
     }
 

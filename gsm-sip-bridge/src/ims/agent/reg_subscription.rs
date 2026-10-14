@@ -20,7 +20,9 @@
 use super::call::{contact_uri, route_set_in_order, uac_route_set};
 use super::header_tag;
 use super::ping::{parse_cseq_number, PING_RESPONSE_TIMEOUT};
-use crate::ims::session::{next_backoff, parse_subscription_state, SubState, SubStateKind};
+use crate::ims::session::{
+    next_backoff, parse_subscription_state, SubState, SubStateKind, MAX_NETWORK_DELAY_SECS,
+};
 use crate::ims::sip_client::{SipRequest, SipResponse};
 use crate::ims::SubscriptionHealth;
 use std::collections::VecDeque;
@@ -42,6 +44,12 @@ pub(super) const SUPERSEDED_GRACE: Duration = Duration::from_secs(128);
 /// At most this many replaced subscriptions are remembered per line; the
 /// oldest is forgotten first.
 pub(super) const SUPERSEDED_CAP: usize = 32;
+/// `now + delay`, with `delay` clamped so a network-supplied value can never
+/// overflow the `Instant` (see [`MAX_NETWORK_DELAY_SECS`]).
+fn after(now: Instant, delay: Duration) -> Instant {
+    now + delay.min(Duration::from_secs(MAX_NETWORK_DELAY_SECS))
+}
+
 /// The preferred refresh lead time, scaled down for a short grant by
 /// [`crate::ims::renewal_headroom_for`] exactly as registration renewal is.
 const REFRESH_HEADROOM: Duration = Duration::from_secs(300);
@@ -244,9 +252,9 @@ pub(super) struct RegSubscription {
     last_failure: Option<(SystemTime, String)>,
     /// When the subscription stopped being confirmed, for status.
     unconfirmed_since: Option<SystemTime>,
-    /// When the last initial SUBSCRIBE went out: even an "at once" resend
-    /// waits [`SUB_INITIAL_BACKOFF`] after it.
-    last_initial_at: Option<Instant>,
+    /// When the last SUBSCRIBE, initial or refresh, went out: even an "at
+    /// once" resend waits [`SUB_INITIAL_BACKOFF`] after it (SC-006).
+    last_sent_at: Option<Instant>,
 }
 
 impl Default for RegSubscription {
@@ -267,7 +275,7 @@ impl RegSubscription {
             probing: None,
             last_failure: None,
             unconfirmed_since: None,
-            last_initial_at: None,
+            last_sent_at: None,
         }
     }
 
@@ -281,7 +289,7 @@ impl RegSubscription {
         self.stopped = None;
         self.min_expires = crate::ims::DEFAULT_EXPIRES;
         self.backoff = SUB_INITIAL_BACKOFF;
-        self.last_initial_at = None;
+        self.last_sent_at = None;
         SubAction::SendInitial {
             expires: self.min_expires,
         }
@@ -299,10 +307,10 @@ impl RegSubscription {
             sent_at: now,
             kind,
         };
+        self.last_sent_at = Some(now);
         match kind {
             SubKind::Initial => {
                 self.supersede(now);
-                self.last_initial_at = Some(now);
                 self.current = Some(Subscription {
                     call_id: sent.call_id.clone(),
                     local_tag: sent.local_tag.clone(),
@@ -473,7 +481,7 @@ impl RegSubscription {
                 }
                 let c = self.current.as_mut().expect("on_response matched current");
                 c.granted = Some(Duration::from_secs(granted.into()));
-                c.expires_at = Some(now + Duration::from_secs(granted.into()));
+                c.expires_at = Some(after(now, Duration::from_secs(granted.into())));
                 let to_tag = resp.header("To").and_then(header_tag);
                 let target = resp.header("Contact").and_then(contact_uri);
                 c.learn_dialog(to_tag, uac_route_set(resp, &[]), target);
@@ -487,15 +495,19 @@ impl RegSubscription {
                     "reg-event SUBSCRIBE accepted"
                 );
             }
+            // A `Min-Expires` that does not raise what we ask for is no
+            // progress: resending would draw the same 423, so it is an
+            // ordinary refusal below.
             423 if resp
                 .header("Min-Expires")
-                .is_some_and(|v| v.trim().parse::<u32>().is_ok()) =>
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .is_some_and(|min| min > self.min_expires) =>
             {
                 let min: u32 = resp
                     .header("Min-Expires")
                     .and_then(|v| v.trim().parse().ok())
                     .expect("guarded above");
-                self.min_expires = self.min_expires.max(min);
+                self.min_expires = min;
                 tracing::info!(
                     call_id = %call_id,
                     min_expires = self.min_expires,
@@ -628,7 +640,7 @@ impl RegSubscription {
             SubStateKind::Active | SubStateKind::Pending => {
                 if let Some(e) = state.expires {
                     c.granted = Some(Duration::from_secs(e));
-                    c.expires_at = Some(now + Duration::from_secs(e));
+                    c.expires_at = Some(after(now, Duration::from_secs(e)));
                 }
             }
             SubStateKind::Terminated => {
@@ -700,6 +712,16 @@ impl RegSubscription {
         if self.stopped.is_some() {
             return None;
         }
+        if let Some(c) = self.current.as_mut() {
+            if let Txn::Pending { sent_at, .. } = c.txn {
+                if c.notified_since_send && now >= sent_at + TIMER_F {
+                    // A NOTIFY proved the network has this SUBSCRIBE, but its
+                    // final response never came. End the transaction quietly,
+                    // so the confirmed dialog's refresh schedule still runs.
+                    c.txn = Txn::Idle;
+                }
+            }
+        }
         let current = self.current.as_ref().map(|c| {
             let timer_f = matches!(c.txn, Txn::Pending { sent_at, .. }
                 if !c.notified_since_send && now >= sent_at + TIMER_F);
@@ -726,7 +748,9 @@ impl RegSubscription {
                 self.supersede(now);
                 self.record_failure("expired without a successful refresh".to_string());
                 self.unconfirmed_since.get_or_insert_with(SystemTime::now);
-                self.retry_at = Some(now);
+                // Never sooner than a retry the network already asked us to
+                // hold off for (a refused refresh's `Retry-After`).
+                self.retry_at = Some(self.retry_at.map_or(now, |t| t.max(now)));
                 tracing::warn!(
                     call_id = %call_id,
                     "reg-event subscription expired without a successful refresh; resubscribing"
@@ -752,7 +776,10 @@ impl RegSubscription {
             }
         }
         let due = self.retry_at.is_some_and(|t| now >= t);
-        if !due {
+        let spaced = self
+            .last_sent_at
+            .is_none_or(|last| now >= last + SUB_INITIAL_BACKOFF);
+        if !due || !spaced {
             return None;
         }
         match &self.current {
@@ -764,12 +791,6 @@ impl RegSubscription {
             }
             Some(_) => None,
             None => {
-                if self
-                    .last_initial_at
-                    .is_some_and(|last| now < last + SUB_INITIAL_BACKOFF)
-                {
-                    return None;
-                }
                 self.retry_at = None;
                 Some(SubAction::SendInitial {
                     expires: self.min_expires,
@@ -869,7 +890,7 @@ impl RegSubscription {
     /// `Retry-After` is a floor, not a ceiling: FR-009a).
     fn schedule_retry(&mut self, now: Instant, floor: Option<Duration>) -> Duration {
         let delay = self.backoff.max(floor.unwrap_or_default());
-        self.retry_at = Some(now + delay);
+        self.retry_at = Some(after(now, delay));
         self.backoff = next_backoff(self.backoff, SUB_MAX_BACKOFF);
         delay
     }
@@ -893,9 +914,12 @@ impl RegSubscription {
         let Some(c) = self.current.take() else {
             return;
         };
-        let expiry = c
-            .expires_at
-            .unwrap_or_else(|| c.created_at + Duration::from_secs(c.requested_expires.into()));
+        let expiry = c.expires_at.unwrap_or_else(|| {
+            after(
+                c.created_at,
+                Duration::from_secs(c.requested_expires.into()),
+            )
+        });
         self.superseded.push_back(SupersededSub {
             call_id: c.call_id,
             local_tag: c.local_tag,
@@ -919,7 +943,10 @@ fn retry_after_secs(value: &str) -> Option<u64> {
     let end = value
         .find(|ch: char| !ch.is_ascii_digit())
         .unwrap_or(value.len());
-    value[..end].parse().ok()
+    value[..end]
+        .parse::<u64>()
+        .ok()
+        .map(|v| v.min(MAX_NETWORK_DELAY_SECS))
 }
 
 #[cfg(test)]
@@ -1556,8 +1583,11 @@ mod tests {
             t1,
         );
         assert!(sub.current.is_none());
+        // "At once", but never inside SUB_INITIAL_BACKOFF of the refresh it
+        // replaces (SC-006).
+        assert_eq!(sub.poll(t1, false), None);
         assert_eq!(
-            sub.poll(t1, false),
+            sub.poll(t1 + SUB_INITIAL_BACKOFF, false),
             Some(SubAction::SendInitial { expires: 3600 })
         );
     }
@@ -1934,6 +1964,116 @@ mod tests {
             panic!("expected unconfirmed");
         };
         assert_eq!(retry_at, Some(wall + secs(5)));
+    }
+
+    // ---- PR #129 review findings ----
+
+    /// A NOTIFY confirms the subscription but the 2xx is lost: the
+    /// transaction ends quietly at Timer F and the refresh still goes out.
+    #[test]
+    fn a_confirmed_subscription_whose_2xx_was_lost_is_still_refreshed() {
+        let t0 = Instant::now();
+        let mut sub = started(t0);
+        let t1 = t0 + secs(1);
+        sub.on_notify(
+            &notify("sub-a", "ltag-a", Some("active;expires=600"), ""),
+            t1,
+        );
+        let state = parse_subscription_state("active;expires=600");
+        sub.apply_subscription_state(&state, t1);
+        assert_eq!(sub.poll(t0 + TIMER_F, false), None);
+        assert_eq!(failure(&sub), None);
+        assert_eq!(sub.poll(t1 + secs(299), false), None);
+        assert_eq!(
+            sub.poll(t1 + secs(300), false),
+            Some(SubAction::SendRefresh { expires: 3600 })
+        );
+    }
+
+    /// Expiry never brings a retry forward past the network's `Retry-After`.
+    #[test]
+    fn expiry_keeps_a_longer_retry_after_from_a_refused_refresh() {
+        let t0 = Instant::now();
+        let (mut sub, t1) = refreshing(t0);
+        let r = resp(
+            503,
+            "Service Unavailable",
+            "sub-a",
+            8,
+            &[("Retry-After", "600")],
+        );
+        sub.on_response(&r, t1);
+        assert_eq!(sub.poll(t0 + secs(600), false), None);
+        assert!(sub.current.is_none());
+        assert_eq!(sub.poll(t1 + secs(599), false), None);
+        assert_eq!(
+            sub.poll(t1 + secs(600), false),
+            Some(SubAction::SendInitial { expires: 3600 })
+        );
+    }
+
+    /// Network-supplied durations near `u64::MAX` are clamped, not added to
+    /// an `Instant` (which would panic the agent).
+    #[test]
+    fn oversized_network_durations_do_not_overflow() {
+        let t0 = Instant::now();
+        let mut sub = confirmed(t0, 3600);
+        let huge = "active;expires=18446744073709551615";
+        sub.on_notify(&notify("sub-a", "ltag-a", Some(huge), ""), t0);
+        sub.apply_subscription_state(&parse_subscription_state(huge), t0);
+        assert!(sub.current.as_ref().unwrap().expires_at.is_some());
+
+        let mut sub = started(t0);
+        let r = resp(
+            503,
+            "Service Unavailable",
+            "sub-a",
+            7,
+            &[("Retry-After", "18446744073709551615")],
+        );
+        sub.on_response(&r, t0);
+        assert!(sub.retry_at.is_some());
+        let r = resp(200, "OK", "sub-a", 7, &[("Expires", "4294967295")]);
+        let mut sub = started(t0);
+        sub.on_response(&r, t0);
+        assert!(sub.current.as_ref().unwrap().expires_at.is_some());
+    }
+
+    /// A refused refresh is never resent within `SUB_INITIAL_BACKOFF`, and a
+    /// repeated `423` that raises nothing falls back to the backoff.
+    #[test]
+    fn a_refresh_refused_423_is_spaced_and_does_not_loop() {
+        let t0 = Instant::now();
+        let (mut sub, t1) = refreshing(t0);
+        let r423 = |cseq| {
+            resp(
+                423,
+                "Interval Too Brief",
+                "sub-a",
+                cseq,
+                &[("Min-Expires", "7200")],
+            )
+        };
+        sub.on_response(&r423(8), t1);
+        assert_eq!(sub.poll(t1 + secs(1), false), None);
+        assert_eq!(
+            sub.poll(t1 + secs(5), false),
+            Some(SubAction::SendRefresh { expires: 7200 })
+        );
+        let t2 = t1 + secs(5);
+        sub.on_sent(&sent("sub-a", "ltag-a", 9, 7200), SubKind::Refresh, t2);
+        sub.on_response(&r423(9), t2);
+        assert_eq!(
+            failure(&sub),
+            Some("SUBSCRIBE refused: 423 Interval Too Brief")
+        );
+        for tick in 1..5 {
+            assert_eq!(sub.poll(t2 + secs(tick), false), None);
+        }
+        assert_eq!(
+            sub.poll(t2 + secs(5), false),
+            Some(SubAction::SendRefresh { expires: 7200 })
+        );
     }
 
     #[test]
