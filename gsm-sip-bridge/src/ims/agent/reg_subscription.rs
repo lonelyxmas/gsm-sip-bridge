@@ -179,6 +179,14 @@ struct Subscription {
 }
 
 impl Subscription {
+    /// No SUBSCRIBE is outstanding that the network has not acknowledged. A
+    /// NOTIFY since the last send proves the network has it, so a refresh need
+    /// not wait for a final response that may never come; a late one then
+    /// matches an older CSeq and is ignored.
+    fn settled(&self) -> bool {
+        self.txn == Txn::Idle || self.notified_since_send
+    }
+
     fn refresh_due(&self, now: Instant) -> bool {
         match (self.expires_at, self.granted) {
             (Some(expires_at), Some(granted)) => {
@@ -730,7 +738,7 @@ impl RegSubscription {
                 timer_f,
                 c.expires_at.is_some_and(|e| now >= e),
                 !c.confirmed && c.timer_n.is_some_and(|t| now >= t),
-                c.txn == Txn::Idle && c.refresh_due(now),
+                c.settled() && c.refresh_due(now),
                 c.remote_tag.is_some(),
             )
         });
@@ -783,7 +791,7 @@ impl RegSubscription {
             return None;
         }
         match &self.current {
-            Some(c) if c.txn == Txn::Idle && c.remote_tag.is_some() => {
+            Some(c) if c.settled() && c.remote_tag.is_some() => {
                 self.retry_at = None;
                 Some(SubAction::SendRefresh {
                     expires: self.min_expires,
@@ -1988,6 +1996,39 @@ mod tests {
             sub.poll(t1 + secs(300), false),
             Some(SubAction::SendRefresh { expires: 3600 })
         );
+    }
+
+    /// The same with a grant too short for Timer F to have closed the
+    /// transaction first: the refresh is not held for the lost response.
+    #[test]
+    fn a_short_grant_confirmed_by_notify_alone_refreshes_on_time() {
+        let t0 = Instant::now();
+        let mut sub = started(t0);
+        sub.on_notify(
+            &notify("sub-a", "ltag-a", Some("active;expires=60"), ""),
+            t0,
+        );
+        sub.apply_subscription_state(&parse_subscription_state("active;expires=60"), t0);
+        assert_eq!(sub.poll(t0 + secs(29), false), None);
+        assert_eq!(
+            sub.poll(t0 + secs(30), false),
+            Some(SubAction::SendRefresh { expires: 3600 })
+        );
+        sub.on_sent(
+            &sent("sub-a", "ltag-a", 8, 3600),
+            SubKind::Refresh,
+            t0 + secs(30),
+        );
+        // The original transaction's late 2xx is now an older CSeq.
+        assert_eq!(
+            sub.on_response(&ok("sub-a", 7, 60), t0 + secs(31)),
+            ResponseMatch::Superseded
+        );
+        assert_eq!(
+            sub.on_response(&ok("sub-a", 8, 600), t0 + secs(31)),
+            ResponseMatch::Current
+        );
+        assert_eq!(failure(&sub), None);
     }
 
     /// Expiry never brings a retry forward past the network's `Retry-After`.
