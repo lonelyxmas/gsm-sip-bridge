@@ -118,9 +118,9 @@ real parsed `SipRequest`s; no mocks. Fixtures are synthetic only
 
 **Independent Test**: `application/vnd.3gpp.sms;charset=x` decodes identically to the unparameterised form.
 
-- [ ] T031 [US5] Write failing test in `gsm-sip-bridge/src/ims/agent/mod.rs` (next to `decode_pdu_body_decodes_a_3gpp_sms_message`, ~line 3666) using a parameterised Content-Type
-- [ ] T032 [US5] Change `decode_pdu_body` (`gsm-sip-bridge/src/ims/agent/mod.rs:1071`) and `message_content_type_supported` (`:1059`) to compare via `body::MediaType::parse`; make `MediaType` `pub(crate)` if needed
-- [ ] T033 [US5] Commit "fix(ims): decode parameterised application/vnd.3gpp.sms as SMS" after `make format && make lint && make test`
+- [X] T031 [US5] Write failing test in `gsm-sip-bridge/src/ims/agent/mod.rs` (next to `decode_pdu_body_decodes_a_3gpp_sms_message`, ~line 3666) using a parameterised Content-Type
+- [X] T032 [US5] Change `decode_pdu_body` (`gsm-sip-bridge/src/ims/agent/mod.rs:1071`) and `message_content_type_supported` (`:1059`) to compare via `body::MediaType::parse`; make `MediaType` `pub(crate)` if needed
+- [X] T033 [US5] Commit "fix(ims): decode parameterised application/vnd.3gpp.sms as SMS" after `make format && make lint && make test`
 
 ---
 
