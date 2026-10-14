@@ -875,7 +875,7 @@ pub(crate) fn build_prack(p: &AckParts, rack: &str) -> String {
 /// The SDP answer in an outbound INVITE's `2xx`, decoded like any other SIP
 /// body (specs/088: RFC 5621 §4.2 has UACs parse multipart responses too). A
 /// `2xx` with no usable SDP fails the call through the usual error path.
-fn answer_sdp(resp: &SipResponse) -> BridgeResult<String> {
+pub(crate) fn answer_sdp(resp: &SipResponse) -> BridgeResult<String> {
     match body::extract_sdp(resp.header("Content-Type"), resp.body.as_bytes()) {
         Ok(body::Decoded::Sdp { text, .. }) => Ok(text),
         Ok(body::Decoded::Empty) => Err(BridgeError::Ims(
