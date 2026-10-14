@@ -395,7 +395,7 @@ logged.
   scope), for example `**P-CSCF failover**`, followed by a plain-text description.
 - [X] T044 Run quickstart Q0 in full. Confirm `make lint` is clean across all targets and that no test or fixture
   contains a real address or number (`grep -rn` the diff for anything outside the placeholders listed at the top).
-- [ ] T045 Live gate quickstart Q2 and Q3 on the Jio Pi (blocking: SC-001, SC-004, SC-005, R9). Record the
+- [X] T045 Live gate quickstart Q2 and Q3 on the Jio Pi (blocking: SC-001, SC-004, SC-005, R9). Record the
   `"P-CSCF marked unavailable"` / `"failing over"` lines and the `vowifi-status` output (addresses redacted) in the
   PR description.
 - [ ] T046 Live gate quickstart Q4: 6 h steady state on the Vodafone rig (SC-002). There must be no marks and no
@@ -473,3 +473,27 @@ Then:      T017 → T018 → T014/T019 → T020 → T015/T021      ‖      T022
 - **T040**: the reply carries the P-CSCF status as one boxed `pcscf: Option<PcscfStatusReply>`, not three flat
   fields. Three inline lists tripped `clippy::large_enum_variant` on `ControlMessage`. contracts/control.md is
   updated to match.
+
+## Live gate T045 (Jio Pi, 2026-10-14, image `pcscf-failover-091-arm64`)
+
+The negotiation advertised four P-CSCFs: two IPv4, A (the selection) and B, and two IPv6. The host has no
+`iptables`, so A was black-holed with a /32 route to the line's veth peer inside the agent's namespace. New connects
+to A time out, and the route probe still finds a route.
+
+| UTC | Event |
+|---|---|
+| 17:11:48 | A black-holed |
+| 17:12:47 | `Gm keepalive went unanswered` |
+| ~17:13 | Supervisor: `P-CSCF A unreachable; pool member <IPv6> answers`; no rebuild (R9) |
+| 17:14:43 | `Gm reconnect exhausted`, then `P-CSCF marked unavailable` (A, `gm-keepalive`, 330 s), then `P-CSCF selected` (B, `failover`) |
+| 17:14:44 | `registration through P-CSCF` (B, `registered`); reg-event subscription confirmed on B |
+| 17:15:22 | Agent killed inside A's mark: first selection B (SC-005, US4 AS1) |
+| 17:20:22 | Route removed; A's mark expired 17:20:13 |
+| 17:20:36 | Agent killed after expiry: stays on B (US4 AS2, Q3) |
+
+- **SC-001**: registered through B 2 min 56 s after the black hole (keepalive interval plus 3 reconnects), with no
+  tunnel rebuild.
+- **SC-004**: zero marks outside the deliberate black hole.
+- **Rebuilds**: zero `recovered from …` and zero `P-CSCF changed` lines since the deploy.
+- **Not exercised live**: an inbound call after the failover. Registration, the confirmed reg-event subscription
+  and `can_answer: true` on B were checked instead.
