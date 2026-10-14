@@ -33,10 +33,10 @@ const MARK_BASE: Duration = Duration::from_secs(30);
 const MARK_CAP: Duration = Duration::from_secs(1800);
 const MARK_EXTRA: Duration = Duration::from_secs(300);
 
-/// The longest a P-CSCF is ever held unavailable. A `Retry-After` or a stored
-/// expiry beyond it is the network's or the file's error, and must not
-/// overflow `SystemTime` (Greptile, PR #130).
-const MAX_UNAVAILABLE: Duration = Duration::from_secs(24 * 3600);
+/// Where a mark ends when `now + delay` cannot be represented: an absurd
+/// `Retry-After` must not overflow `SystemTime` and panic the agent, and a
+/// genuine one, however long, is honoured in full (Greptile, PR #130).
+const FAR_FUTURE: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
 
 /// `.state` format version; anything else is ignored as a whole.
 const STATE_VERSION: u32 = 1;
@@ -350,10 +350,11 @@ impl PcscfPool {
         let unavailable = match &cause {
             FailureCause::RetryAfter(d) => *d,
             _ => mark_duration(failures),
-        }
-        .min(MAX_UNAVAILABLE);
+        };
         let mark = Mark {
-            until: now + unavailable,
+            until: now
+                .checked_add(unavailable)
+                .unwrap_or_else(|| now + FAR_FUTURE),
             failures,
             cause: cause.to_string(),
         };
@@ -902,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn an_absurd_retry_after_is_capped_not_a_panic() {
+    fn an_absurd_retry_after_is_not_a_panic_and_a_long_one_is_kept() {
         let mut p = mem(A, &[A, B]);
         p.select(t0());
         let m = p
@@ -912,7 +913,13 @@ mod tests {
                 t0(),
             )
             .unwrap();
-        assert_eq!(m.until, t0() + MAX_UNAVAILABLE);
+        assert_eq!(m.until, t0() + FAR_FUTURE);
+        let mut p = mem(A, &[A, B]);
+        p.select(t0());
+        let m = p
+            .on_failure(ip(A), FailureCause::RetryAfter(secs(172_800)), t0())
+            .unwrap();
+        assert_eq!(m.until, t0() + secs(172_800), "two days stays two days");
     }
 
     #[test]

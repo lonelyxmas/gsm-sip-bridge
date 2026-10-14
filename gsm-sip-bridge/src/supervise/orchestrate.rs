@@ -1151,14 +1151,16 @@ mod resolve_epdg_ip_tests {
         // US2 AS3: a new member only joins the candidates.
         let runner = MockCommandRunner::new();
         let mut current = addrs(&["10.0.0.10", "10.0.1.10"]);
+        let mut published = current.clone();
         republish_pool_after_set_change(
             &runner,
             0,
             "/tmp/pcscf-0",
             &mut current,
+            &mut published,
             addrs(&["10.0.1.10", "10.0.0.10", "10.0.2.10"]),
         );
-        assert_eq!(current.len(), 3);
+        assert_eq!((current.len(), published.len()), (3, 3));
         assert_eq!(
             *runner.write_order.lock().unwrap(),
             vec![PathBuf::from("/tmp/pcscf-0.pool")],
@@ -1190,16 +1192,23 @@ mod resolve_epdg_ip_tests {
             "the selection is still published"
         );
         let mut current = Vec::new();
+        let mut published = Vec::new();
         republish_pool_after_set_change(
             &runner,
             0,
             "/tmp/pcscf-0",
             &mut current,
+            &mut published,
             addrs(&["10.0.0.10", "10.0.1.10"]),
         );
         assert!(
-            current.is_empty(),
+            published.is_empty(),
             "still unpublished, so retried next tick"
+        );
+        assert_eq!(
+            current,
+            addrs(&["10.0.0.10", "10.0.1.10"]),
+            "the fallbacks still feed the reachability check"
         );
         runner.failing_writes.lock().unwrap().clear();
         republish_pool_after_set_change(
@@ -1207,9 +1216,10 @@ mod resolve_epdg_ip_tests {
             0,
             "/tmp/pcscf-0",
             &mut current,
+            &mut published,
             addrs(&["10.0.0.10", "10.0.1.10"]),
         );
-        assert_eq!(current, addrs(&["10.0.0.10", "10.0.1.10"]));
+        assert_eq!(published, addrs(&["10.0.0.10", "10.0.1.10"]));
         assert_eq!(
             runner.files.lock().unwrap()[&pool_path],
             "10.0.0.10\n10.0.1.10\n"
@@ -1760,15 +1770,17 @@ fn start_vowifi_line_strongswan(
         .read_file(&ctx.shared_charon.charon_log)
         .map(|c| super::engines::extract_latest_pcscf_pool(&c, &vowifi_conn_name(idx)))
         .unwrap_or_default();
-    if !publish_pcscf(
+    let mut published_pool = if publish_pcscf(
         runner.as_ref(),
         idx,
         &line.pcscf_source_path,
         &pcscf,
         &current_pool,
     ) {
-        current_pool.clear();
-    }
+        current_pool.clone()
+    } else {
+        Vec::new()
+    };
 
     // Shared with the agent loop: set while a rebuild is syncing the P-CSCF.
     let rebuild_gate = Arc::new(RebuildGate::default());
@@ -1875,6 +1887,7 @@ fn start_vowifi_line_strongswan(
                     idx,
                     &line.pcscf_source_path,
                     &mut current_pool,
+                    &mut published_pool,
                     engine.latest_pcscf_pool(runner.as_ref()),
                 );
             }
@@ -1882,15 +1895,17 @@ fn start_vowifi_line_strongswan(
                 drop(guard);
                 println!("[supervise] line {idx}: P-CSCF changed ({current_pcscf} -> {new_pcscf}); refreshing");
                 current_pool = engine.latest_pcscf_pool(runner.as_ref());
-                if !publish_pcscf(
+                published_pool = if publish_pcscf(
                     runner.as_ref(),
                     idx,
                     &line.pcscf_source_path,
                     &new_pcscf,
                     &current_pool,
                 ) {
-                    current_pool.clear();
-                }
+                    current_pool.clone()
+                } else {
+                    Vec::new()
+                };
                 current_pcscf = new_pcscf;
                 let _ = runner.run(&["pkill", "-f", &format!("vowifi-ims-agent --line {idx}$")]);
             }
@@ -1961,15 +1976,17 @@ fn start_vowifi_line_strongswan(
                             current_pool = engine
                                 .fresh_pcscf_pool_since(runner.as_ref(), mark)
                                 .unwrap_or_default();
-                            if !publish_pcscf(
+                            published_pool = if publish_pcscf(
                                 runner.as_ref(),
                                 idx,
                                 &line.pcscf_source_path,
                                 &p,
                                 &current_pool,
                             ) {
-                                current_pool.clear();
-                            }
+                                current_pool.clone()
+                            } else {
+                                Vec::new()
+                            };
                             current_pcscf = p;
                         }
                         None if !stop() => println!(
@@ -2132,14 +2149,23 @@ fn steady_pool_update(published: &[String], latest: Vec<String>) -> Option<Vec<S
 
 /// Republishes only the pool after a set change on a healthy line: no agent
 /// restart, and the selection file is not touched (FR-004).
+///
+/// Two lists, because they answer different questions (Greptile, PR #130):
+/// `current_pool` is what the tunnel advertises, and feeds the reachability
+/// check whether or not the file could be written; `published_pool` is what
+/// the agent's file holds, and decides when to write it again.
 fn republish_pool_after_set_change(
     runner: &dyn CommandRunner,
     idx: u32,
     selection_path: &str,
     current_pool: &mut Vec<String>,
+    published_pool: &mut Vec<String>,
     latest: Vec<String>,
 ) {
-    if let Some(pool) = steady_pool_update(current_pool, latest) {
+    if !latest.is_empty() {
+        current_pool.clone_from(&latest);
+    }
+    if let Some(pool) = steady_pool_update(published_pool, latest) {
         // Recorded as published only once it is: a failed write is retried on
         // the next healthy tick rather than forgotten.
         match runner.write_file_atomic(
@@ -2151,7 +2177,7 @@ fn republish_pool_after_set_change(
                     "[supervise] line {idx}: P-CSCF pool changed (set): {}; not restarting",
                     pool.join(", ")
                 );
-                *current_pool = pool;
+                *published_pool = pool;
             }
             Err(e) => {
                 eprintln!("[supervise] line {idx}: could not publish the P-CSCF pool: {e}")
@@ -2656,15 +2682,17 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
 
     println!("[supervise] line {idx}: tunnel UP. P-CSCF: {pcscf}");
     let mut current_pool = engine.latest_pcscf_pool(runner.as_ref());
-    if !publish_pcscf(
+    let mut published_pool = if publish_pcscf(
         runner.as_ref(),
         idx,
         &line.pcscf_source_path,
         &pcscf,
         &current_pool,
     ) {
-        current_pool.clear();
-    }
+        current_pool.clone()
+    } else {
+        Vec::new()
+    };
     {
         let mut st = started.lock().unwrap();
         st.started_netns.push(netns.clone());
@@ -2729,6 +2757,7 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
                     idx,
                     &line.pcscf_source_path,
                     &mut current_pool,
+                    &mut published_pool,
                     engine.latest_pcscf_pool(runner.as_ref()),
                 );
             }
@@ -2742,6 +2771,7 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
                     idx,
                     &line.pcscf_source_path,
                     &mut current_pool,
+                    &mut published_pool,
                     engine.latest_pcscf_pool(runner.as_ref()),
                 );
                 current_pcscf = new_pcscf;
