@@ -23,6 +23,7 @@
 //! | Placing an outbound call | [`origination`] |
 //! | A bridged call's state and every way it ends | [`call`] |
 //! | Gm connection liveness and repair | [`ping`] |
+//! | The reg-event subscription's transaction and dialog | [`reg_subscription`] |
 //! | RFC 4028 session-timer refresh on a placed call | [`session_refresh`] |
 //! | The veth link to Agent B, and the RTP relay | [`veth`] |
 //! | The `probe-inbound` diagnostic | [`probe`] |
@@ -32,6 +33,7 @@ mod inbound;
 mod origination;
 mod ping;
 mod probe;
+mod reg_subscription;
 mod session_refresh;
 mod veth;
 pub(crate) mod watchdog;
@@ -48,10 +50,11 @@ use crate::ims::observability;
 // call sites below read exactly as they did before the move.
 use crate::ims::sdp;
 use crate::ims::session::{
-    attempt_renewal, extract_caller, header_uri, map_registration_error,
-    map_registration_status_code, next_backoff, respond, send_sms_delivery_report, start_inbound,
-    subscribe_reg_event, to_unix, unresolved_caller_diagnostic, DeregEvent, Deregistration,
-    Inbound,
+    attempt_renewal, evaluate_reg_notify, extract_caller, header_uri, log_superseded_notify,
+    map_registration_error, map_registration_status_code, next_backoff, respond, respond_notify,
+    send_reg_subscribe, send_sms_delivery_report, start_inbound, to_unix,
+    unresolved_caller_diagnostic, DeregEvent, Deregistration, Inbound, SubState, SubscribeRefresh,
+    SubscribeRequest,
 };
 use crate::ims::sip_client::{
     build_200_ok_message, build_415_unsupported_media, build_486_busy_here,
@@ -82,7 +85,8 @@ use call::{
 use origination::{
     begin_origination, tick_pending_origination, OriginationStatus, PendingOrigination,
 };
-use ping::{parse_cseq_number, probe_gm_connection, PingState};
+use ping::{cseq_method, parse_cseq_number, probe_gm_connection, PingState};
+use reg_subscription::{EndpointFailureCause, NotifyMatch, RegSubscription, SubAction, SubKind};
 use session_refresh::{RefreshVerdict, Refresher};
 
 pub(crate) use call::AttachmentHook;
@@ -170,6 +174,11 @@ const MAX_CONSECUTIVE_RENEWAL_FAILURES: u32 = 6;
 /// counts against the renewal that produced the binding instead — see
 /// [`LoopState::on_network_deregistration`].
 const REGISTRATION_SETTLE: Duration = Duration::from_secs(60);
+
+/// `last_failure` when an unanswered reg-event SUBSCRIBE and its confirming
+/// Gm probe both fail (specs/090 FR-011a).
+const QUALIFYING_FAILURE_REASON: &str =
+    "reg-event SUBSCRIBE unanswered and the Gm keepalive probe failed; re-registering";
 
 /// Work that must succeed before a renewal is worth attempting.
 ///
@@ -877,9 +886,10 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             + Duration::from_secs(session.granted_expires(crate::ims::DEFAULT_EXPIRES) as u64),
     );
     // Before the SUBSCRIBE, so the listeners are up to catch its response and
-    // the NOTIFY the network sends straight back on a new connection.
+    // the NOTIFY the network sends straight back on a new connection. The
+    // SUBSCRIBE itself is the dispatch loop's first act, so it is tracked like
+    // every later one (specs/090 R2).
     let mut inbound = start_inbound(&session)?;
-    subscribe_reg_event(&mut session, &reg_cfg.access_network_info);
 
     // What the registrar actually granted, not what we asked for: renewing on
     // the requested value would leave a window where the binding has lapsed
@@ -1022,6 +1032,10 @@ fn run_status_listener(
                     blocked_reason: health.blocked_reason().map(str::to_string),
                     gm_connection: snapshot.gm_connection.render(),
                     rejection_cooldown_until: snapshot.rejected_until.and_then(to_unix),
+                    reg_subscription: snapshot.reg_subscription.render(),
+                    reg_subscription_last_failure: snapshot
+                        .reg_subscription_last_failure
+                        .map(|(t, msg)| (to_unix(t).unwrap_or(0), msg)),
                 };
                 let _ = write_msg(&mut stream, &reply);
             }
@@ -1812,6 +1826,9 @@ struct LoopState {
     /// expected end of a decline rather than as an unmatched ACK
     /// (specs/084 FR-006). Diagnostics only — never consulted for admission.
     recent_declines: RecentDeclines,
+    /// The reg-event subscription: its transaction, dialog and timers
+    /// (specs/090). The loop performs the sends it asks for.
+    reg_sub: RegSubscription,
 }
 
 impl LoopState {
@@ -1835,6 +1852,7 @@ impl LoopState {
             budget_exit_owed: None,
             unreadable_caller_warned: None,
             recent_declines: RecentDeclines::default(),
+            reg_sub: RegSubscription::new(),
         }
     }
 
@@ -2091,6 +2109,8 @@ fn dispatch_loop(
             "respond_on_client is set — answering network-initiated requests on the client leg, not the socket they arrived on"
         );
     }
+    let first = st.reg_sub.on_new_registration(Instant::now());
+    st.perform_sub_action(session, p, first);
     loop {
         st.sync_shared_status(p);
 
@@ -2235,6 +2255,8 @@ impl LoopState {
         // `vowifi-status`/`volte-status` query the same way `busy` is.
         guard.gm_connection = self.gm_conn;
         guard.rejected_until = self.rejection.map(|r| r.until_wall);
+        guard.reg_subscription = self.reg_sub.health(Instant::now(), SystemTime::now());
+        guard.reg_subscription_last_failure = self.reg_sub.last_failure().cloned();
     }
 
     /// A hangup can start on *either* side. The carrier's arrives as a BYE;
@@ -2784,7 +2806,64 @@ impl LoopState {
         req: &SipRequest,
         sink: &SipSink,
     ) -> BridgeResult<()> {
-        let deregistration = crate::ims::session::handle_notify(session, sink, req);
+        let now = Instant::now();
+        let Some((deregistration, state)) = self.answer_reg_notify(session, req, sink, now) else {
+            return Ok(());
+        };
+        // Spec 089's evaluation of the body first, then the subscription's own
+        // state (research R7): a terminated NOTIFY that also reports our
+        // binding gone forces a renewal, which replaces the subscription.
+        let result = self.apply_reg_notify(session, p, deregistration);
+        self.reg_sub.apply_subscription_state(&state, now);
+        result
+    }
+
+    /// Matches a NOTIFY to a subscription and answers it accordingly (specs/090
+    /// R6, RFC 6665 §4.4.1): `200` and an evaluation for the current
+    /// subscription, `200` and a log line for one this line replaced, `481` for
+    /// anything else. Only the first is returned for the caller to act on.
+    fn answer_reg_notify(
+        &mut self,
+        session: &crate::ims::RegisteredSession,
+        req: &SipRequest,
+        sink: &SipSink,
+        now: Instant,
+    ) -> Option<(Option<Deregistration>, SubState)> {
+        match self.reg_sub.on_notify(req, now) {
+            NotifyMatch::Current { state } => {
+                respond_notify(sink, req, 200);
+                Some((evaluate_reg_notify(session, req), state))
+            }
+            NotifyMatch::Superseded => {
+                respond_notify(sink, req, 200);
+                log_superseded_notify(session, req);
+                None
+            }
+            NotifyMatch::Unknown => {
+                respond_notify(sink, req, 481);
+                let (current_call_id, current_local_tag) =
+                    self.reg_sub.current_ids().unwrap_or_default();
+                tracing::info!(
+                    call_id = %req.header("Call-ID").unwrap_or_default(),
+                    to_tag = %req.header("To").and_then(header_tag).unwrap_or_default(),
+                    event = %req.header("Event").unwrap_or_default(),
+                    subscription_state = %req.header("Subscription-State").unwrap_or_default(),
+                    current_call_id = %current_call_id,
+                    current_local_tag = %current_local_tag,
+                    "NOTIFY for no subscription of ours; refused 481"
+                );
+                None
+            }
+        }
+    }
+
+    /// Applies spec 089's policy to a current NOTIFY's evaluation.
+    fn apply_reg_notify(
+        &mut self,
+        session: &mut crate::ims::RegisteredSession,
+        p: &DispatchParams,
+        deregistration: Option<Deregistration>,
+    ) -> BridgeResult<()> {
         if deregistration.is_some_and(|d| d.event == DeregEvent::Rejected) {
             self.end_calls_on_rejection(session, &|call| report_answered_call_ended(p.obs, call));
         }
@@ -2816,6 +2895,165 @@ impl LoopState {
         }
         p.obs.set_registered(false);
         Ok(())
+    }
+
+    /// Performs what the subscription tracker asked for (specs/090 R1), and
+    /// reports a qualifying endpoint failure to observability.
+    fn perform_sub_action(
+        &mut self,
+        session: &mut crate::ims::RegisteredSession,
+        p: &DispatchParams,
+        action: SubAction,
+    ) {
+        if self.apply_sub_action(session, &p.reg_cfg.access_network_info, p.status, action) {
+            p.obs.set_registered(false);
+            p.obs.set_gm_connection_up(false);
+        }
+    }
+
+    /// Performs a [`SubAction`] and feeds each result back to the tracker,
+    /// until it has nothing more to ask: a failed send asks for a probe, and
+    /// an unsendable probe for the escalation. `true` when a qualifying
+    /// endpoint failure was applied.
+    fn apply_sub_action(
+        &mut self,
+        session: &mut crate::ims::RegisteredSession,
+        access_network_info: &str,
+        status: &Mutex<crate::ims::RegistrationStatus>,
+        action: SubAction,
+    ) -> bool {
+        let mut escalated = false;
+        let mut next = Some(action);
+        while let Some(action) = next.take() {
+            let now = Instant::now();
+            next = match action {
+                SubAction::SendInitial { expires } => self.send_subscribe(
+                    session,
+                    access_network_info,
+                    expires,
+                    SubKind::Initial,
+                    now,
+                ),
+                SubAction::SendRefresh { expires } => self.send_subscribe(
+                    session,
+                    access_network_info,
+                    expires,
+                    SubKind::Refresh,
+                    now,
+                ),
+                // Sent straight away, even mid-call, and not through the
+                // keepalive: its verdict would be suppressed during a call, and
+                // a dead one starts the rebuild ladder (clarifications Q1, Q3).
+                SubAction::Probe { cause, call_id } => {
+                    tracing::warn!(
+                        call_id = %call_id.as_deref().unwrap_or(""),
+                        cause = %cause,
+                        in_call = self.busy(),
+                        "reg-event SUBSCRIBE unanswered; probing the Gm path"
+                    );
+                    match session.send_gm_ping() {
+                        Ok(cseq) => {
+                            self.reg_sub.on_probe_sent(cseq, now);
+                            None
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "confirming Gm probe could not be sent");
+                            self.reg_sub.on_probe_send_failed(now)
+                        }
+                    }
+                }
+                SubAction::EndpointFailure { cause, call_id } => {
+                    escalated |=
+                        self.on_qualifying_endpoint_failure(cause, call_id.as_deref(), status);
+                    None
+                }
+            };
+        }
+        escalated
+    }
+
+    fn send_subscribe(
+        &mut self,
+        session: &mut crate::ims::RegisteredSession,
+        access_network_info: &str,
+        expires: u32,
+        kind: SubKind,
+        now: Instant,
+    ) -> Option<SubAction> {
+        let refresh = match kind {
+            SubKind::Initial => None,
+            SubKind::Refresh => {
+                let d = self.reg_sub.refresh_dialog()?;
+                Some(SubscribeRefresh {
+                    call_id: d.call_id,
+                    local_tag: d.local_tag,
+                    remote_tag: d.remote_tag,
+                    remote_target: d.remote_target,
+                    route_set: d.route_set,
+                })
+            }
+        };
+        let sent = send_reg_subscribe(
+            session,
+            &SubscribeRequest {
+                access_network_info,
+                expires,
+                refresh,
+            },
+        );
+        match sent {
+            Ok(sent) => {
+                self.reg_sub.on_sent(&sent, kind, now);
+                None
+            }
+            Err(_) => Some(self.reg_sub.on_send_failed(kind, now, self.force_renewal)),
+        }
+    }
+
+    /// A reg-event SUBSCRIBE went unanswered (or could not be sent) and the
+    /// confirming Gm probe failed too: the path to the P-CSCF is dead
+    /// (specs/090 FR-011a). Re-register at once, bypassing the transport
+    /// rebuild ladder — `probe_gm_connection` returns early while
+    /// `force_renewal` is set, so a ladder part-way through is abandoned.
+    /// During a call the renewal is deferred by the maintenance policy as
+    /// usual, and the call is not ended (FR-022).
+    ///
+    /// This method and its log line are the signal spec 091 builds P-CSCF
+    /// failover on. `true` when it was applied; `false` when a
+    /// re-registration was already pending, which is not stacked.
+    fn on_qualifying_endpoint_failure(
+        &mut self,
+        cause: EndpointFailureCause,
+        call_id: Option<&str>,
+        status: &Mutex<crate::ims::RegistrationStatus>,
+    ) -> bool {
+        let call_id = call_id.unwrap_or("");
+        if self.force_renewal {
+            tracing::info!(
+                cause = %cause,
+                call_id = %call_id,
+                "qualifying endpoint failure while a re-registration is already pending"
+            );
+            return false;
+        }
+        self.force_renewal = true;
+        self.ping.reset();
+        self.reconnect_attempts = 0;
+        self.gm_conn = crate::ims::GmConnectionState::Failed {
+            since: ping::gm_episode_since(self.gm_conn),
+        };
+        {
+            let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
+            guard.state = crate::ims::RegistrationState::Failed;
+            guard.last_failure = Some((SystemTime::now(), QUALIFYING_FAILURE_REASON.to_string()));
+        }
+        tracing::warn!(
+            cause = %cause,
+            call_id = %call_id,
+            in_call = self.busy(),
+            "qualifying endpoint failure: re-registering"
+        );
+        true
     }
 
     /// The loop's half of a reg-event NOTIFY, once it is classified: nothing
@@ -2876,6 +3114,9 @@ impl LoopState {
         p: &DispatchParams,
         resp: &SipResponse,
     ) {
+        if self.take_reg_sub_response(resp, Instant::now()) {
+            return;
+        }
         // Is this a response to an outbound INVITE we are placing (specs/029)?
         // These arrive here, on `inbound.rx`, instead of being read from the
         // carrier socket directly inside a blocking helper — matched by
@@ -2937,14 +3178,35 @@ impl LoopState {
             p.obs.set_gm_connection_up(true);
             return;
         }
-        // Outside a call the only requests we originate are reg-event
-        // SUBSCRIBEs, so their outcome is worth surfacing rather than burying
-        // at debug.
+        // Reg-event SUBSCRIBE responses are matched above, so anything left is
+        // worth surfacing rather than burying at debug.
         tracing::info!(
             status = resp.status,
             reason = %resp.reason,
             "received response outside an active transaction"
         );
+    }
+
+    /// The responses the reg-event subscription owns, taken before the
+    /// keepalive sees them; `true` when consumed.
+    ///
+    /// - Every SUBSCRIBE response, matched by method (specs/090 R3). The
+    ///   keepalive matches by CSeq number alone, so a late SUBSCRIBE response
+    ///   from a replaced session could otherwise be scored as its answer.
+    /// - The confirming probe's answer (R5): an `OPTIONS` like the keepalive,
+    ///   matched by its exact CSeq.
+    fn take_reg_sub_response(&mut self, resp: &SipResponse, now: Instant) -> bool {
+        let cseq = resp.header("CSeq");
+        match cseq.and_then(cseq_method) {
+            Some(m) if m.eq_ignore_ascii_case("SUBSCRIBE") => {
+                self.reg_sub.on_response(resp, now);
+                true
+            }
+            Some(m) if m.eq_ignore_ascii_case("OPTIONS") => cseq
+                .and_then(parse_cseq_number)
+                .is_some_and(|n| self.reg_sub.on_probe_response(n, now)),
+            _ => false,
+        }
     }
 
     /// Idle wake-up: nothing arrived within the poll interval. Runs Gm
@@ -2967,6 +3229,13 @@ impl LoopState {
         // function (renewal not due, deferred, backed off, ...) can skip it.
         flush_expired_reassembly(p);
         self.take_owed_budget_exit()?;
+
+        // specs/090 R4: the subscription's timers, before the busy gate below.
+        // The confirming probe must go out mid-call (clarification Q3), and a
+        // refresh is ordinary signalling, not maintenance.
+        if let Some(action) = self.reg_sub.poll(Instant::now(), self.force_renewal) {
+            self.perform_sub_action(session, p, action);
+        }
 
         // Gm connection liveness (specs/028) runs here, on the idle path, only
         // when no call is in progress — a live call proves the connection by
@@ -3155,7 +3424,10 @@ impl LoopState {
                 self.force_renewal = false;
                 self.gm_conn = crate::ims::GmConnectionState::Up;
                 p.obs.set_gm_connection_up(true);
-                subscribe_reg_event(session, &p.reg_cfg.access_network_info);
+                // A fresh subscription for the fresh registration; the old
+                // one's timers go with it (FR-003).
+                let action = self.reg_sub.on_new_registration(Instant::now());
+                self.perform_sub_action(session, p, action);
             }
             Err(e) => {
                 tracing::warn!(
@@ -3240,6 +3512,7 @@ mod tests {
             expires: 3600,
             access_network_info: "IEEE-802.11",
             security_verify: Some(echo),
+            dialog: None,
         });
         assert!(msg.contains("Require: sec-agree\r\n"), "{msg}");
         assert!(msg.contains("Proxy-Require: sec-agree\r\n"), "{msg}");
@@ -3266,6 +3539,7 @@ mod tests {
             expires: 3600,
             access_network_info: "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=40494abcdef01",
             security_verify: None,
+            dialog: None,
         });
         assert!(!msg.contains("sec-agree") && !msg.contains("Security-Verify"));
         assert!(msg
@@ -3287,6 +3561,46 @@ mod tests {
             "P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=40494abcdef01\r\n"
         ));
         assert!(msg.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    /// specs/090 R2: a refresh goes inside the subscription dialog — to the
+    /// notifier's Contact, along the dialog's route set, with its tag in `To` —
+    /// while keeping our own identifiers.
+    #[test]
+    fn build_subscribe_formats_an_in_dialog_refresh() {
+        let route_set = ["Route: <sip:pcscf@10.0.0.8;lr>".to_string()];
+        let msg = build_subscribe(&SubscribeParts {
+            impu: "sip:+919000000000@ims.mnc000.mcc000.3gppnetwork.org",
+            route_headers: &route_set,
+            via_transport: "UDP",
+            local_addr: "10.0.0.1:5062".parse().unwrap(),
+            contact_addr: "10.0.0.1:5070".parse().unwrap(),
+            public_user: "+919000000000",
+            call_id: "sub-a",
+            from_tag: "ltag-a",
+            cseq: 9,
+            expires: 3600,
+            access_network_info: "3GPP-WLAN",
+            security_verify: None,
+            dialog: Some(crate::ims::session::SubscribeDialog {
+                remote_tag: "rtag-1",
+                request_uri: "sip:scscf@10.0.0.9:5060",
+            }),
+        });
+        assert!(
+            msg.starts_with("SUBSCRIBE sip:scscf@10.0.0.9:5060 SIP/2.0\r\n"),
+            "{msg}"
+        );
+        let routes: Vec<&str> = msg.lines().filter(|l| l.starts_with("Route:")).collect();
+        assert_eq!(routes, ["Route: <sip:pcscf@10.0.0.8;lr>"]);
+        assert!(msg
+            .contains("To: <sip:+919000000000@ims.mnc000.mcc000.3gppnetwork.org>;tag=rtag-1\r\n"));
+        assert!(msg.contains(
+            "From: <sip:+919000000000@ims.mnc000.mcc000.3gppnetwork.org>;tag=ltag-a\r\n"
+        ));
+        assert!(msg.contains("Call-ID: sub-a\r\n"));
+        assert!(msg.contains("CSeq: 9 SUBSCRIBE\r\n"));
+        assert!(msg.contains("Event: reg\r\n"));
     }
 
     #[test]
@@ -5175,5 +5489,340 @@ mod tests {
         )
         .expect("never an exit");
         assert_eq!(st.rejection, Some(after));
+    }
+
+    // ---- specs/090: the reg-event subscription in the dispatch loop ----
+
+    use crate::ims::session::SentSubscribe;
+
+    /// A registered session whose client transport is a real UDP socket to
+    /// `peer`, so a test can read what the loop sends.
+    fn session_to(peer: &std::net::UdpSocket) -> crate::ims::RegisteredSession {
+        let transport =
+            crate::ims::sip_client::SipTransport::connect(peer.local_addr().unwrap(), false)
+                .unwrap();
+        crate::ims::test_session_with_sa(Some(transport), peer.local_addr().unwrap(), None)
+    }
+
+    fn peer() -> std::net::UdpSocket {
+        let peer = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        peer
+    }
+
+    fn registered_status() -> Mutex<crate::ims::RegistrationStatus> {
+        Mutex::new(crate::ims::RegistrationStatus {
+            state: crate::ims::RegistrationState::Registered,
+            ..Default::default()
+        })
+    }
+
+    /// A loop whose current subscription is `sub-a` (our tag `ltag-a`), after
+    /// an earlier `sub-old` (`ltag-old`) it replaced.
+    fn subscribed_loop(now: Instant) -> LoopState {
+        let mut st = LoopState::new();
+        st.reg_sub.on_new_registration(now);
+        let old = SentSubscribe {
+            call_id: "sub-old".into(),
+            local_tag: "ltag-old".into(),
+            cseq: 3,
+            expires: 3600,
+        };
+        st.reg_sub.on_sent(&old, SubKind::Initial, now);
+        st.reg_sub.on_new_registration(now);
+        let current = SentSubscribe {
+            call_id: "sub-a".into(),
+            local_tag: "ltag-a".into(),
+            cseq: 7,
+            expires: 3600,
+        };
+        st.reg_sub.on_sent(&current, SubKind::Initial, now);
+        st
+    }
+
+    fn carrier_response(status: u16, cseq: &str) -> SipResponse {
+        SipResponse {
+            status,
+            reason: "OK".into(),
+            headers: vec![
+                ("Call-ID".into(), "sub-gone".into()),
+                ("CSeq".into(), cseq.into()),
+            ],
+            body: String::new(),
+        }
+    }
+
+    /// Research R3: every SUBSCRIBE response is the subscription's, even an
+    /// unknown one whose CSeq number equals a keepalive's — it never reaches
+    /// the keepalive's CSeq-only matcher. An OPTIONS that is not the probe
+    /// is left for the keepalive.
+    #[test]
+    fn a_subscribe_response_never_reaches_the_keepalive_matcher() {
+        let now = Instant::now();
+        let mut st = subscribed_loop(now);
+        assert!(st.take_reg_sub_response(&carrier_response(200, "9 SUBSCRIBE"), now));
+        assert!(!st.take_reg_sub_response(&carrier_response(200, "9 OPTIONS"), now));
+        assert!(!st.take_reg_sub_response(&carrier_response(200, "9 INVITE"), now));
+    }
+
+    #[test]
+    fn a_qualifying_endpoint_failure_forces_a_re_registration_past_the_ladder() {
+        let mut st = LoopState::new();
+        // A rebuild ladder part-way through (clarification Q1 edge case).
+        st.reconnect_attempts = 2;
+        let status = registered_status();
+        assert!(st.on_qualifying_endpoint_failure(
+            EndpointFailureCause::SubscribeTimeout,
+            Some("sub-a"),
+            &status
+        ));
+        assert!(
+            st.force_renewal,
+            "probe_gm_connection returns early from here on"
+        );
+        assert_eq!(st.reconnect_attempts, 0);
+        assert!(matches!(
+            st.gm_conn,
+            crate::ims::GmConnectionState::Failed { .. }
+        ));
+        let guard = status.lock().unwrap();
+        assert_eq!(guard.state, crate::ims::RegistrationState::Failed);
+        assert_eq!(
+            guard.last_failure.as_ref().map(|(_, r)| r.as_str()),
+            Some(QUALIFYING_FAILURE_REASON)
+        );
+    }
+
+    /// FR-022: mid-call the failure is recorded at once, the call is left
+    /// alone, and the re-registration waits for it.
+    #[test]
+    fn a_qualifying_endpoint_failure_mid_call_keeps_the_call_and_defers_renewal() {
+        let mut st = LoopState::new();
+        st.active_call = Some(test_active_call(
+            "c1",
+            "our-to-tag",
+            REQUEST_HELPER_CALLER_FROM,
+        ));
+        let status = registered_status();
+        assert!(st.on_qualifying_endpoint_failure(
+            EndpointFailureCause::SubscribeTimeout,
+            None,
+            &status
+        ));
+        assert!(st.active_call.is_some());
+        assert_eq!(
+            status.lock().unwrap().state,
+            crate::ims::RegistrationState::Failed
+        );
+        assert_eq!(
+            st.maintenance.decide(Maintenance::Renewal, st.busy()),
+            MaintenanceDecision::Defer
+        );
+    }
+
+    /// Edge case: an escalation already pending is not stacked.
+    #[test]
+    fn a_qualifying_endpoint_failure_with_a_re_registration_pending_changes_nothing() {
+        let mut st = LoopState::new();
+        st.force_renewal = true;
+        let status = registered_status();
+        assert!(!st.on_qualifying_endpoint_failure(
+            EndpointFailureCause::SubscribeTimeout,
+            None,
+            &status
+        ));
+        assert_eq!(
+            status.lock().unwrap().state,
+            crate::ims::RegistrationState::Registered
+        );
+        assert!(st.gm_conn.is_up());
+    }
+
+    /// Clarification Q3: the confirming probe goes out mid-call, straight
+    /// from the subscription, not gated on `busy()`.
+    #[test]
+    fn the_confirming_probe_is_sent_mid_call() {
+        let peer = peer();
+        let mut session = session_to(&peer);
+        let mut st = LoopState::new();
+        st.active_call = Some(test_active_call(
+            "c1",
+            "our-to-tag",
+            REQUEST_HELPER_CALLER_FROM,
+        ));
+        let status = registered_status();
+        let escalated = st.apply_sub_action(
+            &mut session,
+            "3GPP-WLAN",
+            &status,
+            SubAction::Probe {
+                cause: EndpointFailureCause::SubscribeTimeout,
+                call_id: Some("sub-a".into()),
+            },
+        );
+        assert!(!escalated);
+        let sent = recv_response(&peer);
+        assert!(sent.starts_with("OPTIONS "), "{sent}");
+    }
+
+    #[test]
+    fn an_initial_subscribe_is_sent_and_tracked() {
+        let peer = peer();
+        let mut session = session_to(&peer);
+        let mut st = LoopState::new();
+        let first = st.reg_sub.on_new_registration(Instant::now());
+        st.apply_sub_action(&mut session, "3GPP-WLAN", &registered_status(), first);
+        let sent = recv_response(&peer);
+        assert!(sent.starts_with("SUBSCRIBE "), "{sent}");
+        let (call_id, tag) = st.reg_sub.current_ids().expect("tracked");
+        assert!(sent.contains(&format!("Call-ID: {call_id}\r\n")));
+        assert!(sent.contains(&format!(";tag={tag}\r\n")));
+    }
+
+    /// US1 scenario 2 end to end: with no transport the SUBSCRIBE cannot be
+    /// sent, nor can the probe, and the line re-registers.
+    #[test]
+    fn an_unsendable_subscribe_and_probe_escalate_to_re_registration() {
+        let mut session =
+            crate::ims::test_session_with_sa(None, "127.0.0.1:5060".parse().unwrap(), None);
+        let mut st = LoopState::new();
+        let status = registered_status();
+        let first = st.reg_sub.on_new_registration(Instant::now());
+        assert!(st.apply_sub_action(&mut session, "3GPP-WLAN", &status, first));
+        assert!(st.force_renewal);
+        assert_eq!(
+            status.lock().unwrap().state,
+            crate::ims::RegistrationState::Failed
+        );
+    }
+
+    fn reg_notify(
+        call_id: &str,
+        to_tag: &str,
+        event: &str,
+        sub_state: Option<&str>,
+        body: &str,
+    ) -> SipRequest {
+        let sub_state = sub_state
+            .map(|v| format!("Subscription-State: {v}\r\n"))
+            .unwrap_or_default();
+        let raw = format!(
+            "NOTIFY sip:x@127.0.0.1:5063 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKn1\r\n\
+             From: <sip:+919000000000@ims.example.test>;tag=rtag-1\r\n\
+             To: <sip:+919000000000@ims.example.test>;tag={to_tag}\r\n\
+             Call-ID: {call_id}\r\n\
+             CSeq: 1 NOTIFY\r\n\
+             Event: {event}\r\n\
+             {sub_state}Content-Type: application/reginfo+xml\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0
+    }
+
+    /// Our binding (the test session's contact, `127.0.0.1:5063`) reported
+    /// `terminated` with `event`.
+    fn our_binding(event: &str) -> String {
+        format!(
+            r#"<reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="1" state="full">
+  <registration aor="sip:+919000000000@ims.example.test" id="a1" state="active">
+    <contact id="c1" state="terminated" event="{event}">
+      <uri>sip:+919000000000@127.0.0.1:5063</uri>
+    </contact>
+  </registration>
+</reginfo>"#
+        )
+    }
+
+    fn status_line(peer: &std::net::UdpSocket) -> String {
+        recv_response(peer)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// US3 scenario 1: a current NOTIFY is answered `200` and evaluated.
+    #[test]
+    fn a_current_notify_is_answered_200_and_evaluated() {
+        let now = Instant::now();
+        let mut st = subscribed_loop(now);
+        let session =
+            crate::ims::test_session_with_sa(None, "127.0.0.1:5060".parse().unwrap(), None);
+        let (sink, peer) = udp_sink_pair();
+        let req = reg_notify(
+            "sub-a",
+            "ltag-a",
+            "reg",
+            Some("active;expires=3600"),
+            &our_binding("deactivated"),
+        );
+        let (dereg, state) = st
+            .answer_reg_notify(&session, &req, &sink, now)
+            .expect("current");
+        assert_eq!(status_line(&peer), "SIP/2.0 200 OK");
+        assert_eq!(dereg.map(|d| d.event), Some(DeregEvent::Deactivated));
+        assert_eq!(state.state, crate::ims::session::SubStateKind::Active);
+    }
+
+    /// US3 scenario 2: a superseded NOTIFY is acknowledged, never applied —
+    /// even one reporting our binding rejected.
+    #[test]
+    fn a_superseded_notify_is_answered_200_and_not_applied() {
+        let now = Instant::now();
+        let mut st = subscribed_loop(now);
+        let session =
+            crate::ims::test_session_with_sa(None, "127.0.0.1:5060".parse().unwrap(), None);
+        let (sink, peer) = udp_sink_pair();
+        let req = reg_notify(
+            "sub-old",
+            "ltag-old",
+            "reg",
+            Some("active"),
+            &our_binding("rejected"),
+        );
+        assert!(st.answer_reg_notify(&session, &req, &sink, now).is_none());
+        assert_eq!(status_line(&peer), "SIP/2.0 200 OK");
+        assert!(!st.force_renewal);
+        assert_eq!(st.rejection, None);
+    }
+
+    /// US3 scenario 3, and a package we never subscribed to.
+    #[test]
+    fn a_notify_for_no_subscription_of_ours_is_refused_481() {
+        let now = Instant::now();
+        let session =
+            crate::ims::test_session_with_sa(None, "127.0.0.1:5060".parse().unwrap(), None);
+        for req in [
+            reg_notify("stray", "ltag-a", "reg", Some("active"), ""),
+            reg_notify("sub-a", "ltag-a", "presence", Some("active"), ""),
+        ] {
+            let mut st = subscribed_loop(now);
+            let (sink, peer) = udp_sink_pair();
+            assert!(st.answer_reg_notify(&session, &req, &sink, now).is_none());
+            assert_eq!(
+                status_line(&peer),
+                "SIP/2.0 481 Call/Transaction Does Not Exist"
+            );
+            assert!(!st.force_renewal);
+        }
+    }
+
+    #[test]
+    fn a_current_notify_without_subscription_state_is_treated_as_active() {
+        let now = Instant::now();
+        let mut st = subscribed_loop(now);
+        let session =
+            crate::ims::test_session_with_sa(None, "127.0.0.1:5060".parse().unwrap(), None);
+        let (sink, peer) = udp_sink_pair();
+        let req = reg_notify("sub-a", "ltag-a", "reg", None, "");
+        let (_, state) = st
+            .answer_reg_notify(&session, &req, &sink, now)
+            .expect("current");
+        assert_eq!(status_line(&peer), "SIP/2.0 200 OK");
+        assert_eq!(state.state, crate::ims::session::SubStateKind::Missing);
+        st.reg_sub.apply_subscription_state(&state, now);
+        assert_eq!(st.reg_sub.current_ids(), Some(("sub-a", "ltag-a")));
     }
 }

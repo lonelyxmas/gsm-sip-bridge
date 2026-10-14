@@ -7,7 +7,7 @@
 //! miss entirely.
 
 use crate::error::{BridgeError, BridgeResult};
-use crate::ims::session::{start_inbound, subscribe_reg_event};
+use crate::ims::session::{send_reg_subscribe, start_inbound, SubscribeRequest};
 use crate::ims::sip_client::{build_100_trying, build_486_busy_here, random_hex, SipMessage};
 use std::time::{Duration, Instant};
 
@@ -56,7 +56,16 @@ pub fn probe_inbound(
     // notification arriving proves the network can reach us, which is what
     // makes a subsequent *absent* INVITE meaningful evidence.
     let inbound = start_inbound(&session)?;
-    subscribe_reg_event(&mut session, &cfg.access_network_info);
+    // Fire-and-forget: this one-shot diagnostic runs no dispatch loop to track
+    // the subscription, and a send failure is already logged.
+    let _ = send_reg_subscribe(
+        &mut session,
+        &SubscribeRequest {
+            access_network_info: &cfg.access_network_info,
+            expires: crate::ims::DEFAULT_EXPIRES,
+            refresh: None,
+        },
+    );
     match session.gm_server_addr() {
         Some(addr) => tracing::info!(
             %addr,

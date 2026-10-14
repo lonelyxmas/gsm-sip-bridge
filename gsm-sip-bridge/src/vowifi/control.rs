@@ -96,6 +96,15 @@ pub enum ControlMessage {
         /// cooldown is running, and from an older peer that omits it.
         #[serde(default)]
         rejection_cooldown_until: Option<u64>,
+        /// Rendered reg-event subscription health (specs/090 FR-020), e.g.
+        /// `confirmed, expires <ts>`. Empty from an older peer, which the CLI
+        /// prints as `unknown`, as for `gm_connection`.
+        #[serde(default)]
+        reg_subscription: String,
+        /// The most recent subscription failure: unix seconds and reason.
+        /// `None` when there has been none, and from an older peer.
+        #[serde(default)]
+        reg_subscription_last_failure: Option<(u64, String)>,
     },
     /// Agent B → `vowifi-status`. Recent call outcomes, newest first.
     CallHistoryReply { calls: Vec<CallRecord> },
@@ -617,6 +626,11 @@ mod tests {
             blocked_reason: None,
             gm_connection: "up".to_string(),
             rejection_cooldown_until: None,
+            reg_subscription: "confirmed, expires 2026-10-14T11:02:11+00:00".to_string(),
+            reg_subscription_last_failure: Some((
+                1_699_999_500,
+                "accepted but no NOTIFY within 128s".to_string(),
+            )),
         };
         assert_eq!(roundtrip(&msg), msg);
     }
@@ -632,6 +646,8 @@ mod tests {
             blocked_reason: Some("not registered".to_string()),
             gm_connection: "reconnecting since 2026-08-07T10:14:03+00:00 (attempt 2)".to_string(),
             rejection_cooldown_until: Some(1_700_001_800),
+            reg_subscription: "none".to_string(),
+            reg_subscription_last_failure: None,
         };
         assert_eq!(roundtrip(&msg), msg);
     }
@@ -647,11 +663,16 @@ mod tests {
             ControlMessage::RegistrationStatusReply {
                 gm_connection,
                 rejection_cooldown_until,
+                reg_subscription,
+                reg_subscription_last_failure,
                 ..
             } => {
                 assert_eq!(gm_connection, "");
                 // specs/089: nor does it know of the rejection cooldown.
                 assert_eq!(rejection_cooldown_until, None);
+                // specs/090: nor of the reg-event subscription.
+                assert_eq!(reg_subscription, "");
+                assert_eq!(reg_subscription_last_failure, None);
             }
             other => panic!("unexpected variant: {other:?}"),
         }

@@ -238,16 +238,29 @@ pub(crate) struct SubscribeParts<'a> {
     /// `Security-Verify` value (RFC 3329 §2.3.1) — `None` when the
     /// registration negotiated no Gm SA.
     pub(crate) security_verify: Option<&'a str>,
+    /// `Some` for a refresh inside an existing subscription dialog (RFC 6665
+    /// §4.1.2.2), `None` for a new subscription. `route_headers` is then the
+    /// dialog's route set rather than the Service-Route.
+    pub(crate) dialog: Option<SubscribeDialog<'a>>,
+}
+
+/// The parts of an in-dialog SUBSCRIBE that differ from an initial one.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SubscribeDialog<'a> {
+    /// The network's tag, carried in `To`.
+    pub(crate) remote_tag: &'a str,
+    /// The dialog's remote target (the notifier's `Contact`).
+    pub(crate) request_uri: &'a str,
 }
 
 pub(crate) fn build_subscribe(p: &SubscribeParts) -> String {
     let via_addr = format_sip_addr(p.local_addr);
     let contact_addr = format_sip_addr(p.contact_addr);
     let mut msg = format!(
-        "SUBSCRIBE {impu} SIP/2.0\r\n\
+        "SUBSCRIBE {request_uri} SIP/2.0\r\n\
          Via: SIP/2.0/{transport} {via_addr};branch=z9hG4bK{branch};rport\r\n\
          Max-Forwards: 70\r\n",
-        impu = p.impu,
+        request_uri = p.dialog.map_or(p.impu, |d| d.request_uri),
         transport = p.via_transport,
         via_addr = via_addr,
         branch = random_hex(6),
@@ -256,9 +269,13 @@ pub(crate) fn build_subscribe(p: &SubscribeParts) -> String {
         msg.push_str(route);
         msg.push_str("\r\n");
     }
+    let to_tag = p
+        .dialog
+        .map(|d| format!(";tag={}", d.remote_tag))
+        .unwrap_or_default();
     msg.push_str(&format!(
         "From: <{impu}>;tag={from_tag}\r\n\
-         To: <{impu}>\r\n\
+         To: <{impu}>{to_tag}\r\n\
          Call-ID: {call_id}\r\n\
          CSeq: {cseq} SUBSCRIBE\r\n\
          Contact: <sip:{public_user}@{contact_addr};transport={transport}>\r\n\
@@ -282,29 +299,76 @@ pub(crate) fn build_subscribe(p: &SubscribeParts) -> String {
     msg
 }
 
+/// A reg-event SUBSCRIBE to send: a new subscription, or a refresh of an
+/// existing one when `refresh` is set.
+pub(crate) struct SubscribeRequest<'a> {
+    pub(crate) access_network_info: &'a str,
+    pub(crate) expires: u32,
+    pub(crate) refresh: Option<SubscribeRefresh<'a>>,
+}
+
+/// The dialog a refresh is sent in (RFC 6665 §4.1.2.2): the same Call-ID and
+/// tags as the subscription it renews.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SubscribeRefresh<'a> {
+    pub(crate) call_id: &'a str,
+    pub(crate) local_tag: &'a str,
+    pub(crate) remote_tag: &'a str,
+    /// `None` when the network gave no usable `Contact`: the IMPU is used.
+    pub(crate) remote_target: Option<&'a str>,
+    /// Empty when the network recorded no route: the Service-Route is used.
+    pub(crate) route_set: &'a [String],
+}
+
+/// What [`send_reg_subscribe`] sent, so its response and NOTIFYs can be
+/// matched back to it (specs/090 FR-001).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SentSubscribe {
+    pub(crate) call_id: String,
+    pub(crate) local_tag: String,
+    pub(crate) cseq: u32,
+    pub(crate) expires: u32,
+}
+
 /// TS 24.229 §5.1.1.3: a UE subscribes to its own registration-state event
 /// package (`Event: reg`) immediately after a successful registration. Some
 /// IMS cores treat a binding whose UE never subscribes as incomplete and
 /// exclude it from terminating-call routing; independently of that, the
 /// resulting `NOTIFY`s (reginfo XML) are the only authoritative view of how
 /// the network sees this binding — a server-side deregistration is otherwise
-/// silent. Best-effort: the SUBSCRIBE's own response and the NOTIFYs arrive
-/// asynchronously on the shared transport and are handled by
-/// `dispatch_loop`, and a send failure only costs us that visibility.
-pub(crate) fn subscribe_reg_event(
+/// silent.
+///
+/// Sends and returns at once: the response and the NOTIFYs arrive
+/// asynchronously on the shared transport, and the dispatch loop matches them
+/// to the identifiers returned here (specs/090). A send failure is `Err`,
+/// because an unsendable SUBSCRIBE is itself evidence about the Gm path
+/// (FR-011).
+pub(crate) fn send_reg_subscribe(
     session: &mut super::RegisteredSession,
-    access_network_info: &str,
-) {
+    req: &SubscribeRequest,
+) -> BridgeResult<SentSubscribe> {
     let impu = session
         .default_impu()
         .unwrap_or_else(|| format!("sip:{}", session.public_uri));
-    let route_headers = service_route_headers(session);
+    let route_headers = match req.refresh {
+        Some(r) if !r.route_set.is_empty() => r.route_set.to_vec(),
+        _ => service_route_headers(session),
+    };
     let public_user = session
         .public_uri
         .split('@')
         .next()
         .unwrap_or(&session.public_uri)
         .to_string();
+    let (call_id, local_tag) = match req.refresh {
+        Some(r) => (r.call_id.to_string(), r.local_tag.to_string()),
+        None => (random_hex(8), random_hex(4)),
+    };
+    let kind = if req.refresh.is_some() {
+        "refresh"
+    } else {
+        "initial"
+    };
     let cseq = session.cseq;
     session.cseq += 1;
     let msg = build_subscribe(&SubscribeParts {
@@ -314,16 +378,38 @@ pub(crate) fn subscribe_reg_event(
         local_addr: session.local_addr,
         contact_addr: session.contact_addr,
         public_user: &public_user,
-        call_id: &random_hex(8),
-        from_tag: &random_hex(4),
+        call_id: &call_id,
+        from_tag: &local_tag,
         cseq,
-        expires: super::DEFAULT_EXPIRES,
-        access_network_info,
+        expires: req.expires,
+        access_network_info: req.access_network_info,
         security_verify: session.security_verify(),
+        dialog: req.refresh.map(|r| SubscribeDialog {
+            remote_tag: r.remote_tag,
+            request_uri: r.remote_target.unwrap_or(&impu),
+        }),
     });
     match session.transport_mut().and_then(|t| t.send(&msg)) {
-        Ok(()) => tracing::info!(impu = %impu, "sent reg-event SUBSCRIBE"),
-        Err(e) => tracing::warn!(error = %e, "failed to send reg-event SUBSCRIBE"),
+        Ok(()) => {
+            tracing::info!(
+                impu = %impu,
+                call_id = %call_id,
+                cseq,
+                kind,
+                expires = req.expires,
+                "sent reg-event SUBSCRIBE"
+            );
+            Ok(SentSubscribe {
+                call_id,
+                local_tag,
+                cseq,
+                expires: req.expires,
+            })
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, call_id = %call_id, kind, "failed to send reg-event SUBSCRIBE");
+            Err(e)
+        }
     }
 }
 
@@ -365,7 +451,7 @@ fn service_route_headers(session: &super::RegisteredSession) -> Vec<String> {
 /// reason `vowifi.respond_on_client` exists. A report sent as a request does
 /// not depend on that defect being solved first.
 ///
-/// Best-effort, like [`subscribe_reg_event`]: the `202 Accepted` comes back
+/// Best-effort: the `202 Accepted` comes back
 /// asynchronously on the shared transport and is handled by the dispatch
 /// loop, and a send failure costs a redelivery, which the caller's dedupe
 /// absorbs.
@@ -745,15 +831,64 @@ pub(crate) struct NotifyVerdict {
     pub(crate) deregistration: Option<Deregistration>,
 }
 
-/// The `retry-after` parameter of a `Subscription-State` header value
-/// (RFC 6665 §8.2.3), e.g. `terminated;reason=probation;retry-after=900`.
-fn subscription_retry_after(subscription_state: &str) -> Option<u64> {
-    subscription_state.split(';').skip(1).find_map(|param| {
-        let (name, value) = param.split_once('=')?;
-        name.trim()
-            .eq_ignore_ascii_case("retry-after")
-            .then(|| value.trim().parse().ok())?
-    })
+/// The substate a `Subscription-State` header names (RFC 6665 §8.2.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubStateKind {
+    Active,
+    Pending,
+    Terminated,
+    /// No header, an empty one, or a substate this UA does not know.
+    Missing,
+}
+
+/// A parsed `Subscription-State` header value, e.g.
+/// `terminated;reason=probation;retry-after=900`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubState {
+    pub(crate) state: SubStateKind,
+    pub(crate) expires: Option<u64>,
+    /// Lower-cased: RFC 6665 event reasons are tokens, compared
+    /// case-insensitively.
+    pub(crate) reason: Option<String>,
+    pub(crate) retry_after: Option<u64>,
+}
+
+/// Parses a `Subscription-State` header value. Pure, so every reason the
+/// subscription acts on is testable (specs/090 R7). A parameter whose value is
+/// not a number is treated as absent rather than as an error.
+pub(crate) fn parse_subscription_state(value: &str) -> SubState {
+    let mut parts = value.split(';');
+    let state = match parts
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "active" => SubStateKind::Active,
+        "pending" => SubStateKind::Pending,
+        "terminated" => SubStateKind::Terminated,
+        _ => SubStateKind::Missing,
+    };
+    let mut parsed = SubState {
+        state,
+        expires: None,
+        reason: None,
+        retry_after: None,
+    };
+    for param in parts {
+        let Some((name, value)) = param.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match name.trim().to_ascii_lowercase().as_str() {
+            "expires" => parsed.expires = value.parse().ok(),
+            "retry-after" => parsed.retry_after = value.parse().ok(),
+            "reason" => parsed.reason = Some(value.to_ascii_lowercase()),
+            _ => {}
+        }
+    }
+    parsed
 }
 
 /// Classifies a reg-event NOTIFY body for this line: the pure decision behind
@@ -776,7 +911,7 @@ pub(crate) fn classify_reg_notify(
                 .entries
                 .iter()
                 .filter_map(|c| c.retry_after)
-                .chain(subscription_retry_after(subscription_state))
+                .chain(parse_subscription_state(subscription_state).retry_after)
                 .max()
                 .map(Duration::from_secs);
             // Research R6: the identity as a whole went only when every
@@ -802,11 +937,27 @@ pub(crate) fn classify_reg_notify(
     }
 }
 
-/// Acknowledges a `NOTIFY` and surfaces its payload. For `Event: reg` the
-/// body is the network's reginfo XML — logged in full because it is the
-/// ground truth for whether our binding is actually active for terminating
-/// calls. The `To` header already carries our tag (it echoes our SUBSCRIBE's
-/// `From` tag), so no tag is added.
+/// Answers a reg-event `NOTIFY`: `200` for a subscription of ours, `481` for
+/// one we do not have (RFC 6665 §4.4.1). Which applies is the subscription
+/// matcher's decision (specs/090 R6), made before anything is sent. The `To`
+/// header already carries our tag (it echoes our SUBSCRIBE's `From` tag), so
+/// no tag is added.
+pub(crate) fn respond_notify(sink: &SipSink, req: &SipRequest, status: u16) {
+    let reason = match status {
+        481 => "Call/Transaction Does Not Exist",
+        _ => "OK",
+    };
+    respond(
+        sink,
+        "NOTIFY response",
+        &build_uas_response(status, reason, req, None, None, None),
+    );
+}
+
+/// Evaluates a reg-event NOTIFY for the current subscription, already
+/// answered by [`respond_notify`]. The body is the network's reginfo XML —
+/// logged in full because it is the ground truth for whether our binding is
+/// actually active for terminating calls.
 ///
 /// Returns the deregistration of our own binding (see [`find_own_contacts`]
 /// and [`classify_reg_notify`]), if the NOTIFY reported one — so the caller
@@ -817,22 +968,39 @@ pub(crate) fn classify_reg_notify(
 ///
 /// What the line does about each event is the caller's policy
 /// (`on_network_deregistration`, TS 24.229 §5.1.1.7).
-pub(crate) fn handle_notify(
+pub(crate) fn evaluate_reg_notify(
     session: &super::RegisteredSession,
-    sink: &SipSink,
     req: &SipRequest,
 ) -> Option<Deregistration> {
-    let _ = sink.send(&build_uas_response(200, "OK", req, None, None, None));
-    let event = req.header("Event").unwrap_or("?").to_string();
     let sub_state = req.header("Subscription-State").unwrap_or("?").to_string();
-
-    if !event.eq_ignore_ascii_case("reg") {
-        tracing::info!(event = %event, subscription_state = %sub_state, body = %req.body, "received NOTIFY");
-        return None;
-    }
     let verdict = classify_reg_notify(&req.body, &sub_state, &session.imei, session.contact_addr);
     log_reg_notify(&verdict, session.contact_addr, &sub_state, &req.body);
     verdict.deregistration
+}
+
+/// Logs a NOTIFY for a subscription this line has replaced: acknowledged,
+/// never applied (specs/090 FR-015). The attribution summary is included so
+/// a reader can see what it would have said about our binding.
+pub(crate) fn log_superseded_notify(session: &super::RegisteredSession, req: &SipRequest) {
+    let sub_state = req.header("Subscription-State").unwrap_or("?");
+    let verdict = classify_reg_notify(&req.body, sub_state, &session.imei, session.contact_addr);
+    tracing::info!(
+        call_id = %req.header("Call-ID").unwrap_or_default(),
+        subscription_state = %sub_state,
+        attribution = %verdict.own.matched_by,
+        own_entries = verdict.own.entries.len(),
+        contact_states = %contact_states(&verdict.own),
+        body = %req.body,
+        "NOTIFY for a superseded reg-event subscription; acknowledged, not applied"
+    );
+}
+
+fn contact_states(own: &OwnContacts) -> String {
+    own.entries
+        .iter()
+        .map(|c| format!("{}/{}", c.state, c.event))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The FR-016 line every reg-event NOTIFY gets, plus one FR-005 line per
@@ -853,12 +1021,7 @@ fn log_reg_notify(verdict: &NotifyVerdict, contact_addr: SocketAddr, sub_state: 
             "replaced binding retired"
         );
     }
-    let states = own
-        .entries
-        .iter()
-        .map(|c| format!("{}/{}", c.state, c.event))
-        .collect::<Vec<_>>()
-        .join(",");
+    let states = contact_states(own);
     match &verdict.deregistration {
         Some(d) => tracing::warn!(
             attribution = %own.matched_by,
@@ -870,6 +1033,7 @@ fn log_reg_notify(verdict: &NotifyVerdict, contact_addr: SocketAddr, sub_state: 
             retry_after_secs = d.retry_after.map(|r| r.as_secs()),
             scope = %d.scope,
             subscription_state = %sub_state,
+            subscription = "current",
             body = %body,
             "reg-event NOTIFY: our current binding was deregistered"
         ),
@@ -887,6 +1051,7 @@ fn log_reg_notify(verdict: &NotifyVerdict, contact_addr: SocketAddr, sub_state: 
                 contact_states = %states,
                 applied = "none",
                 subscription_state = %sub_state,
+                subscription = "current",
                 body = %body,
                 "{message}"
             );
@@ -1610,16 +1775,93 @@ mod tests {
 
     #[test]
     fn subscription_state_retry_after_is_read_from_its_parameters() {
+        let retry_after = |v: &str| parse_subscription_state(v).retry_after;
         assert_eq!(
-            subscription_retry_after("terminated;reason=probation;retry-after=900"),
+            retry_after("terminated;reason=probation;retry-after=900"),
             Some(900)
         );
+        assert_eq!(retry_after("terminated; Retry-After = 60"), Some(60));
+        assert_eq!(retry_after("active;expires=600000"), None);
+        assert_eq!(retry_after("retry-after=5"), None);
+    }
+
+    fn sub_state(
+        state: SubStateKind,
+        expires: Option<u64>,
+        reason: Option<&str>,
+        retry_after: Option<u64>,
+    ) -> SubState {
+        SubState {
+            state,
+            expires,
+            reason: reason.map(str::to_string),
+            retry_after,
+        }
+    }
+
+    /// specs/090 R6: a refused NOTIFY is answered `481` with the request's own
+    /// dialog headers echoed, so the notifier can match it.
+    #[test]
+    fn respond_notify_answers_481_on_the_requests_own_headers() {
+        let peer = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let transport =
+            super::super::sip_client::SipTransport::connect(peer.local_addr().unwrap(), false)
+                .unwrap();
+        let raw = "NOTIFY sip:x SIP/2.0\r\nVia: SIP/2.0/UDP 10.0.0.8:5060;branch=z9hG4bKn1\r\n\
+                   From: <sip:a@ims.example>;tag=rtag-1\r\nTo: <sip:a@ims.example>;tag=ltag-x\r\n\
+                   Call-ID: stray\r\nCSeq: 4 NOTIFY\r\nEvent: reg\r\nContent-Length: 0\r\n\r\n";
+        let req = SipRequest::try_parse(raw.as_bytes()).unwrap().unwrap().0;
+        for (status, line) in [
+            (481, "SIP/2.0 481 Call/Transaction Does Not Exist\r\n"),
+            (200, "SIP/2.0 200 OK\r\n"),
+        ] {
+            respond_notify(&transport.sink().unwrap(), &req, status);
+            let mut buf = [0u8; 2048];
+            let (n, _) = peer.recv_from(&mut buf).unwrap();
+            let sent = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(sent.starts_with(line), "{sent}");
+            for h in [
+                "Via: SIP/2.0/UDP 10.0.0.8:5060;branch=z9hG4bKn1",
+                "From: <sip:a@ims.example>;tag=rtag-1\r\n",
+                "To: <sip:a@ims.example>;tag=ltag-x\r\n",
+                "Call-ID: stray\r\n",
+                "CSeq: 4 NOTIFY\r\n",
+            ] {
+                assert!(sent.contains(h), "missing {h:?} in {sent}");
+            }
+        }
+    }
+
+    /// specs/090 R7: every shape the subscription acts on.
+    #[test]
+    fn subscription_state_is_parsed_into_its_substate_and_parameters() {
         assert_eq!(
-            subscription_retry_after("terminated; Retry-After = 60"),
-            Some(60)
+            parse_subscription_state("active;expires=600"),
+            sub_state(SubStateKind::Active, Some(600), None, None)
         );
-        assert_eq!(subscription_retry_after("active;expires=600000"), None);
-        assert_eq!(subscription_retry_after("retry-after=5"), None);
+        assert_eq!(
+            parse_subscription_state("pending"),
+            sub_state(SubStateKind::Pending, None, None, None)
+        );
+        assert_eq!(
+            parse_subscription_state("terminated;reason=probation;retry-after=300"),
+            sub_state(SubStateKind::Terminated, None, Some("probation"), Some(300))
+        );
+        assert_eq!(
+            parse_subscription_state("Terminated; Reason=NoResource"),
+            sub_state(SubStateKind::Terminated, None, Some("noresource"), None)
+        );
+        assert_eq!(
+            parse_subscription_state("terminated"),
+            sub_state(SubStateKind::Terminated, None, None, None)
+        );
+        assert_eq!(parse_subscription_state("").state, SubStateKind::Missing);
+        assert_eq!(parse_subscription_state("  ").state, SubStateKind::Missing);
+        assert_eq!(
+            parse_subscription_state("active;expires=soon;retry-after=x"),
+            sub_state(SubStateKind::Active, None, None, None)
+        );
     }
 
     const OLD: &str = "10.0.0.1:5064";

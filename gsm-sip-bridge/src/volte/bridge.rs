@@ -563,6 +563,8 @@ fn print_line_live_status(
             blocked_reason,
             gm_connection,
             rejection_cooldown_until,
+            reg_subscription,
+            reg_subscription_last_failure,
         }) => (
             state,
             registered_at,
@@ -572,6 +574,8 @@ fn print_line_live_status(
             blocked_reason,
             gm_connection,
             rejection_cooldown_until,
+            reg_subscription,
+            reg_subscription_last_failure,
         ),
         // Unreachable, or an unexpected reply, both mean this line's carrier
         // half is not answering.
@@ -590,6 +594,8 @@ fn print_line_live_status(
         blocked_reason,
         gm_connection,
         rejection_cooldown_until,
+        reg_subscription,
+        reg_subscription_last_failure,
     ) = reg;
     println!("  registration:");
     println!("    state: {state}");
@@ -603,6 +609,11 @@ fn print_line_live_status(
             &gm_connection
         }
     );
+    for l in
+        crate::vowifi::format_reg_subscription(&reg_subscription, reg_subscription_last_failure)
+    {
+        println!("    {l}");
+    }
     println!(
         "    rejection_cooldown: {}",
         crate::vowifi::format_rejection_cooldown(
