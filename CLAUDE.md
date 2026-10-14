@@ -1,7 +1,7 @@
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan at
-`specs/091-pcscf-failover/plan.md`.
+`specs/092-epdg-inner-address-family/plan.md`.
 <!-- SPECKIT END -->
 
 ## Pre-commit Checklist
