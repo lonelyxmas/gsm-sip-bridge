@@ -161,6 +161,10 @@ pub trait TunnelEngine {
     fn is_tunnel_established(&self, runner: &dyn CommandRunner) -> bool;
     /// Latest P-CSCF address from wherever this engine's log records it.
     fn latest_pcscf(&self, runner: &dyn CommandRunner) -> Option<String>;
+    /// Every P-CSCF the latest negotiation advertised, deduplicated, in log
+    /// order (specs/091 R1). Published beside [`Self::latest_pcscf`]; never
+    /// compared by the "P-CSCF changed" check.
+    fn latest_pcscf_pool(&self, runner: &dyn CommandRunner) -> Vec<String>;
     /// Is this line's primary process (charon / the swu dialer) still alive?
     fn is_process_alive(&self, runner: &dyn CommandRunner) -> bool;
     /// Terminates the current negotiation without restarting the process
@@ -321,6 +325,9 @@ pub enum SteadyOutcome {
 /// its inputs.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SteadyTracking {
+    /// The pool member that answered while the selection did not, on the last
+    /// tick (specs/091 R9); `None` when the selection answered or nothing did.
+    pub pcscf_via_sibling: Option<std::net::IpAddr>,
     /// Consecutive ticks the P-CSCF was unreachable.
     pub pcscf_unreachable: u32,
     /// Consecutive ticks an IKE_SA was listed but had no usable CHILD_SA.
@@ -410,6 +417,27 @@ pub fn tick_steady_state(
     engine: &dyn TunnelEngine,
     runner: &dyn CommandRunner,
     current_pcscf: &str,
+    tracking: &mut SteadyTracking,
+    poll_interval: Duration,
+) -> SteadyOutcome {
+    tick_steady_state_with_pool(engine, runner, current_pcscf, &[], tracking, poll_interval)
+}
+
+/// [`tick_steady_state`] for a line whose whole advertised pool is known
+/// (specs/091 research R9).
+///
+/// The reachability check exists to catch a dead data path, and any pool
+/// member answering proves the path. Probing only the selection would rebuild
+/// the tunnel ~90s after that one P-CSCF died, which is exactly the move the
+/// agent's failover makes unnecessary (US1: "without a tunnel rebuild"). The
+/// other members are probed only when the selection fails, so a healthy line
+/// costs what it always did. With every member dead the rebuild still happens,
+/// and it is the spec's "rediscovery": the new negotiation brings a new pool.
+pub fn tick_steady_state_with_pool(
+    engine: &dyn TunnelEngine,
+    runner: &dyn CommandRunner,
+    current_pcscf: &str,
+    current_pool: &[String],
     tracking: &mut SteadyTracking,
     poll_interval: Duration,
 ) -> SteadyOutcome {
@@ -526,7 +554,18 @@ pub fn tick_steady_state(
         }
     }
 
-    if engine.pcscf_reachable(runner, current_pcscf) {
+    let selection_reachable = engine.pcscf_reachable(runner, current_pcscf);
+    let sibling = if selection_reachable {
+        None
+    } else {
+        current_pool
+            .iter()
+            .filter(|a| a.as_str() != current_pcscf)
+            .find(|a| engine.pcscf_reachable(runner, a))
+            .and_then(|a| a.parse().ok())
+    };
+    tracking.pcscf_via_sibling = sibling;
+    if selection_reachable || tracking.pcscf_via_sibling.is_some() {
         tracking.pcscf_unreachable = 0;
     } else {
         // Before escalating: is the route simply gone? That is a millisecond
@@ -648,6 +687,11 @@ mod tests {
         /// below, because the whole point is that structure can be perfect
         /// while nothing is reachable.
         pcscf_reachable: RefCell<bool>,
+        /// When set, exactly these addresses answer, overriding
+        /// `pcscf_reachable` (specs/091 R9).
+        reachable_addrs: RefCell<Option<Vec<String>>>,
+        /// Every address probed, in order.
+        probed: RefCell<Vec<String>>,
         /// Whether this line's default route has gone missing. Separate from
         /// `pcscf_reachable` because the whole point is that a missing route is
         /// one specific *cause* of unreachability with its own cheap remedy.
@@ -655,6 +699,7 @@ mod tests {
         route_repairs: RefCell<u32>,
         established: RefCell<bool>,
         pcscf: RefCell<Option<String>>,
+        pool: RefCell<Vec<String>>,
         alive: RefCell<bool>,
         health: RefCell<SteadyStateHealth>,
         max_attempts: Option<u32>,
@@ -677,9 +722,12 @@ mod tests {
             Self {
                 established: RefCell::new(false),
                 pcscf: RefCell::new(None),
+                pool: RefCell::new(Vec::new()),
                 // Default reachable: every pre-existing test asserts on the
                 // structural checks and must keep passing unchanged.
                 pcscf_reachable: RefCell::new(true),
+                reachable_addrs: RefCell::new(None),
+                probed: RefCell::new(Vec::new()),
                 // Default present: an unreachable P-CSCF in a pre-existing test
                 // means "unreachable for some other reason", so the route repair
                 // must not silently absorb those cases.
@@ -700,8 +748,12 @@ mod tests {
     }
 
     impl TunnelEngine for FakeEngine {
-        fn pcscf_reachable(&self, _runner: &dyn CommandRunner, _pcscf: &str) -> bool {
-            *self.pcscf_reachable.borrow()
+        fn pcscf_reachable(&self, _runner: &dyn CommandRunner, pcscf: &str) -> bool {
+            self.probed.borrow_mut().push(pcscf.to_string());
+            match &*self.reachable_addrs.borrow() {
+                Some(up) => up.iter().any(|a| a == pcscf),
+                None => *self.pcscf_reachable.borrow(),
+            }
         }
 
         fn is_tunnel_established(&self, _runner: &dyn CommandRunner) -> bool {
@@ -709,6 +761,9 @@ mod tests {
         }
         fn latest_pcscf(&self, _runner: &dyn CommandRunner) -> Option<String> {
             self.pcscf.borrow().clone()
+        }
+        fn latest_pcscf_pool(&self, _runner: &dyn CommandRunner) -> Vec<String> {
+            self.pool.borrow().clone()
         }
         fn is_process_alive(&self, _runner: &dyn CommandRunner) -> bool {
             *self.alive.borrow()
@@ -990,6 +1045,83 @@ mod tests {
              two after this gate) and cannot produce a data path — the tick \
              after the id frees recovers normally"
         );
+    }
+
+    fn pool(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_dead_selection_with_a_live_pool_member_never_rebuilds_the_tunnel() {
+        // specs/091 R9: the agent fails over to B; rebuilding the tunnel over
+        // A would defeat that (US1: "without a tunnel rebuild").
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            reachable_addrs: RefCell::new(Some(pool(&["10.0.1.10"]))),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        let ticks = 2 * pcscf_unreachable_strikes(STEADY_STATE_POLL_INTERVAL);
+        for _ in 0..ticks {
+            let outcome = super::tick_steady_state_with_pool(
+                &engine,
+                &runner,
+                "10.0.0.10",
+                &pool(&["10.0.0.10", "10.0.1.10"]),
+                &mut tracking,
+                STEADY_STATE_POLL_INTERVAL,
+            );
+            assert_eq!(outcome, SteadyOutcome::StillUp);
+        }
+        assert_eq!(
+            tracking.pcscf_via_sibling,
+            Some("10.0.1.10".parse().unwrap())
+        );
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn a_wholly_dead_pool_still_rebuilds_the_tunnel() {
+        // The rebuild is the spec's "rediscovery" (US3).
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            reachable_addrs: RefCell::new(Some(Vec::new())),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        let mut outcome = SteadyOutcome::StillUp;
+        for _ in 0..pcscf_unreachable_strikes(STEADY_STATE_POLL_INTERVAL) {
+            outcome = super::tick_steady_state_with_pool(
+                &engine,
+                &runner,
+                "10.0.0.10",
+                &pool(&["10.0.0.10", "10.0.1.10"]),
+                &mut tracking,
+                STEADY_STATE_POLL_INTERVAL,
+            );
+        }
+        assert_eq!(
+            outcome,
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::PcscfUnreachable,
+                ike_sa_loss_cause: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_healthy_selection_probes_no_other_pool_member() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine::default();
+        super::tick_steady_state_with_pool(
+            &engine,
+            &runner,
+            "10.0.0.10",
+            &pool(&["10.0.0.10", "10.0.1.10", "10.0.2.10"]),
+            &mut SteadyTracking::default(),
+            STEADY_STATE_POLL_INTERVAL,
+        );
+        assert_eq!(*engine.probed.borrow(), pool(&["10.0.0.10"]));
     }
 
     #[test]

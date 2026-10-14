@@ -444,6 +444,8 @@ impl ImsTransport for LteImsPdnTransport {
 
         let handle = ImsTransportHandle {
             pcscf,
+            // VoLTE keeps its single configured P-CSCF (specs/091 R11).
+            pool: vec![pcscf.ip()],
             descriptor: format!(
                 "LTE IMS PDN (cid {}, APN {}, {}), P-CSCF from configuration",
                 report.pdn.cid,

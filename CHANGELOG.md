@@ -10,6 +10,15 @@ across releases.
 
 ### Added
 
+- **P-CSCF failover.** The supervisor publishes every advertised P-CSCF to
+  `/tmp/pcscf-N.pool` beside its unchanged single choice. The IMS agent marks a
+  P-CSCF that fails while the tunnel is up (RFC 5626 delay + 5 min, or a long
+  `Retry-After`) and registers through the next one at once. Marks persist in
+  `/tmp/pcscf-N.state` across agent restarts, and the tunnel is rebuilt only
+  when no advertised P-CSCF answers. `vowifi-status`/`volte-status` print
+  `pcscf` and `pcscf_unavailable`
+  ([#124](https://github.com/selvakn/gsm-sip-bridge/issues/124)).
+
 - **Reg-event subscription tracking.** The reg-event `SUBSCRIBE` is
   correlated with its response and NOTIFYs and refreshed in its dialog. An
   unanswered one (Timer F, 128 s) is checked with an immediate Gm probe, and an

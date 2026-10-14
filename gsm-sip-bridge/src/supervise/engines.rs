@@ -62,6 +62,44 @@ pub fn extract_latest_pcscf(charon_log: &str, conn_name: &str) -> Option<String>
 /// read; a `mark` landing mid-line or off a char boundary is snapped forward
 /// to the next line start.
 pub fn extract_pcscf_after(charon_log: &str, conn_name: &str, mark: usize) -> Option<String> {
+    closed_batch_after(charon_log, conn_name, mark).and_then(|b| pick_stable_pcscf(&b))
+}
+
+/// The whole P-CSCF pool the most recent negotiation advertised, deduplicated,
+/// in the order charon logged it (specs/091 R1). Empty while there is none.
+///
+/// The single selection ([`extract_latest_pcscf`]) is still the only thing the
+/// steady-state "P-CSCF changed" check compares; this is published beside it
+/// so the agent can fail over to another member (FR-001, FR-004).
+pub fn extract_latest_pcscf_pool(charon_log: &str, conn_name: &str) -> Vec<String> {
+    dedup_pool(latest_pcscf_batch(charon_log, conn_name).0)
+}
+
+/// [`extract_latest_pcscf_pool`] for a negotiation logged after `mark`, with
+/// the same rules as [`extract_pcscf_after`]: only a closed batch counts.
+pub fn extract_pcscf_pool_after(
+    charon_log: &str,
+    conn_name: &str,
+    mark: usize,
+) -> Option<Vec<String>> {
+    closed_batch_after(charon_log, conn_name, mark)
+        .map(dedup_pool)
+        .filter(|p| !p.is_empty())
+}
+
+fn dedup_pool(batch: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(batch.len());
+    for a in batch {
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    }
+    out
+}
+
+/// The batch of a negotiation that started after byte offset `mark`, if it has
+/// been closed by its establishment (see [`extract_pcscf_after`]).
+fn closed_batch_after(charon_log: &str, conn_name: &str, mark: usize) -> Option<Vec<String>> {
     let slice = if mark > charon_log.len() {
         charon_log
     } else {
@@ -79,11 +117,7 @@ pub fn extract_pcscf_after(charon_log: &str, conn_name: &str, mark: usize) -> Op
         &charon_log[at..]
     };
     let (batch, closed) = latest_pcscf_batch(slice, conn_name);
-    if closed {
-        pick_stable_pcscf(&batch)
-    } else {
-        None
-    }
+    closed.then_some(batch)
 }
 
 fn is_valid_pcscf_addr(s: &str) -> bool {
@@ -502,6 +536,24 @@ impl StrongswanEngine {
             .and_then(|c| extract_pcscf_after(&c, &self.conn_name, offset))
     }
 
+    /// The whole pool of a negotiation logged after `mark`; see
+    /// [`Self::fresh_pcscf_since`].
+    pub fn fresh_pcscf_pool_since(
+        &self,
+        runner: &dyn CommandRunner,
+        mark: LogMark,
+    ) -> Option<Vec<String>> {
+        let offset = if self.shared.log_generation.load(Ordering::SeqCst) == mark.generation {
+            mark.len
+        } else {
+            0
+        };
+        runner
+            .read_file(&self.shared.charon_log)
+            .ok()
+            .and_then(|c| extract_pcscf_pool_after(&c, &self.conn_name, offset))
+    }
+
     /// Backgrounded `swanctl` invocation — matches the bash calls that end
     /// in `&` (every `--initiate`). Fire-and-forget: like the bash version,
     /// the spawned process's handle is never tracked or waited on (the
@@ -548,6 +600,13 @@ impl TunnelEngine for StrongswanEngine {
             .read_file(&self.shared.charon_log)
             .ok()
             .and_then(|c| extract_latest_pcscf(&c, &self.conn_name))
+    }
+
+    fn latest_pcscf_pool(&self, runner: &dyn CommandRunner) -> Vec<String> {
+        runner
+            .read_file(&self.shared.charon_log)
+            .map(|c| extract_latest_pcscf_pool(&c, &self.conn_name))
+            .unwrap_or_default()
     }
 
     fn is_process_alive(&self, runner: &dyn CommandRunner) -> bool {
@@ -761,6 +820,22 @@ pub fn extract_swu_pcscf(log: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Every P-CSCF address the swu dialer logged, IPv4 and IPv6 lines alike, in
+/// log order and deduplicated (specs/091 R1). [`extract_swu_pcscf`] stays the
+/// single selection.
+pub fn extract_swu_pcscf_pool(log: &str) -> Vec<String> {
+    let addrs = log
+        .lines()
+        .filter(|l| l.contains("P-CSCF IPV4 ADDRESS") || l.contains("P-CSCF IPV6 ADDRESS"))
+        .filter_map(|l| {
+            l.split_whitespace()
+                .find(|tok| tok.parse::<std::net::IpAddr>().is_ok())
+                .map(str::to_string)
+        })
+        .collect();
+    dedup_pool(addrs)
+}
+
 /// One line's swu engine state.
 pub struct SwuEngine {
     pub idx: u32,
@@ -822,6 +897,13 @@ impl TunnelEngine for SwuEngine {
             .read_file(&self.log_file)
             .ok()
             .and_then(|c| extract_swu_pcscf(&c))
+    }
+
+    fn latest_pcscf_pool(&self, runner: &dyn CommandRunner) -> Vec<String> {
+        runner
+            .read_file(&self.log_file)
+            .map(|c| extract_swu_pcscf_pool(&c))
+            .unwrap_or_default()
     }
 
     fn is_process_alive(&self, runner: &dyn CommandRunner) -> bool {
@@ -951,6 +1033,57 @@ mod tests {
         assert_eq!(
             extract_latest_pcscf(log, "ims0"),
             Some("10.7.7.7".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_latest_pcscf_pool_returns_the_whole_latest_batch_in_log_order() {
+        let log = "[CFG] <ims0|1> received P-CSCF server IP 2402:8100::10\n\
+                   [CFG] <ims0|1> received P-CSCF server IP 10.0.1.10\n\
+                   [CFG] <ims1|2> received P-CSCF server IP 10.9.9.9\n\
+                   [CFG] <ims0|1> received P-CSCF server IP 2402:8100::11\n\
+                   [CFG] <ims0|1> received P-CSCF server IP 10.0.0.10\n\
+                   [CFG] <ims0|1> received P-CSCF server IP 10.0.1.10\n";
+        assert_eq!(
+            extract_latest_pcscf_pool(log, "ims0"),
+            vec!["2402:8100::10", "10.0.1.10", "2402:8100::11", "10.0.0.10"]
+        );
+        // The single selection is unchanged by publishing the pool (FR-004).
+        assert_eq!(
+            extract_latest_pcscf(log, "ims0"),
+            Some("10.0.0.10".to_string())
+        );
+    }
+
+    #[test]
+    fn a_new_negotiation_replaces_the_previous_pcscf_pool() {
+        let log = "<ims0|1> received P-CSCF server IP 10.0.0.10\n\
+                   <ims0|1> received P-CSCF server IP 10.0.1.10\n\
+                   <ims0|1> CHILD_SA ims0{1} established with SPIs\n\
+                   <ims0|1> received P-CSCF server IP 10.0.2.10\n";
+        assert_eq!(extract_latest_pcscf_pool(log, "ims0"), vec!["10.0.2.10"]);
+        assert!(extract_latest_pcscf_pool(log, "ims1").is_empty());
+    }
+
+    #[test]
+    fn extract_pcscf_pool_after_wants_a_closed_batch_after_the_mark() {
+        let old = "<ims0|1> received P-CSCF server IP 10.0.0.10\n\
+                   <ims0|1> CHILD_SA ims0{1} established with SPIs\n";
+        let mark = old.len();
+        assert_eq!(extract_pcscf_pool_after(old, "ims0", mark), None);
+        let open = format!("{old}<ims0|2> received P-CSCF server IP 10.0.2.10\n");
+        assert_eq!(extract_pcscf_pool_after(&open, "ims0", mark), None);
+        let closed = format!(
+            "{open}<ims0|2> received P-CSCF server IP 10.0.3.10\n\
+             <ims0|2> CHILD_SA ims0{{2}} established with SPIs\n"
+        );
+        assert_eq!(
+            extract_pcscf_pool_after(&closed, "ims0", mark),
+            Some(vec!["10.0.2.10".to_string(), "10.0.3.10".to_string()])
+        );
+        assert_eq!(
+            extract_pcscf_after(&closed, "ims0", mark),
+            Some("10.0.2.10".to_string())
         );
     }
 
@@ -1124,6 +1257,19 @@ mod tests {
     fn extract_swu_pcscf_falls_back_to_ipv6_when_no_ipv4_present() {
         let log = "P-CSCF IPV6 ADDRESS: 2001:db8::1\n";
         assert_eq!(extract_swu_pcscf(log), Some("2001:db8::1".to_string()));
+    }
+
+    #[test]
+    fn extract_swu_pcscf_pool_collects_both_families_in_order() {
+        let log = "P-CSCF IPV6 ADDRESS: 2402:8100::10\n\
+                   P-CSCF IPV4 ADDRESS: 10.0.0.10\n\
+                   P-CSCF IPV4 ADDRESS: 10.0.1.10\n\
+                   P-CSCF IPV4 ADDRESS: 10.0.0.10\n";
+        assert_eq!(
+            extract_swu_pcscf_pool(log),
+            vec!["2402:8100::10", "10.0.0.10", "10.0.1.10"]
+        );
+        assert!(extract_swu_pcscf_pool("STATE CONNECTED\n").is_empty());
     }
 
     #[test]

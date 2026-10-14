@@ -205,6 +205,80 @@ sent (Gm path alive)`, `SUBSCRIBE refused: <status> <reason>`, `terminated by th
 network: <reason>` or `expired without a successful refresh`. Neither line changes
 `can_answer`. An older agent that does not report them prints `unknown`.
 
+## P-CSCF selection and failover
+
+A VoWiFi tunnel negotiation advertises several P-CSCFs, often two to four. The
+supervisor still picks one of them deterministically into `/tmp/pcscf-N` (a
+reorder of the same set never restarts a line). It also publishes the whole list
+to `/tmp/pcscf-N.pool`, and rewrites that file alone when the set changes on a
+healthy line (specs/091).
+
+The IMS agent registers through one candidate at a time. The candidates are tried
+in this order:
+
+1. the last P-CSCF that registered successfully;
+2. the supervisor's choice;
+3. the rest of the pool, IPv4 before IPv6.
+
+When the P-CSCF itself fails while the tunnel is up, the agent marks it
+unavailable and registers through the next candidate straight away. These
+failures count:
+
+- a REGISTER that times out;
+- a connect that is refused or times out;
+- a send that fails on a new connection;
+- a reg-event SUBSCRIBE that goes unanswered, followed by an unanswered Gm probe;
+- the Gm keepalive escalation;
+- a `503` whose `Retry-After` is longer than 128 s.
+
+A mark lasts 330 s after the first failure, doubling up to 2100 s on repeated
+failures. A `503` mark lasts the `Retry-After` period instead. A successful
+registration through an address clears its mark and resets its failure count.
+
+These never mark a P-CSCF:
+
+- `Network is unreachable` or no route, which means the tunnel is down; the agent
+  checks the route as well as the error;
+- the P-CSCF closing a connection;
+- any SIM or authentication failure;
+- any other final response;
+- a reg-event deregistration (including `rejected`);
+- a failure on an address the line has already moved away from.
+
+When every candidate is marked, the line uses its usual renewal backoff, each
+step going to the address whose mark ends soonest, and the usual retry budget
+still restarts the agent. The supervisor rebuilds the tunnel only when no pool
+member answers at all; the new negotiation brings a new pool. Marks and the last
+working P-CSCF are kept in `/tmp/pcscf-N.state`, so an agent restart honours them.
+VoLTE lines run the same logic over their single configured P-CSCF, kept in
+`/tmp/volte-pcscf-<card>.state`.
+
+| Message | Level | Fields |
+|---|---|---|
+| `P-CSCF selected` | INFO | `pcscf`, `reason` (`startup`/`sticky`/`failover`/`pool-replaced`/`all-unavailable`), `cause`, `previous`, `candidates` |
+| `registration through P-CSCF` | INFO / WARN | `pcscf`, `outcome` (`registered`/`failed`), `class` (`timeout`/`transport`/`no-route`/`peer-closed`/`not-pcscf`/`rejected`), `status`, `error` |
+| `P-CSCF marked unavailable` | WARN | `pcscf`, `cause`, `failures`, `until`, `unavailable_secs`, `remaining` |
+| `failing over to the next P-CSCF now` | WARN | `from`, `to`, `cause` |
+| `every P-CSCF is unavailable; retrying on backoff` | WARN | `pcscf`, `pool`, `retry_in_secs` |
+| `every P-CSCF is unavailable; waiting before the startup attempt` | WARN | `pcscf`, `wait_secs` |
+| `failure not attributed to the P-CSCF; not marking` | INFO | `pcscf`, `cause`, `why` (`no-route`/`not-active`) |
+| `P-CSCF pool replaced` | INFO | `pool`, `dropped_marks` |
+| `P-CSCF state unreadable; starting clean` / `could not save P-CSCF state` | WARN | `path`, `error` |
+
+The supervisor adds `P-CSCF pool: …` when it publishes a pool,
+`P-CSCF pool changed (set): …; not restarting`, and
+`P-CSCF <a> unreachable; pool member <b> answers` when it holds off a tunnel
+rebuild because another pool member still answers.
+
+`vowifi-status`/`volte-status` print two lines after `reg_subscription_last_failure`:
+
+```text
+    pcscf: 10.0.1.10 (pool: 10.0.1.10, 10.0.0.10)
+    pcscf_unavailable: 10.0.0.10 until 2026-10-14T10:08:41+00:00
+```
+
+To forget every mark on a line, delete `/tmp/pcscf-N.state` and restart its agent.
+
 ## Grafana dashboard
 
 The "GSM-SIP Bridge" dashboard is auto-provisioned on first boot of the

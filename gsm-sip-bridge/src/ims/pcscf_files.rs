@@ -1,0 +1,119 @@
+//! The per-line P-CSCF files beside `/tmp/pcscf-N` (specs/091,
+//! `contracts/files.md`): the pool the supervisor publishes and the state the
+//! agent keeps across its own restarts.
+//!
+//! Shared by both sides so the writer and the reader cannot disagree on a
+//! path or a format. The selection file itself (`/tmp/pcscf-N`) is untouched:
+//! `healthcheck`, the keepalive loop and `EpdgTransport` all read it as a
+//! single address (FR-004).
+
+use std::io;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+
+/// `/tmp/pcscf-N.pool` for the selection file `/tmp/pcscf-N`.
+pub fn pool_path(selection_path: &str) -> PathBuf {
+    PathBuf::from(format!("{selection_path}.pool"))
+}
+
+/// `/tmp/pcscf-N.state` for the selection file `/tmp/pcscf-N`.
+pub fn state_path(selection_path: &str) -> PathBuf {
+    PathBuf::from(format!("{selection_path}.state"))
+}
+
+/// One address per line, trailing newline.
+pub fn render_pool<S: AsRef<str>>(pool: &[S]) -> String {
+    let mut out = String::new();
+    for a in pool {
+        out.push_str(a.as_ref());
+        out.push('\n');
+    }
+    out
+}
+
+/// Parses a `.pool` file: blank lines and anything that is not an IP address
+/// are skipped, duplicates dropped, order kept.
+pub fn parse_pool(contents: &str) -> Vec<IpAddr> {
+    let mut out: Vec<IpAddr> = Vec::new();
+    for addr in contents.lines().filter_map(|l| l.trim().parse().ok()) {
+        if !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+    out
+}
+
+/// The published pool, or empty when there is none (a missing or unreadable
+/// file means "no pool published", FR-006).
+pub fn read_pool(path: &Path) -> Vec<IpAddr> {
+    std::fs::read_to_string(path)
+        .map(|c| parse_pool(&c))
+        .unwrap_or_default()
+}
+
+/// Writes `<path>.tmp` and renames it over `path`, so a concurrent reader sees
+/// the old contents or the new, never a torn mix.
+pub fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pcscf-files-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn paths_sit_beside_the_selection_file() {
+        assert_eq!(
+            pool_path("/tmp/pcscf-0"),
+            PathBuf::from("/tmp/pcscf-0.pool")
+        );
+        assert_eq!(
+            state_path("/tmp/pcscf-1"),
+            PathBuf::from("/tmp/pcscf-1.state")
+        );
+    }
+
+    #[test]
+    fn parse_pool_skips_garbage_and_duplicates_and_keeps_order() {
+        let pool =
+            parse_pool("10.0.1.10\n\nnot-an-address\n2402:8100::10\n 10.0.0.10 \n10.0.1.10\n");
+        let want: Vec<IpAddr> = ["10.0.1.10", "2402:8100::10", "10.0.0.10"]
+            .iter()
+            .map(|a| a.parse().unwrap())
+            .collect();
+        assert_eq!(pool, want);
+    }
+
+    #[test]
+    fn a_rendered_pool_parses_back() {
+        let rendered = render_pool(&["10.0.0.10", "10.0.1.10"]);
+        assert_eq!(rendered, "10.0.0.10\n10.0.1.10\n");
+        assert_eq!(parse_pool(&rendered).len(), 2);
+    }
+
+    #[test]
+    fn write_atomic_replaces_the_file_and_leaves_no_temp_behind() {
+        let dir = temp_dir();
+        let path = dir.join("pcscf-0.pool");
+        write_atomic(&path, "10.0.0.10\n").unwrap();
+        write_atomic(&path, "10.0.1.10\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "10.0.1.10\n");
+        assert!(!dir.join("pcscf-0.pool.tmp").exists());
+        assert!(read_pool(&dir.join("missing.pool")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

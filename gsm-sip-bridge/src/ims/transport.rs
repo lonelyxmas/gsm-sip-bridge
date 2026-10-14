@@ -83,6 +83,9 @@ pub type TransportResult<T> = Result<T, TransportError>;
 pub struct ImsTransportHandle {
     /// Where to send SIP.
     pub pcscf: SocketAddr,
+    /// Every P-CSCF the attachment advertised, for failover (specs/091). Never
+    /// empty: `[pcscf.ip()]` when no wider pool was published (FR-006).
+    pub pool: Vec<IpAddr>,
     /// How this transport reached that address — carried into logs and
     /// operator-facing status so "which P-CSCF, and where did it come from"
     /// is always answerable (FR-009).
@@ -154,8 +157,15 @@ impl ImsTransport for EpdgTransport {
             return Ok(handle.clone());
         }
         let addr = self.read_pcscf()?;
+        let mut pool = crate::ims::pcscf_files::read_pool(&crate::ims::pcscf_files::pool_path(
+            &self.pcscf_source_path,
+        ));
+        if pool.is_empty() {
+            pool.push(addr);
+        }
         let handle = ImsTransportHandle {
             pcscf: SocketAddr::new(addr, self.pcscf_port),
+            pool,
             descriptor: format!("ePDG tunnel, P-CSCF from {}", self.pcscf_source_path),
         };
         self.prepared = Some(handle.clone());
@@ -200,6 +210,40 @@ mod tests {
 
         assert_eq!(handle.pcscf, "10.1.2.3:5060".parse().unwrap());
         assert!(handle.descriptor.contains("ePDG"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn epdg_prepare_reads_the_published_pool_beside_the_selection() {
+        let path = temp_pcscf_file("10.0.0.10\n");
+        let pool_path = crate::ims::pcscf_files::pool_path(&path.to_string_lossy());
+        std::fs::write(
+            &pool_path,
+            "10.0.1.10\ngarbage\n\n10.0.0.10\n2402:8100::10\n",
+        )
+        .unwrap();
+        let mut t = EpdgTransport::new(path.to_string_lossy(), 5060);
+
+        let handle = t.prepare().unwrap();
+
+        let want: Vec<IpAddr> = ["10.0.1.10", "10.0.0.10", "2402:8100::10"]
+            .iter()
+            .map(|a| a.parse().unwrap())
+            .collect();
+        assert_eq!(handle.pool, want);
+        assert_eq!(handle.pcscf, "10.0.0.10:5060".parse().unwrap());
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&pool_path).ok();
+    }
+
+    #[test]
+    fn epdg_prepare_without_a_pool_uses_the_selection_alone() {
+        let path = temp_pcscf_file("10.0.0.10\n");
+        let mut t = EpdgTransport::new(path.to_string_lossy(), 5060);
+
+        let handle = t.prepare().unwrap();
+
+        assert_eq!(handle.pool, vec!["10.0.0.10".parse::<IpAddr>().unwrap()]);
         std::fs::remove_file(&path).ok();
     }
 

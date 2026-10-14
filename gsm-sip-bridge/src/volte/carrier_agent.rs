@@ -248,6 +248,17 @@ pub(crate) fn run(
         reassembly,
         pbx_registered,
         app_config,
+        // VoLTE keeps its one configured P-CSCF (specs/091 R11): the same
+        // bookkeeping and status, with no alternate to move to.
+        pcscf_pool: crate::ims::agent::pcscf_pool::PcscfPool::new(
+            pcscf.ip(),
+            Vec::new(),
+            Some(std::path::PathBuf::from(format!(
+                "/tmp/volte-pcscf-{}.state",
+                line.card_id
+            ))),
+        ),
+        pcscf_source: None,
         progress: Arc::clone(progress),
         agent_label: "volte-ims-agent",
         agent_kind: crate::control::protocol::AgentKind::Volte,
