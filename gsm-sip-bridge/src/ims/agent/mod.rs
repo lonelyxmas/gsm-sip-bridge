@@ -24,6 +24,7 @@
 //! | A bridged call's state and every way it ends | [`call`] |
 //! | Gm connection liveness and repair | [`ping`] |
 //! | The reg-event subscription's transaction and dialog | [`reg_subscription`] |
+//! | Which advertised P-CSCF to register through, and which to avoid | [`pcscf_pool`] |
 //! | RFC 4028 session-timer refresh on a placed call | [`session_refresh`] |
 //! | The veth link to Agent B, and the RTP relay | [`veth`] |
 //! | The `probe-inbound` diagnostic | [`probe`] |
@@ -31,6 +32,7 @@
 mod call;
 mod inbound;
 mod origination;
+pub(crate) mod pcscf_pool;
 mod ping;
 mod probe;
 mod reg_subscription;
@@ -51,10 +53,10 @@ use crate::ims::observability;
 use crate::ims::sdp;
 use crate::ims::session::{
     attempt_renewal, evaluate_reg_notify, extract_caller, header_uri, log_superseded_notify,
-    map_registration_error, map_registration_status_code, next_backoff, respond, respond_notify,
-    send_reg_subscribe, send_sms_delivery_report, start_inbound, to_unix,
-    unresolved_caller_diagnostic, DeregEvent, Deregistration, Inbound, SubState, SubscribeRefresh,
-    SubscribeRequest,
+    map_registration_error, map_registration_status_code, next_backoff, register_checked, respond,
+    respond_notify, send_reg_subscribe, send_sms_delivery_report, start_inbound, to_unix,
+    unresolved_caller_diagnostic, DeregEvent, Deregistration, Inbound, RegisterFailure, SubState,
+    SubscribeRefresh, SubscribeRequest,
 };
 use crate::ims::sip_client::{
     build_200_ok_message, build_415_unsupported_media, build_486_busy_here,
@@ -85,6 +87,7 @@ use call::{
 use origination::{
     begin_origination, tick_pending_origination, OriginationStatus, PendingOrigination,
 };
+use pcscf_pool::{cause_of, FailureCause, PcscfPool, SelectReason};
 use ping::{cseq_method, parse_cseq_number, probe_gm_connection, PingState};
 use reg_subscription::{EndpointFailureCause, NotifyMatch, RegSubscription, SubAction, SubKind};
 use session_refresh::{RefreshVerdict, Refresher};
@@ -395,6 +398,14 @@ fn run_inner(
         pbx_registered: None,
         app_config,
         progress: Arc::clone(&progress),
+        pcscf_pool: PcscfPool::new(
+            pcscf_addr,
+            transport_handle.pool.clone(),
+            Some(crate::ims::pcscf_files::state_path(
+                &config.pcscf_source_path,
+            )),
+        ),
+        pcscf_source: Some(config.pcscf_source_path.clone()),
         agent_label: "vowifi-ims-agent",
         agent_kind: AgentKind::Ims,
     })
@@ -756,6 +767,14 @@ pub(crate) struct InboundParams<'a> {
     /// the startup path is monitored too, and shared with the dispatch loop
     /// here so every blocking region publishes which phase it is in.
     pub progress: Arc<watchdog::Progress>,
+    /// The P-CSCFs this line may register through, with any marks a previous
+    /// run left (specs/091). Built by the caller: VoWiFi from the published
+    /// pool, VoLTE from its single configured P-CSCF.
+    pub pcscf_pool: PcscfPool,
+    /// The supervisor's selection file (`/tmp/pcscf-N`), whose pool is
+    /// re-read before every renewal (FR-014). `None` on VoLTE, where nothing
+    /// republishes the P-CSCF.
+    pub pcscf_source: Option<String>,
     /// What to call this agent in logs.
     pub agent_label: &'a str,
     /// Which agent this is, for the `transport` label its reports land under.
@@ -792,9 +811,12 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         pbx_registered,
         app_config,
         progress,
+        pcscf_pool,
+        pcscf_source,
         agent_label,
         agent_kind,
     } = p;
+    let mut pcscf_pool = pcscf_pool;
 
     // Best-effort: a store that fails to open must not stop the agent from
     // registering and carrying calls (FR-018) — call history is simply
@@ -851,28 +873,33 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             },
             None => None,
         };
-        match crate::ims::register_session(reg_cfg) {
+        let startup_wait = |d: Duration| {
+            // Asleep by design, so `Dormant`; the attempt after it is startup
+            // work again and gets a fresh budget.
+            progress.enter(watchdog::Phase::Dormant);
+            std::thread::sleep(d);
+            progress.enter(watchdog::Phase::Startup);
+        };
+        match register_via_pool(
+            &mut pcscf_pool,
+            reg_cfg,
+            |cfg| register_checked(cfg, "IMS registration failed"),
+            |addr| crate::ims::route_to(addr, reg_cfg.pcscf_port).is_ok(),
+            startup_wait,
+        ) {
             Ok(s) => s,
-            Err(e) => {
+            Err(f) => {
                 drop(_guard);
-                obs.report_registration_attempt(map_registration_error(&e));
+                obs.report_registration_attempt(match f.status {
+                    Some(status) => map_registration_status_code(status),
+                    None => map_registration_error(&f.error),
+                });
                 obs.set_registered(false);
                 obs.set_tunnel_up(false);
-                return Err(e);
+                return Err(f.error);
             }
         }
     };
-    if session.status != 200 {
-        let status = session.status;
-        let reason = session.reason.clone();
-        obs.report_registration_attempt(map_registration_status_code(status));
-        obs.set_registered(false);
-        obs.set_tunnel_up(false);
-        session.cleanup();
-        return Err(BridgeError::Ims(format!(
-            "IMS registration failed: {status} {reason}"
-        )));
-    }
     tracing::info!(
         agent = agent_label,
         "registered, listening for inbound calls"
@@ -896,6 +923,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
     // while we still believe it is live (FR-023).
     let granted_expires = session.granted_expires(crate::ims::DEFAULT_EXPIRES);
     let status = Arc::new(Mutex::new(crate::ims::RegistrationStatus {
+        pcscf: pcscf_pool.snapshot(SystemTime::now()),
         state: crate::ims::RegistrationState::Registered,
         registered_at: Some(SystemTime::now()),
         expires_at: Some(SystemTime::now() + Duration::from_secs(granted_expires as u64)),
@@ -947,7 +975,9 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             obs: &obs,
             progress: &progress,
             reg_rejected_cooldown,
+            pcscf_source: pcscf_source.as_deref(),
         },
+        pcscf_pool,
         place_call_rx,
     );
     session.unregister();
@@ -1720,6 +1750,8 @@ struct DispatchParams<'a> {
     /// `config::VowifiConfig::reg_rejected_cooldown_sec`; consumed by
     /// [`LoopState::on_network_deregistration`].
     reg_rejected_cooldown: Duration,
+    /// See `InboundParams::pcscf_source`.
+    pcscf_source: Option<&'a str>,
 }
 
 impl DispatchParams<'_> {
@@ -1829,6 +1861,12 @@ struct LoopState {
     /// The reg-event subscription: its transaction, dialog and timers
     /// (specs/090). The loop performs the sends it asks for.
     reg_sub: RegSubscription,
+    /// Which P-CSCF each renewal goes to, and which are marked unavailable
+    /// (specs/091). Handed over from the startup registration.
+    pool: PcscfPool,
+    /// A spec 090 qualifying endpoint failure raised by the last subscription
+    /// action, waiting for `perform_sub_action` to mark the P-CSCF.
+    endpoint_failure_seen: Option<String>,
 }
 
 impl LoopState {
@@ -1853,6 +1891,11 @@ impl LoopState {
             unreadable_caller_warned: None,
             recent_declines: RecentDeclines::default(),
             reg_sub: RegSubscription::new(),
+            // Replaced by `dispatch_loop` with the pool the startup
+            // registration chose from; this placeholder is only ever seen by
+            // tests that build a bare `LoopState`.
+            pool: PcscfPool::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), Vec::new(), None),
+            endpoint_failure_seen: None,
         }
     }
 
@@ -2084,6 +2127,11 @@ impl LoopState {
     fn schedule_renewal_retry(&mut self) -> BridgeResult<()> {
         self.next_renewal_attempt = Some(Instant::now() + self.backoff);
         self.backoff = next_backoff(self.backoff, RETRY_MAX_BACKOFF);
+        self.count_renewal_failure()
+    }
+
+    /// One more failed renewal on the budget; `Err` once it is spent.
+    fn count_renewal_failure(&mut self) -> BridgeResult<()> {
         self.consecutive_renewal_failures += 1;
         if self.consecutive_renewal_failures >= MAX_CONSECUTIVE_RENEWAL_FAILURES {
             return Err(BridgeError::Ims(format!(
@@ -2094,15 +2142,196 @@ impl LoopState {
         }
         Ok(())
     }
+
+    /// A renewal through `addr` failed (specs/091 research R7).
+    ///
+    /// A failure of the P-CSCF itself, seen over a live route, marks it. If
+    /// another candidate is still eligible the next attempt goes there at once
+    /// — the failure is counted on the budget, but the backoff does not move
+    /// (clarification Q1). Only with every candidate marked does the existing
+    /// ladder apply (FR-013), each step aimed at the soonest-expiring mark.
+    /// Anything else takes exactly the path it always did.
+    fn on_renewal_failure(
+        &mut self,
+        addr: IpAddr,
+        failure: &RegisterFailure,
+        routed: bool,
+        now: SystemTime,
+    ) -> BridgeResult<()> {
+        let Some(cause) = cause_of(failure) else {
+            return self.schedule_renewal_retry();
+        };
+        if !routed {
+            tracing::info!(
+                pcscf = %addr,
+                cause = %cause,
+                why = "no-route",
+                "failure not attributed to the P-CSCF; not marking"
+            );
+            return self.schedule_renewal_retry();
+        }
+        let marked = self.pool.on_failure(addr, cause.clone(), now).is_some();
+        match self.pool.next_eligible(now) {
+            Some(next) if marked => {
+                tracing::warn!(
+                    from = %addr,
+                    to = %next,
+                    cause = %cause,
+                    "failing over to the next P-CSCF now"
+                );
+                self.next_renewal_attempt = None;
+                self.force_renewal = true;
+                self.count_renewal_failure()
+            }
+            None => {
+                let result = self.schedule_renewal_retry();
+                tracing::warn!(
+                    pool = %self
+                        .pool
+                        .candidates(now)
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    retry_in_secs = self
+                        .next_renewal_attempt
+                        .map_or(0, |t| t.saturating_duration_since(Instant::now()).as_secs()),
+                    "every P-CSCF is unavailable; retrying on backoff"
+                );
+                result
+            }
+            Some(_) => self.schedule_renewal_retry(),
+        }
+    }
+
+    /// Marks the active P-CSCF for a failure seen on the live registration —
+    /// spec 090's qualifying endpoint failure, or the Gm keepalive escalation
+    /// (FR-007). Not again while it is already marked: one episode can raise
+    /// both signals, and it must count once. The re-registration they trigger
+    /// then selects the next candidate.
+    fn mark_active_pcscf(&mut self, cause: FailureCause, port: u16) {
+        let Some(addr) = self.pool.active() else {
+            return;
+        };
+        let now = SystemTime::now();
+        if self.pool.is_marked(addr, now) {
+            return;
+        }
+        if crate::ims::route_to(addr, port).is_err() {
+            tracing::info!(
+                pcscf = %addr,
+                cause = %cause,
+                why = "no-route",
+                "failure not attributed to the P-CSCF; not marking"
+            );
+            return;
+        }
+        self.pool.on_failure(addr, cause, now);
+    }
+}
+
+/// The `"registration through P-CSCF"` outcome line for a failed attempt
+/// (FR-019).
+fn log_attempt_failure(addr: IpAddr, f: &RegisterFailure) {
+    let class = match f.status {
+        Some(_) => "rejected",
+        None => crate::ims::classify_register_failure(&f.error).as_str(),
+    };
+    tracing::warn!(
+        pcscf = %addr,
+        outcome = "failed",
+        class,
+        status = f.status.map(|s| s.to_string()).unwrap_or_default(),
+        error = %f.error,
+        "registration through P-CSCF"
+    );
+}
+
+/// The startup registration, through the pool (specs/091 research R8).
+///
+/// A failure of the P-CSCF itself, over a live route, marks it and the next
+/// eligible candidate is tried straight away, in this process — at most once
+/// per candidate. Any other failure, or running out of candidates, returns it
+/// exactly as a single attempt always did, so the supervisor's exit-driven
+/// recovery (`sim_recovery`) sees the same exits.
+///
+/// If every candidate is already marked when this starts (a restart inside the
+/// marks' window), `wait` sleeps until the soonest mark ends, at most
+/// [`RETRY_MAX_BACKOFF`], before the one attempt: otherwise the supervisor's
+/// quick respawn would retry a dead pool faster than the renewal ladder ever
+/// does (FR-013, SC-003).
+///
+/// `register` and `routed` are parameters so the selection logic is testable
+/// without a modem; production passes `register_checked` and `route_to`.
+fn register_via_pool(
+    pool: &mut PcscfPool,
+    reg_cfg: &ImsRegisterConfig,
+    mut register: impl FnMut(
+        &ImsRegisterConfig,
+    ) -> Result<crate::ims::RegisteredSession, RegisterFailure>,
+    routed: impl Fn(IpAddr) -> bool,
+    mut wait: impl FnMut(Duration),
+) -> Result<crate::ims::RegisteredSession, RegisterFailure> {
+    if !pool.has_unmarked(SystemTime::now()) {
+        let wait_for = pool
+            .soonest_expiry(SystemTime::now())
+            .min(RETRY_MAX_BACKOFF);
+        tracing::warn!(
+            pcscf = %pool.next_eligible(SystemTime::now() + wait_for).map(|a| a.to_string()).unwrap_or_default(),
+            wait_secs = wait_for.as_secs(),
+            "every P-CSCF is unavailable; waiting before the startup attempt"
+        );
+        wait(wait_for);
+    }
+    loop {
+        let selection = pool.select(SystemTime::now());
+        match register(&reg_cfg.with_pcscf(selection.addr)) {
+            Ok(session) => {
+                pool.on_registered(selection.addr);
+                tracing::info!(pcscf = %selection.addr, outcome = "registered", "registration through P-CSCF");
+                return Ok(session);
+            }
+            Err(failure) => {
+                log_attempt_failure(selection.addr, &failure);
+                let Some(cause) = cause_of(&failure) else {
+                    return Err(failure);
+                };
+                if !routed(selection.addr) {
+                    tracing::info!(
+                        pcscf = %selection.addr,
+                        cause = %cause,
+                        why = "no-route",
+                        "failure not attributed to the P-CSCF; not marking"
+                    );
+                    return Err(failure);
+                }
+                let now = SystemTime::now();
+                pool.on_failure(selection.addr, cause.clone(), now);
+                match pool.next_eligible(now) {
+                    Some(next) if selection.reason != SelectReason::AllUnavailable => {
+                        tracing::warn!(
+                            from = %selection.addr,
+                            to = %next,
+                            cause = %cause,
+                            "failing over to the next P-CSCF now"
+                        );
+                    }
+                    _ => return Err(failure),
+                }
+            }
+        }
+    }
 }
 
 fn dispatch_loop(
     session: &mut crate::ims::RegisteredSession,
     inbound: &mut Inbound,
     p: &DispatchParams,
+    pool: PcscfPool,
     place_call_rx: mpsc::Receiver<PendingPlaceCall>,
 ) -> BridgeResult<()> {
     let mut st = LoopState::new();
+    st.pool = pool;
     let respond_on_client = p.respond_on_client;
     if respond_on_client {
         tracing::warn!(
@@ -2257,6 +2486,7 @@ impl LoopState {
         guard.rejected_until = self.rejection.map(|r| r.until_wall);
         guard.reg_subscription = self.reg_sub.health(Instant::now(), SystemTime::now());
         guard.reg_subscription_last_failure = self.reg_sub.last_failure().cloned();
+        guard.pcscf = self.pool.snapshot(SystemTime::now());
     }
 
     /// A hangup can start on *either* side. The carrier's arrives as a BYE;
@@ -2909,6 +3139,9 @@ impl LoopState {
             p.obs.set_registered(false);
             p.obs.set_gm_connection_up(false);
         }
+        if let Some(cause) = self.endpoint_failure_seen.take() {
+            self.mark_active_pcscf(FailureCause::EndpointFailure(cause), p.reg_cfg.pcscf_port);
+        }
     }
 
     /// Performs a [`SubAction`] and feeds each result back to the tracker,
@@ -2965,6 +3198,10 @@ impl LoopState {
                 SubAction::EndpointFailure { cause, call_id } => {
                     escalated |=
                         self.on_qualifying_endpoint_failure(cause, call_id.as_deref(), status);
+                    // Marked by `perform_sub_action`, which knows the port the
+                    // route probe needs. Recorded even when the re-registration
+                    // was already pending: the P-CSCF is dead either way.
+                    self.endpoint_failure_seen = Some(cause.to_string());
                     None
                 }
             };
@@ -3246,7 +3483,7 @@ impl LoopState {
         // `force_renewal`, which the renewal gate below honours.
         if !self.busy() {
             let _phase = p.progress.phase_guard(watchdog::Phase::GmProbe);
-            probe_gm_connection(
+            if probe_gm_connection(
                 session,
                 inbound,
                 p.obs,
@@ -3254,7 +3491,9 @@ impl LoopState {
                 &mut self.gm_conn,
                 &mut self.reconnect_attempts,
                 &mut self.force_renewal,
-            );
+            ) {
+                self.mark_active_pcscf(FailureCause::GmKeepalive, p.reg_cfg.pcscf_port);
+            }
         }
 
         // Never renew mid-call — that would tear down the transport a call's
@@ -3385,8 +3624,24 @@ impl LoopState {
                 return self.schedule_renewal_retry();
             }
         }
-        match attempt_renewal(p.reg_cfg) {
+        // The supervisor may have republished the pool since the last attempt
+        // (a rebuild, or an address joining): candidates and marks follow it
+        // (FR-014). Unreadable files leave the pool as it was.
+        if let Some(src) = p.pcscf_source {
+            if let Some(selection) = std::fs::read_to_string(src)
+                .ok()
+                .and_then(|s| s.trim().parse::<IpAddr>().ok())
+            {
+                let pool =
+                    crate::ims::pcscf_files::read_pool(&crate::ims::pcscf_files::pool_path(src));
+                self.pool.replace_pool(pool, selection);
+            }
+        }
+        let target = self.pool.select(SystemTime::now()).addr;
+        match attempt_renewal(&p.reg_cfg.with_pcscf(target)) {
             Ok(new_session) => {
+                self.pool.on_registered(target);
+                tracing::info!(pcscf = %target, outcome = "registered", "registration through P-CSCF");
                 session.cleanup();
                 *session = new_session;
                 // A renewal negotiates a fresh Gm SA on fresh ports, so the old
@@ -3429,14 +3684,15 @@ impl LoopState {
                 let action = self.reg_sub.on_new_registration(Instant::now());
                 self.perform_sub_action(session, p, action);
             }
-            Err(e) => {
+            Err(failure) => {
+                log_attempt_failure(target, &failure);
+                let e = &failure.error;
                 tracing::warn!(
                     error = %e,
                     retry_in_secs = self.backoff.as_secs(),
                     "registration renewal failed, retrying with backoff"
                 );
-                p.obs
-                    .report_registration_attempt(map_registration_error(&e));
+                p.obs.report_registration_attempt(map_registration_error(e));
                 p.obs.set_registered(false);
                 p.obs.set_tunnel_up(false);
                 let mut guard = p.status.lock().unwrap_or_else(|e| e.into_inner());
@@ -3454,7 +3710,8 @@ impl LoopState {
                 // Not a blocking sleep: the loop keeps dispatching inbound SIP
                 // every iteration in the meantime (see `next_renewal_attempt`'s
                 // doc comment).
-                return self.schedule_renewal_retry();
+                let routed = crate::ims::route_to(target, p.reg_cfg.pcscf_port).is_ok();
+                return self.on_renewal_failure(target, &failure, routed, SystemTime::now());
             }
         }
         Ok(())
@@ -5508,6 +5765,394 @@ mod tests {
         let peer = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         peer
+    }
+
+    // --- specs/091: P-CSCF failover in the agent ---
+
+    use pcscf_pool::{FailureCause as PoolCause, PcscfPool as Pool, SelectReason as Reason};
+    use std::cell::RefCell;
+
+    /// A reg config aimed at `addr:port`. Its modem is never opened: every test
+    /// below stubs the registration itself.
+    fn pcscf_cfg(addr: IpAddr, port: u16, use_tcp: bool) -> ImsRegisterConfig {
+        ImsRegisterConfig {
+            modem_port: PathBuf::from("/dev/null"),
+            pcsc_reader: false,
+            pcscf_addr: addr,
+            pcscf_port: port,
+            mcc: "001".into(),
+            mnc: "01".into(),
+            imsi: None,
+            imei: None,
+            use_tcp,
+            sec_agree: false,
+            msisdn: None,
+            access_network_info: crate::ims::ACCESS_NETWORK_WLAN.into(),
+            register_uri_home_domain: true,
+            gm_auth_alg: None,
+            gm_cipher_alg: None,
+        }
+    }
+
+    fn lo(n: u8) -> IpAddr {
+        IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, n))
+    }
+
+    /// The transport half of a registration attempt, for real: connect to the
+    /// candidate and send a REGISTER. A refused connect and an unanswered
+    /// REGISTER fail exactly as `register_session` does. Getting past that
+    /// needs a SIM — MOCK JUSTIFICATION (constitution I): no modem or SIM in
+    /// CI — so a connection that is accepted counts as registered.
+    fn transport_only_register(
+        tried: &RefCell<Vec<IpAddr>>,
+    ) -> impl FnMut(&ImsRegisterConfig) -> Result<crate::ims::RegisteredSession, RegisterFailure> + '_
+    {
+        move |cfg| {
+            tried.borrow_mut().push(cfg.pcscf_addr);
+            let addr = SocketAddr::new(cfg.pcscf_addr, cfg.pcscf_port);
+            let mut t = crate::ims::sip_client::SipTransport::connect(addr, cfg.use_tcp)?;
+            if !cfg.use_tcp {
+                t.send_and_recv("REGISTER sip:ims.example.test SIP/2.0\r\n\r\n")?;
+            }
+            Ok(crate::ims::test_session_with_sa(None, addr, None))
+        }
+    }
+
+    /// B listens on `127.0.0.2:P`; the same port on `127.0.0.1` (A) is closed.
+    fn a_refuses_b_listens() -> (std::net::TcpListener, u16) {
+        let b = std::net::TcpListener::bind((lo(2), 0)).unwrap();
+        let port = b.local_addr().unwrap().port();
+        (b, port)
+    }
+
+    fn rejected(status: u16, retry_after: Option<u64>) -> RegisterFailure {
+        RegisterFailure {
+            error: BridgeError::Ims(format!("renewal REGISTER rejected: {status} X")),
+            status: Some(status),
+            retry_after: retry_after.map(Duration::from_secs),
+        }
+    }
+
+    fn io_failure(text: &str) -> RegisterFailure {
+        BridgeError::Ims(text.into()).into()
+    }
+
+    const REFUSED: &str = "TCP connect to 127.0.0.1:5060 failed: Connection refused (os error 111)";
+
+    #[test]
+    fn startup_fails_over_to_the_next_pcscf_in_the_same_process() {
+        // US1 / R8: a refused A is marked and B is tried in the same call.
+        let (_b, port) = a_refuses_b_listens();
+        let mut pool = Pool::new(lo(1), vec![lo(1), lo(2)], None);
+        let tried = RefCell::new(Vec::new());
+        let waited = RefCell::new(Vec::new());
+        let session = register_via_pool(
+            &mut pool,
+            &pcscf_cfg(lo(1), port, true),
+            transport_only_register(&tried),
+            |_| true,
+            |d| waited.borrow_mut().push(d),
+        );
+        assert!(session.is_ok());
+        assert_eq!(*tried.borrow(), vec![lo(1), lo(2)]);
+        assert!(pool.is_marked(lo(1), SystemTime::now()));
+        assert_eq!(pool.active(), Some(lo(2)));
+        assert!(waited.borrow().is_empty());
+    }
+
+    #[test]
+    fn startup_fails_over_after_an_unanswered_register() {
+        let silent = std::net::UdpSocket::bind((lo(1), 0)).unwrap();
+        let port = silent.local_addr().unwrap().port();
+        let _b = std::net::UdpSocket::bind((lo(2), port)).unwrap();
+        let mut pool = Pool::new(lo(1), vec![lo(1), lo(2)], None);
+        let tried = RefCell::new(Vec::new());
+        let mut first = true;
+        let mut register = transport_only_register(&tried);
+        let result = register_via_pool(
+            &mut pool,
+            &pcscf_cfg(lo(1), port, false),
+            |cfg| {
+                if std::mem::take(&mut first) {
+                    register(cfg)
+                } else {
+                    tried.borrow_mut().push(cfg.pcscf_addr);
+                    Ok(crate::ims::test_session_with_sa(
+                        None,
+                        SocketAddr::new(cfg.pcscf_addr, port),
+                        None,
+                    ))
+                }
+            },
+            |_| true,
+            |_| {},
+        );
+        assert!(result.is_ok());
+        assert_eq!(*tried.borrow(), vec![lo(1), lo(2)]);
+    }
+
+    #[test]
+    fn startup_without_a_route_marks_nothing_and_exits_as_before() {
+        // FR-009 / edge case: a failure with the tunnel gone is the tunnel's.
+        let (_b, port) = a_refuses_b_listens();
+        let mut pool = Pool::new(lo(1), vec![lo(1), lo(2)], None);
+        let tried = RefCell::new(Vec::new());
+        let result = register_via_pool(
+            &mut pool,
+            &pcscf_cfg(lo(1), port, true),
+            transport_only_register(&tried),
+            |_| false,
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert_eq!(*tried.borrow(), vec![lo(1)]);
+        assert!(!pool.is_marked(lo(1), SystemTime::now()));
+    }
+
+    #[test]
+    fn startup_returns_a_non_pcscf_failure_unchanged() {
+        let mut pool = Pool::new(lo(1), vec![lo(1), lo(2)], None);
+        let mut calls = 0;
+        let result = register_via_pool(
+            &mut pool,
+            &pcscf_cfg(lo(1), 5060, true),
+            |_| {
+                calls += 1;
+                Err(rejected(403, None))
+            },
+            |_| true,
+            |_| {},
+        );
+        assert_eq!(result.err().and_then(|f| f.status), Some(403));
+        assert_eq!(calls, 1);
+        assert!(!pool.is_marked(lo(1), SystemTime::now()));
+    }
+
+    #[test]
+    fn startup_with_every_pcscf_marked_waits_then_tries_once() {
+        // R8 / SC-003: a restart inside the marks' window cannot outrun the
+        // ladder.
+        for (retry_after, want) in [(30, 30), (600, 120)] {
+            let mut pool = Pool::new(lo(1), vec![lo(1), lo(2)], None);
+            let now = SystemTime::now();
+            pool.select(now);
+            pool.on_failure(
+                lo(1),
+                PoolCause::RetryAfter(Duration::from_secs(retry_after)),
+                now,
+            );
+            pool.select(now);
+            pool.on_failure(lo(2), PoolCause::RetryAfter(Duration::from_secs(5000)), now);
+            let waited = RefCell::new(Vec::new());
+            let mut calls = 0;
+            let result = register_via_pool(
+                &mut pool,
+                &pcscf_cfg(lo(1), 5060, true),
+                |_| {
+                    calls += 1;
+                    Err(io_failure(REFUSED))
+                },
+                |_| true,
+                |d| waited.borrow_mut().push(d),
+            );
+            assert!(result.is_err());
+            assert_eq!(calls, 1, "one attempt after the wait");
+            let w = waited.borrow();
+            assert_eq!(w.len(), 1);
+            assert!(
+                w[0] <= Duration::from_secs(want)
+                    && w[0] + Duration::from_secs(2) >= Duration::from_secs(want),
+                "{retry_after}s mark waited {:?}",
+                w[0]
+            );
+        }
+    }
+
+    fn failing_over_loop() -> LoopState {
+        let mut st = LoopState::new();
+        st.pool = Pool::new(lo(1), vec![lo(1), lo(2)], None);
+        st.pool.select(SystemTime::now());
+        st
+    }
+
+    #[test]
+    fn a_renewal_failure_of_the_pcscf_fails_over_at_once() {
+        // US1 AS1–AS3 / R7: marked, counted, no backoff step, next tick → B.
+        for failure in [
+            io_failure(REFUSED),
+            io_failure("timed out waiting for a SIP response"),
+            rejected(503, Some(600)),
+        ] {
+            let mut st = failing_over_loop();
+            st.on_renewal_failure(lo(1), &failure, true, SystemTime::now())
+                .unwrap();
+            assert!(
+                st.pool.is_marked(lo(1), SystemTime::now()),
+                "{}",
+                failure.error
+            );
+            assert_eq!(st.next_renewal_attempt, None);
+            assert!(st.force_renewal);
+            assert_eq!(st.consecutive_renewal_failures, 1);
+            assert_eq!(st.backoff, RETRY_INITIAL_BACKOFF);
+            let next = st.pool.select(SystemTime::now());
+            assert_eq!((next.addr, next.reason), (lo(2), Reason::Failover));
+        }
+    }
+
+    #[test]
+    fn a_503_retry_after_marks_for_exactly_that_long() {
+        let mut st = failing_over_loop();
+        let now = SystemTime::now();
+        st.on_renewal_failure(lo(1), &rejected(503, Some(600)), true, now)
+            .unwrap();
+        let snap = st.pool.snapshot(now);
+        assert_eq!(
+            snap.unavailable,
+            vec![(lo(1), now + Duration::from_secs(600))]
+        );
+    }
+
+    #[test]
+    fn failures_that_are_not_the_pcscfs_take_todays_ladder() {
+        // US2 AS1/AS4, R12, clarification Q2.
+        let unreachable =
+            "TCP connect to 127.0.0.1:5060 failed: Network is unreachable (os error 101)";
+        let cases: Vec<(RegisterFailure, bool)> = vec![
+            (io_failure(unreachable), true),
+            (io_failure(REFUSED), false),
+            (io_failure("timed out waiting for a SIP response"), false),
+            (rejected(403, None), true),
+            (rejected(503, None), true),
+            (rejected(503, Some(60)), true),
+            (
+                io_failure("connection closed by peer with no data (0 bytes read)"),
+                true,
+            ),
+            (io_failure("AT+CSIM failed: 0"), true),
+        ];
+        for (failure, routed) in cases {
+            let mut st = failing_over_loop();
+            st.on_renewal_failure(lo(1), &failure, routed, SystemTime::now())
+                .unwrap();
+            assert!(
+                !st.pool.is_marked(lo(1), SystemTime::now()),
+                "{} (routed={routed}) must not mark",
+                failure.error
+            );
+            assert!(st.next_renewal_attempt.is_some(), "{}", failure.error);
+            assert_eq!(
+                st.backoff,
+                next_backoff(RETRY_INITIAL_BACKOFF, RETRY_MAX_BACKOFF)
+            );
+            assert_eq!(st.pool.select(SystemTime::now()).addr, lo(1));
+        }
+    }
+
+    #[test]
+    fn a_reg_event_rejection_marks_no_pcscf() {
+        // US2 AS5.
+        let mut st = failing_over_loop();
+        let d = dereg(DeregEvent::Rejected);
+        st.on_network_deregistration(Instant::now(), false, &d, Duration::from_secs(60))
+            .unwrap();
+        assert!(!st.pool.is_marked(lo(1), SystemTime::now()));
+    }
+
+    #[test]
+    fn with_every_pcscf_dead_the_ladder_runs_and_the_budget_still_ends_it() {
+        // US3 AS1 / SC-003: A then B at once, then the ladder only, each step
+        // at the soonest-expiring mark, and the existing exit.
+        let mut st = failing_over_loop();
+        let now = SystemTime::now();
+        st.on_renewal_failure(lo(1), &io_failure(REFUSED), true, now)
+            .unwrap();
+        assert_eq!(st.next_renewal_attempt, None, "A→B is immediate");
+        let b = st.pool.select(now);
+        assert_eq!(b.addr, lo(2));
+        st.on_renewal_failure(lo(2), &io_failure(REFUSED), true, now)
+            .unwrap();
+        assert!(
+            st.next_renewal_attempt.is_some(),
+            "B's failure takes the ladder"
+        );
+        let mut ladder = vec![RETRY_INITIAL_BACKOFF];
+        let mut outcome = Ok(());
+        while outcome.is_ok() {
+            let target = st.pool.select(now);
+            assert_eq!(target.reason, Reason::AllUnavailable);
+            ladder.push(st.backoff);
+            outcome = st.on_renewal_failure(target.addr, &io_failure(REFUSED), true, now);
+            if outcome.is_ok() {
+                assert!(st.next_renewal_attempt.is_some(), "never immediate again");
+            }
+        }
+        assert_eq!(
+            st.consecutive_renewal_failures,
+            MAX_CONSECUTIVE_RENEWAL_FAILURES
+        );
+        assert!(outcome
+            .unwrap_err()
+            .to_string()
+            .contains("exiting so the supervisor"));
+        assert!(
+            ladder
+                .windows(2)
+                .all(|w| w[1] == next_backoff(w[0], RETRY_MAX_BACKOFF)),
+            "every step after A→B is a ladder step: {ladder:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_configured_pcscf_is_marked_and_keeps_todays_ladder() {
+        // US3 AS2 / R11: VoLTE, or a line with no published pool.
+        let mut st = LoopState::new();
+        st.pool = Pool::new(lo(1), Vec::new(), None);
+        st.pool.select(SystemTime::now());
+        st.on_renewal_failure(lo(1), &io_failure(REFUSED), true, SystemTime::now())
+            .unwrap();
+        assert!(st.pool.is_marked(lo(1), SystemTime::now()));
+        assert!(st.next_renewal_attempt.is_some());
+        assert!(!st.force_renewal);
+        assert_eq!(st.pool.select(SystemTime::now()).addr, lo(1));
+    }
+
+    #[test]
+    fn the_live_registrations_failures_mark_the_active_pcscf_once() {
+        // FR-007: spec 090's endpoint failure and the Gm keepalive escalation
+        // both mark the active P-CSCF; one episode counts once.
+        let mut st = failing_over_loop();
+        st.mark_active_pcscf(PoolCause::GmKeepalive, 5060);
+        assert!(st.pool.is_marked(lo(1), SystemTime::now()));
+        st.mark_active_pcscf(PoolCause::EndpointFailure("subscribe-timeout".into()), 5060);
+        let snap = st.pool.snapshot(SystemTime::now());
+        assert_eq!(snap.unavailable.len(), 1);
+        let until = snap.unavailable[0].1;
+        let left = until.duration_since(SystemTime::now()).unwrap();
+        assert!(left <= Duration::from_secs(330), "counted once: {left:?}");
+        assert_eq!(st.pool.select(SystemTime::now()).addr, lo(2));
+    }
+
+    #[test]
+    fn one_lines_failover_never_touches_anothers_state() {
+        // FR-018: per-line pool and state file.
+        let dir = std::env::temp_dir().join(format!("pcscf-lines-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut line0 = LoopState::new();
+        line0.pool = Pool::new(lo(1), vec![lo(1), lo(2)], Some(dir.join("pcscf-0.state")));
+        line0.pool.select(SystemTime::now());
+        let mut line1 = LoopState::new();
+        line1.pool = Pool::new(lo(1), vec![lo(1), lo(2)], Some(dir.join("pcscf-1.state")));
+        line1.pool.select(SystemTime::now());
+        line0
+            .on_renewal_failure(lo(1), &io_failure(REFUSED), true, SystemTime::now())
+            .unwrap();
+        assert!(line0.pool.is_marked(lo(1), SystemTime::now()));
+        assert!(!line1.pool.is_marked(lo(1), SystemTime::now()));
+        assert!(!dir.join("pcscf-1.state").exists());
+        let reloaded = Pool::new(lo(1), vec![lo(1), lo(2)], Some(dir.join("pcscf-1.state")));
+        assert!(!reloaded.is_marked(lo(1), SystemTime::now()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn registered_status() -> Mutex<crate::ims::RegistrationStatus> {

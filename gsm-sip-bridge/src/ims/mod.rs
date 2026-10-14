@@ -138,6 +138,7 @@ pub(crate) const UAS_ALLOW: &str = "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE, 
 pub(crate) const UAS_INVITE_ALLOW: &str =
     "INVITE, ACK, CANCEL, BYE, OPTIONS, UPDATE, MESSAGE, NOTIFY";
 
+#[derive(Clone)]
 pub struct ImsRegisterConfig {
     pub modem_port: PathBuf,
     /// This line's SIM comes from a physical PC/SC reader
@@ -186,6 +187,106 @@ pub struct ImsRegisterConfig {
     /// See `gm_ipsec::select_security_server`.
     pub gm_auth_alg: Option<String>,
     pub gm_cipher_alg: Option<String>,
+}
+
+impl ImsRegisterConfig {
+    /// This configuration aimed at another P-CSCF (specs/091): one registration
+    /// attempt through a chosen candidate, everything else unchanged.
+    pub fn with_pcscf(&self, addr: IpAddr) -> Self {
+        Self {
+            pcscf_addr: addr,
+            ..self.clone()
+        }
+    }
+}
+
+/// What a failed registration attempt says about the P-CSCF it went to
+/// (specs/091 research R4). Only [`Self::Timeout`] and [`Self::Transport`] are
+/// the P-CSCF's own fault; everything else never marks it (FR-009).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureClass {
+    /// The REGISTER transaction timed out: no response at all.
+    Timeout,
+    /// The P-CSCF could not be reached over a working route: connect refused
+    /// or timed out, or a send on the new connection failed.
+    Transport,
+    /// No route to the P-CSCF: the tunnel or attachment is down, which every
+    /// P-CSCF sits behind alike (#124's `Network is unreachable`).
+    NoRoute,
+    /// The P-CSCF closed the connection. A reconnect, not a mark, is the
+    /// remedy (clarification Q2).
+    PeerClosed,
+    /// Anything else: the SIM, AKA, a malformed response.
+    NotPcscf,
+}
+
+impl FailureClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FailureClass::Timeout => "timeout",
+            FailureClass::Transport => "transport",
+            FailureClass::NoRoute => "no-route",
+            FailureClass::PeerClosed => "peer-closed",
+            FailureClass::NotPcscf => "not-pcscf",
+        }
+    }
+}
+
+/// Classifies a registration failure from its error text, in the manner of
+/// `session::map_registration_error`: `register_session` reports every
+/// transport failure as a string carrying the `io::Error`'s own text, which
+/// ends `(os error N)`. The errno is matched first so a localized libc message
+/// still classifies; the English text covers errors with no errno (a connect
+/// timeout).
+pub fn classify_register_failure(e: &crate::error::BridgeError) -> FailureClass {
+    let msg = e.to_string().to_ascii_lowercase();
+    if msg.contains("os error 101")
+        || msg.contains("os error 113")
+        || msg.contains("network is unreachable")
+        || msg.contains("no route to host")
+    {
+        FailureClass::NoRoute
+    } else if (msg.contains("connect to ") && msg.contains(" failed"))
+        || msg.contains("tcp send failed")
+        || msg.contains("udp send failed")
+    {
+        FailureClass::Transport
+    } else if msg.contains("timed out waiting for a sip response") {
+        FailureClass::Timeout
+    } else if msg.contains("connection closed by peer") || msg.contains("recv failed") {
+        FailureClass::PeerClosed
+    } else {
+        FailureClass::NotPcscf
+    }
+}
+
+/// Whether the kernel has a route to `addr` right now (specs/091 R5). A UDP
+/// `connect()` only performs the route lookup — nothing is sent — and fails
+/// with `ENETUNREACH`/`EHOSTUNREACH` when the tunnel or attachment underneath
+/// is gone. A P-CSCF failure seen without a route is the access's fault, never
+/// the P-CSCF's.
+pub fn route_to(addr: IpAddr, port: u16) -> std::io::Result<()> {
+    let bind: SocketAddr = match addr {
+        IpAddr::V4(_) => "0.0.0.0:0".parse().expect("literal"),
+        IpAddr::V6(_) => "[::]:0".parse().expect("literal"),
+    };
+    let sock = std::net::UdpSocket::bind(bind)?;
+    sock.connect(SocketAddr::new(addr, port))
+}
+
+/// A `Retry-After` header's delay in seconds (RFC 3261 §20.33), ignoring any
+/// comment or parameters after it.
+pub fn retry_after(headers: &[(String, String)]) -> Option<std::time::Duration> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("Retry-After"))
+        .and_then(|(_, v)| {
+            v.trim()
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|n| n.parse().ok())
+        })
+        .map(std::time::Duration::from_secs)
 }
 
 #[derive(Debug)]
@@ -607,6 +708,18 @@ impl SubscriptionHealth {
     }
 }
 
+/// Which P-CSCF a line is using and which it is avoiding (specs/091 FR-020),
+/// as the status listener reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PcscfSnapshot {
+    /// The P-CSCF the line is registered through, or is attempting.
+    pub active: Option<std::net::IpAddr>,
+    /// Candidates in selection order.
+    pub pool: Vec<std::net::IpAddr>,
+    /// Addresses currently marked unavailable, with the end of each mark.
+    pub unavailable: Vec<(std::net::IpAddr, std::time::SystemTime)>,
+}
+
 /// Snapshot of Agent A's registration health, per
 /// `specs/011-vowifi-sip-bridge/data-model.md`'s "VoWiFi Line Registration"
 /// entity — what FR-008/User Story 3's status reporting needs.
@@ -648,6 +761,9 @@ pub struct RegistrationStatus {
     /// The most recent subscription failure and when it happened. Kept after a
     /// later success, so the last thing that went wrong stays visible.
     pub reg_subscription_last_failure: Option<(std::time::SystemTime, String)>,
+    /// The line's P-CSCF choice (specs/091 FR-020). In-memory only, like
+    /// `reg_subscription`, and not an input to [`Self::health`].
+    pub pcscf: PcscfSnapshot,
 }
 
 impl Default for RegistrationStatus {
@@ -665,6 +781,7 @@ impl Default for RegistrationStatus {
             rejected_until: None,
             reg_subscription: SubscriptionHealth::None,
             reg_subscription_last_failure: None,
+            pcscf: PcscfSnapshot::default(),
         }
     }
 }
@@ -1457,6 +1574,115 @@ pub(crate) fn test_session_with_sa(
 mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
+
+    // --- specs/091 R4: classification on real socket errors ---
+
+    fn closed_local_port() -> SocketAddr {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        drop(l);
+        addr
+    }
+
+    #[test]
+    fn a_refused_connect_is_a_transport_failure() {
+        let err = sip_client::SipTransport::connect(closed_local_port(), true)
+            .err()
+            .expect("nothing listens there");
+        assert_eq!(classify_register_failure(&err), FailureClass::Transport);
+    }
+
+    #[test]
+    fn an_unanswered_register_is_a_timeout() {
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut t = sip_client::SipTransport::connect(silent.local_addr().unwrap(), false).unwrap();
+        let err = t
+            .send_and_recv("REGISTER sip:x SIP/2.0\r\n\r\n")
+            .unwrap_err();
+        assert_eq!(classify_register_failure(&err), FailureClass::Timeout);
+    }
+
+    #[test]
+    fn a_peer_close_is_not_the_pcscfs_fault() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let closer = std::thread::spawn(move || drop(l.accept().unwrap()));
+        let mut t = sip_client::SipTransport::connect(addr, true).unwrap();
+        closer.join().unwrap();
+        let err = t
+            .send_and_recv("REGISTER sip:x SIP/2.0\r\n\r\n")
+            .unwrap_err();
+        assert_eq!(classify_register_failure(&err), FailureClass::PeerClosed);
+    }
+
+    #[test]
+    fn no_route_is_never_the_pcscfs_fault() {
+        // ENETUNREACH/EHOSTUNREACH need CAP_NET_ADMIN to provoke for real, so
+        // the errno is constructed; the formatting is register_session's own.
+        for errno in [101, 113] {
+            let io = std::io::Error::from_raw_os_error(errno);
+            let err = crate::error::BridgeError::Ims(format!(
+                "TCP connect to 10.0.0.10:5060 failed: {io}"
+            ));
+            assert_eq!(
+                classify_register_failure(&err),
+                FailureClass::NoRoute,
+                "{io}"
+            );
+        }
+    }
+
+    #[test]
+    fn sim_and_auth_failures_are_not_the_pcscfs_fault() {
+        for text in [
+            "AT+CSIM failed: 0",
+            "nonce too short for RAND+AUTN: 3 bytes",
+        ] {
+            let err = crate::error::BridgeError::Ims(text.into());
+            assert_eq!(classify_register_failure(&err), FailureClass::NotPcscf);
+        }
+    }
+
+    #[test]
+    fn a_routed_address_passes_the_route_probe() {
+        assert!(route_to("127.0.0.1".parse().unwrap(), 5060).is_ok());
+    }
+
+    #[test]
+    fn retry_after_reads_seconds_and_ignores_comments() {
+        let h = |v: &str| vec![("Retry-After".to_string(), v.to_string())];
+        assert_eq!(retry_after(&h("600")), Some(Duration::from_secs(600)));
+        assert_eq!(
+            retry_after(&h("600 (maintenance);duration=60")),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(retry_after(&h("soon")), None);
+        assert_eq!(retry_after(&[]), None);
+    }
+
+    #[test]
+    fn with_pcscf_changes_only_the_address() {
+        let cfg = ImsRegisterConfig {
+            modem_port: PathBuf::from("/dev/null"),
+            pcsc_reader: false,
+            pcscf_addr: "10.0.0.10".parse().unwrap(),
+            pcscf_port: 5060,
+            mcc: "001".into(),
+            mnc: "01".into(),
+            imsi: None,
+            imei: None,
+            use_tcp: true,
+            sec_agree: true,
+            msisdn: None,
+            access_network_info: ACCESS_NETWORK_WLAN.into(),
+            register_uri_home_domain: true,
+            gm_auth_alg: None,
+            gm_cipher_alg: None,
+        };
+        let other = cfg.with_pcscf("10.0.1.10".parse().unwrap());
+        assert_eq!(other.pcscf_addr, "10.0.1.10".parse::<IpAddr>().unwrap());
+        assert_eq!((other.pcscf_port, other.mcc.as_str()), (5060, "001"));
+    }
 
     #[test]
     fn renewal_not_due_when_well_before_expiry() {

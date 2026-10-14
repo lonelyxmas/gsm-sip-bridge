@@ -88,15 +88,15 @@ take the same paths, and nothing is marked yet.
   writes: establishment, `PcscfChanged`, and the post-recovery `fresh` sync, in `start_vowifi_line_strongswan` and
   `start_vowifi_line_swu`. Use `engine.latest_pcscf_pool` / `fresh_pcscf_pool_since`. Add `let mut current_pool` beside
   `current_pcscf`. Commit.
-- [ ] T006 [P] Write failing tests in `transport.rs`:
+- [X] T006 [P] Write failing tests in `transport.rs`:
   - `EpdgTransport::prepare` with `/tmp/pcscf-test-*` and `/tmp/pcscf-test-*.pool` temp files returns
     `ImsTransportHandle { pcscf, pool: [A, B, IPv6] }`.
   - A missing `.pool` file gives `pool == [selection]`.
   - Blank and garbage lines are skipped.
   - Existing selection-file tests are unchanged.
-- [ ] T007 Implement T006 in `transport.rs`: add `ImsTransportHandle.pool: Vec<IpAddr>` and a reusable
+- [X] T007 Implement T006 in `transport.rs`: add `ImsTransportHandle.pool: Vec<IpAddr>` and a reusable
   `read_pcscf_pool(path) -> Vec<IpAddr>`, which is also used before each renewal in T019. Commit.
-- [ ] T008 [P] Write failing tests in the new `pcscf_pool.rs` for the parts that preserve behaviour
+- [X] T008 [P] Write failing tests in the new `pcscf_pool.rs` for the parts that preserve behaviour
   (data-model.md):
   - `PcscfPool::new(selection, pool, state_path)` builds `candidates()` as: selection first, then IPv4 in pool order,
     then IPv6, with duplicates removed.
@@ -105,11 +105,11 @@ take the same paths, and nothing is marked yet.
   - `select(now)` with no marks returns the selection with `SelectReason::Startup` the first time, and `Sticky` on
     later calls once `on_registered(addr)` has set `active`.
   - Use injected `SystemTime`s only.
-- [ ] T009 Implement T008: create `pcscf_pool.rs` with `PcscfPool`, `Mark`, `Selection`, `SelectReason`, `FailureCause`
+- [X] T009 Implement T008: create `pcscf_pool.rs` with `PcscfPool`, `Mark`, `Selection`, `SelectReason`, `FailureCause`
   (variants and kebab-case `Display`), `new`, `candidates`, `select`, `on_registered` and `snapshot`. Leave marks
   empty for now. Register `mod pcscf_pool;` in `agent/mod.rs` and add a row to the module table at the top of that
   file. Commit.
-- [ ] T010 Add `ImsRegisterConfig::with_pcscf(&self, addr: IpAddr) -> Self` in `ims/mod.rs`, a clone with only
+- [X] T010 Add `ImsRegisterConfig::with_pcscf(&self, addr: IpAddr) -> Self` in `ims/mod.rs`, a clone with only
   `pcscf_addr` replaced, with a unit test. Add `InboundParams.pcscf_pool: PcscfPool` in `agent/mod.rs`. Wire the two
   callers:
   - VoWiFi `run_inner`: from the transport handle; state path `format!("{}.state", config.pcscf_source_path)`.
@@ -136,7 +136,7 @@ candidate, with no tunnel rebuild.
 
 ### Tests for User Story 1
 
-- [ ] T011 [P] [US1] Write failing tests in `ims/mod.rs` for `classify_register_failure(&BridgeError) -> FailureClass`
+- [X] T011 [P] [US1] Write failing tests in `ims/mod.rs` for `classify_register_failure(&BridgeError) -> FailureClass`
   (research R4), using real errors where CI allows:
   - `SipTransport::connect` over TCP to a closed port on `127.0.0.1` (real `ECONNREFUSED`) gives `Transport`.
   - `register_session` with `use_tcp: false` against a bound UDP socket that never answers gives `Timeout`.
@@ -144,18 +144,18 @@ candidate, with no tunnel rebuild.
   - `io::Error::from_raw_os_error(101)` and `(113)`, formatted as the connect error, give `NoRoute`.
   - `"connection closed by peer with no data (0 bytes read)"` gives `PeerClosed`.
   - An `AT+CSIM failed` error and a nonce error give `NotPcscf`.
-- [ ] T012 [P] [US1] Write failing tests in `pcscf_pool.rs` for marks:
+- [X] T012 [P] [US1] Write failing tests in `pcscf_pool.rs` for marks:
   - `on_failure(active, RegisterTimeout, now)` gives `until = now + 330s` and `failures = 1`. Repeats give 360, 420,
     540, 780, 1260 and 2100 s, then stay at 2100 s (data-model.md formula).
   - `RetryAfter(600s)` gives `until = now + 600s` and increments `failures`.
   - After marking A: `select` returns B with `Failover`, and `has_unmarked` is true.
   - `on_registered(B)`, then A's mark expiring, then `select` still returns B, `Sticky` (FR-012, US1 AS4).
   - `on_registered(A)` resets A's `failures` to 0.
-- [ ] T013 [P] [US1] Write failing tests in `session.rs`: `attempt_renewal` returns
+- [X] T013 [P] [US1] Write failing tests in `session.rs`: `attempt_renewal` returns
   `Err(RenewalFailure { status: Some(503), retry_after: Some(600s), .. })` for a local fake registrar on `127.0.0.1`
   that answers the first REGISTER with `503 Service Unavailable` plus `Retry-After: 600`. Without the header,
   `retry_after: None`. `Retry-After: 600 (maintenance)` parses as 600 s.
-- [ ] T014 [US1] Write failing integration tests in `agent/mod.rs`, in the style of
+- [X] T014 [US1] Write failing integration tests in `agent/mod.rs`, in the style of
   `a_persistently_failing_renewal_exits_instead_of_retrying_forever`. Use `LoopState`, a pool `[127.0.0.1,
   127.0.0.2]`, A as a closed TCP port, and B as a listener that records connection attempts:
   - After a renewal against A fails with `Transport`:
@@ -167,7 +167,7 @@ candidate, with no tunnel rebuild.
   - The same holds for a silent A (`Timeout`) and for a `503` with `Retry-After: 600`.
   - The same scenario on a second `LoopState` with its own pool and state file leaves the first pool untouched
     (FR-018).
-- [ ] T015 [P] [US1] Write failing tests in `agent/mod.rs`:
+- [X] T015 [P] [US1] Write failing tests in `agent/mod.rs`:
   - `on_qualifying_endpoint_failure` with the session's P-CSCF equal to the active one marks it with
     `EndpointFailure(cause)`.
   - With `busy()` true, the mark is immediate but no renewal runs until the call ends (FR-016, US1 AS5;
@@ -182,13 +182,13 @@ candidate, with no tunnel rebuild.
 
 ### Implementation for User Story 1
 
-- [ ] T017 [US1] Implement `FailureClass` and `classify_register_failure` in `ims/mod.rs` per R4. Match `os error N`
+- [X] T017 [US1] Implement `FailureClass` and `classify_register_failure` in `ims/mod.rs` per R4. Match `os error N`
   first, then the English text. Add `route_to(addr: IpAddr, port: u16) -> Result<(), io::Error>`: a UDP socket
   `connect()` with nothing sent (R5). Make T011 pass. Commit.
-- [ ] T018 [US1] Implement `on_failure`, mark durations and `has_unmarked` in `pcscf_pool.rs` (T012). Implement
+- [X] T018 [US1] Implement `on_failure`, mark durations and `has_unmarked` in `pcscf_pool.rs` (T012). Implement
   `RenewalFailure` and a `retry_after(headers) -> Option<Duration>` helper in `session.rs`/`ims/mod.rs` (T013). Update
   the call sites of `attempt_renewal`. Commit.
-- [ ] T019 [US1] Implement renewal failover in `on_idle_tick` (`agent/mod.rs`), per R7:
+- [X] T019 [US1] Implement renewal failover in `on_idle_tick` (`agent/mod.rs`), per R7:
   1. Before the attempt, re-read `.pool` with `read_pcscf_pool`. If the set changed, call `pool.replace_pool` (stubbed
      to a plain replace until T031).
   2. On `Err(RenewalFailure)`, classify. `Timeout`/`Transport`, or a `503` with `retry_after > TIMER_F` (128 s), on
@@ -199,12 +199,12 @@ candidate, with no tunnel rebuild.
   5. Non-qualifying failures take exactly today's path.
 
   Make T014 pass. Commit.
-- [ ] T020 [US1] Implement startup failover in `serve_inbound` (`agent/mod.rs`), per R8. Loop `select` →
+- [X] T020 [US1] Implement startup failover in `serve_inbound` (`agent/mod.rs`), per R8. Loop `select` →
   `register_session(reg_cfg.with_pcscf(..))`. On a qualifying failure, mark and try the next unmarked candidate in
   the same process. On a non-qualifying failure, or once no unmarked candidate remains, return `Err` as today. Add a
   test: a closed `127.0.0.1` at startup leads to an attempt on `127.0.0.2` in the same call, asserted via the B
   listener's recorded connect. Commit.
-- [ ] T021 [US1] Wire the other failure sources in `agent/mod.rs` and `ping.rs`:
+- [X] T021 [US1] Wire the other failure sources in `agent/mod.rs` and `ping.rs`:
   - `on_qualifying_endpoint_failure` calls `pool.on_failure(session P-CSCF, EndpointFailure(cause), now)` after
     `route_to`.
   - `probe_gm_connection` returns the escalation `bool`, and `on_idle_tick` marks with `GmKeepalive`.
@@ -232,7 +232,7 @@ AS1–AS5).
 
 ### Tests for User Story 2
 
-- [ ] T023 [P] [US2] Write failing tests in `agent/mod.rs`, driving the T014 harness with each non-qualifying
+- [X] T023 [P] [US2] Write failing tests in `agent/mod.rs`, driving the T014 harness with each non-qualifying
   outcome. For each, assert no mark, the same active P-CSCF, and today's ladder:
   - a `NoRoute` connect error (US2 AS1);
   - `route_to` failing for an otherwise-qualifying `Timeout` (edge case: tunnel drops at the same moment);
@@ -241,7 +241,7 @@ AS1–AS5).
   - `503` without `Retry-After`;
   - `PeerClosed` (Q2);
   - a reg-event `rejected` NOTIFY through `on_network_deregistration` (AS5).
-- [ ] T024 [P] [US2] Write failing tests in `pcscf_pool.rs` for FR-017:
+- [X] T024 [P] [US2] Write failing tests in `pcscf_pool.rs` for FR-017:
   - `on_failure(addr, ..)` with `addr != active` returns `None`, changes nothing, and logs
     `"failure not attributed to the P-CSCF; not marking"` with `why=not-active`.
   - After `on_registered(B)`, a late `on_failure(A, GmKeepalive)` does not mark B or A.
@@ -253,10 +253,10 @@ AS1–AS5).
 
 ### Implementation for User Story 2
 
-- [ ] T026 [US2] Make T023 pass in `agent/mod.rs`. The classification gate from T019 should already cover most of it.
+- [X] T026 [US2] Make T023 pass in `agent/mod.rs`. The classification gate from T019 should already cover most of it.
   Fix what doesn't, and log `"failure not attributed to the P-CSCF; not marking"` with `why=no-route` when
   `route_to` fails. Commit.
-- [ ] T027 [US2] Make T024 pass in `pcscf_pool.rs`. Commit.
+- [X] T027 [US2] Make T024 pass in `pcscf_pool.rs`. Commit.
 - [X] T028 [US2] Implement the set-change publication in both steady loops in `orchestrate.rs`: after each tick,
   compare the `engine.latest_pcscf_pool` set with the `current_pool` set; when they differ and the selection did not
   change, call `publish_pcscf_pool` only. Make T025 pass. Commit.
@@ -274,14 +274,14 @@ exit to the supervisor at the existing budget. A new negotiation replaces candid
 
 ### Tests for User Story 3
 
-- [ ] T029 [P] [US3] Write failing tests in `pcscf_pool.rs`:
+- [X] T029 [P] [US3] Write failing tests in `pcscf_pool.rs`:
   - With A and B both marked, and B's mark expiring first, `select` returns B with `AllUnavailable`. With equal
     expiries, it returns A (candidate order).
   - `replace_pool([C, D], C)` drops the marks for A and B, drops `last_registered`, and clears `active` (US3 AS4,
     FR-014).
   - `replace_pool([B, A, C], A)` keeps the marks for A and B.
   - A one-element pool's single address is marked and still selected (US3 AS2).
-- [ ] T030 [US3] Write failing tests in `agent/mod.rs` with the T014 harness and both A and B dead:
+- [X] T030 [US3] Write failing tests in `agent/mod.rs` with the T014 harness and both A and B dead:
   - The attempts go A, B, then ladder steps of 5, 10, 20, 40 and 80 s (`RETRY_INITIAL_BACKOFF` doubling), each to
     the soonest-expiring mark.
   - The agent returns `Err` when `consecutive_renewal_failures` reaches `MAX_CONSECUTIVE_RENEWAL_FAILURES` (US3 AS1,
@@ -290,10 +290,10 @@ exit to the supervisor at the existing budget. A new negotiation replaces candid
 
 ### Implementation for User Story 3
 
-- [ ] T031 [US3] Implement the all-marked branch of `select` and the full `replace_pool` in `pcscf_pool.rs` (T029).
+- [X] T031 [US3] Implement the all-marked branch of `select` and the full `replace_pool` in `pcscf_pool.rs` (T029).
   Log `"P-CSCF pool replaced"` when the set changes and `"every P-CSCF is unavailable; retrying on backoff"` in
   `agent/mod.rs`. Make T029 and T030 pass. Commit.
-- [ ] T032 [US3] Confirm VoLTE parity in `carrier_agent.rs` with a test: a one-element pool with a qualifying failure
+- [X] T032 [US3] Confirm VoLTE parity in `carrier_agent.rs` with a test: a one-element pool with a qualifying failure
   marks it and takes `schedule_renewal_retry()` (today's ladder) (US3 AS2, R11). Commit.
 
 **Checkpoint**: US1–US3 hold. Two dead P-CSCFs can never be retried faster than the ladder.
@@ -309,7 +309,7 @@ pool at startup cannot be retried faster than the ladder (R8).
 
 ### Tests for User Story 4
 
-- [ ] T033 [P] [US4] Write failing tests in `pcscf_pool.rs` with a real temp dir (contracts/files.md):
+- [X] T033 [P] [US4] Write failing tests in `pcscf_pool.rs` with a real temp dir (contracts/files.md):
   - Round trip: `save` then `load` keeps marks (`until_unix`, `failures`, `cause`) and `last_registered`.
   - The write is atomic: a `.state.tmp` is renamed, and no partial file is ever observed.
   - Load against a pool that lacks A drops A's mark (FR-014).
@@ -320,7 +320,7 @@ pool at startup cannot be retried faster than the ladder (R8).
     - A marked for 10 more minutes, then restart: `select` gives B (US4 AS1).
     - A expired and `last_registered = B`, then restart: B (US4 AS2).
     - A expired and B marked, then restart: A (US4 AS3).
-- [ ] T034 [P] [US4] Write failing tests in `agent/mod.rs` for the startup wait (R8):
+- [X] T034 [P] [US4] Write failing tests in `agent/mod.rs` for the startup wait (R8):
   - With every candidate marked and the soonest expiry 30 s away, `serve_inbound`'s selection step waits 30 s
     before its single attempt.
   - At 600 s away, it waits `RETRY_MAX_BACKOFF` (120 s).
@@ -329,11 +329,11 @@ pool at startup cannot be retried faster than the ladder (R8).
 
 ### Implementation for User Story 4
 
-- [ ] T035 [US4] Implement `load` and `save` in `pcscf_pool.rs`: serde `PersistedPool { version, last_registered,
+- [X] T035 [US4] Implement `load` and `save` in `pcscf_pool.rs`: serde `PersistedPool { version, last_registered,
   marks }`, atomic temp-then-rename, and reconciliation on load. Call `save` from `on_failure`, `on_registered` and
   `replace_pool`. Have `PcscfPool::new` call `load`. Implement `candidates()` putting `last_registered` first when it
   is unmarked. Make T033 pass. Commit.
-- [ ] T036 [US4] Implement the startup wait in `serve_inbound` (`agent/mod.rs`) and add `Phase::PcscfWait` to the
+- [X] T036 [US4] Implement the startup wait in `serve_inbound` (`agent/mod.rs`) and add `Phase::PcscfWait` to the
   watchdog module (a budget of `RETRY_MAX_BACKOFF` + 10 s). Log `"every P-CSCF is unavailable; waiting before the
   startup attempt"`. Make T034 pass. Commit.
 
@@ -360,7 +360,7 @@ logged.
   - `none` when nothing is marked;
   - `pcscf: unknown` for an empty active;
   - several marks, comma-separated (contracts/control.md).
-- [ ] T039 [P] [US5] Write failing tests in `pcscf_pool.rs`: `snapshot(now)` lists only marks with `until > now`, in
+- [X] T039 [P] [US5] Write failing tests in `pcscf_pool.rs`: `snapshot(now)` lists only marks with `until > now`, in
   candidate order.
 
 ### Implementation for User Story 5

@@ -198,15 +198,55 @@ pub(crate) fn next_backoff(current: Duration, max: Duration) -> Duration {
 /// actually expires or a later retry succeeds.
 pub(crate) fn attempt_renewal(
     reg_cfg: &ImsRegisterConfig,
-) -> BridgeResult<super::RegisteredSession> {
+) -> Result<super::RegisteredSession, RegisterFailure> {
+    register_checked(reg_cfg, "renewal REGISTER rejected")
+}
+
+/// A registration attempt that did not end in `200`, with what P-CSCF
+/// failover needs to judge it (specs/091 R4, FR-008): the final status, if one
+/// arrived, and its `Retry-After`.
+#[derive(Debug)]
+pub(crate) struct RegisterFailure {
+    pub(crate) error: BridgeError,
+    pub(crate) status: Option<u16>,
+    pub(crate) retry_after: Option<Duration>,
+}
+
+impl From<BridgeError> for RegisterFailure {
+    fn from(error: BridgeError) -> Self {
+        Self {
+            error,
+            status: None,
+            retry_after: None,
+        }
+    }
+}
+
+impl std::fmt::Display for RegisterFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+/// One full registration through `reg_cfg`'s P-CSCF; anything but a `200`
+/// final response is a [`RegisterFailure`] whose message starts with
+/// `rejected` (the session is cleaned up first). `Retry-After` is read before
+/// the cleanup discards the response.
+pub(crate) fn register_checked(
+    reg_cfg: &ImsRegisterConfig,
+    rejected: &str,
+) -> Result<super::RegisteredSession, RegisterFailure> {
     let mut new_session = super::register_session(reg_cfg)?;
     if new_session.status != 200 {
         let status = new_session.status;
         let reason = new_session.reason.clone();
+        let retry_after = super::retry_after(&new_session.headers);
         new_session.cleanup();
-        return Err(BridgeError::Ims(format!(
-            "renewal REGISTER rejected: {status} {reason}"
-        )));
+        return Err(RegisterFailure {
+            error: BridgeError::Ims(format!("{rejected}: {status} {reason}")),
+            status: Some(status),
+            retry_after,
+        });
     }
     Ok(new_session)
 }

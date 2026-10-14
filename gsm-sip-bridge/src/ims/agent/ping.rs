@@ -166,6 +166,11 @@ fn reconnect_gm_client(
 /// after `MAX_RECONNECT_ATTEMPTS` consecutive failures — sets `*force_renewal`
 /// so the caller escalates to a full re-registration.
 ///
+/// Returns `true` exactly when it raised that escalation because the client
+/// keepalive went unanswered (or could not be sent): the P-CSCF failure
+/// specs/091 FR-007 counts. An escalation driven only by a local listener
+/// restart failing is not the P-CSCF's fault and returns `false`.
+///
 /// Only ever called with no call in progress (the caller gates on it), so the
 /// ping verdict is evaluated as not-in-a-call.
 pub(super) fn probe_gm_connection(
@@ -176,7 +181,7 @@ pub(super) fn probe_gm_connection(
     gm_conn: &mut crate::ims::GmConnectionState,
     reconnect_attempts: &mut u32,
     force_renewal: &mut bool,
-) {
+) -> bool {
     // An escalation is already pending. The renewal path owns the recovery
     // from here and throttles its own retries on `backoff`, so probing again
     // on every 1s idle tick cannot help: the client transport this would
@@ -192,7 +197,7 @@ pub(super) fn probe_gm_connection(
     // fault. `reconnect_attempts` is only cleared by a *successful* renewal,
     // so nothing in the episode could have stopped it.
     if *force_renewal {
-        return;
+        return false;
     }
 
     let now = Instant::now();
@@ -231,7 +236,7 @@ pub(super) fn probe_gm_connection(
     }
 
     if !client_down && !listener_restart_failed {
-        return;
+        return false;
     }
 
     // A repair is needed. Attribute one failure to the current episode and
@@ -254,7 +259,7 @@ pub(super) fn probe_gm_connection(
         );
         *force_renewal = true;
         ping.reset();
-        return;
+        return client_down;
     }
 
     // Only the *client* half is rebuilt here — a failed listener restart is
@@ -276,6 +281,7 @@ pub(super) fn probe_gm_connection(
             Err(e) => tracing::warn!(error = %e, "Gm client reconnect failed; will retry"),
         }
     }
+    false
 }
 
 #[cfg(test)]
