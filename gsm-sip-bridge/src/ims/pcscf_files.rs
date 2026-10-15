@@ -1,6 +1,8 @@
 //! The per-line P-CSCF files beside `/tmp/pcscf-N` (specs/091,
 //! `contracts/files.md`): the pool the supervisor publishes and the state the
-//! agent keeps across its own restarts.
+//! agent keeps across its own restarts. Plus the agent's active-call count,
+//! which the supervisor reads to hold a stuck-rekey rebuild for a call
+//! (specs/093 `contracts/files.md`).
 //!
 //! Shared by both sides so the writer and the reader cannot disagree on a
 //! path or a format. The selection file itself (`/tmp/pcscf-N`) is untouched:
@@ -19,6 +21,22 @@ pub fn pool_path(selection_path: &str) -> PathBuf {
 /// `/tmp/pcscf-N.state` for the selection file `/tmp/pcscf-N`.
 pub fn state_path(selection_path: &str) -> PathBuf {
     PathBuf::from(format!("{selection_path}.state"))
+}
+
+/// `/tmp/pcscf-N.calls` for the selection file `/tmp/pcscf-N`.
+pub fn calls_path(selection_path: &str) -> PathBuf {
+    PathBuf::from(format!("{selection_path}.calls"))
+}
+
+/// Writes the active-call count (`"1\n"`) atomically.
+pub fn write_active_calls(path: &Path, n: u32) -> io::Result<()> {
+    write_atomic(path, &format!("{n}\n"))
+}
+
+/// The active-call count in a `.calls` file's contents; `None` for anything
+/// that is not a plain unsigned number, which the reader treats as "no call".
+pub fn parse_active_calls(contents: &str) -> Option<u32> {
+    contents.trim().parse().ok()
 }
 
 /// One address per line, trailing newline.
@@ -85,6 +103,33 @@ mod tests {
             state_path("/tmp/pcscf-1"),
             PathBuf::from("/tmp/pcscf-1.state")
         );
+    }
+
+    #[test]
+    fn the_calls_file_sits_beside_the_selection_and_round_trips() {
+        assert_eq!(
+            calls_path("/tmp/pcscf-1"),
+            PathBuf::from("/tmp/pcscf-1.calls")
+        );
+        let dir = temp_dir();
+        let path = dir.join("pcscf-0.calls");
+        write_active_calls(&path, 1).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, "1\n");
+        assert_eq!(parse_active_calls(&written), Some(1));
+        write_active_calls(&path, 0).unwrap();
+        assert_eq!(
+            parse_active_calls(&std::fs::read_to_string(&path).unwrap()),
+            Some(0)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_calls_file_that_is_not_a_count_reads_as_none() {
+        for garbage in ["", "\n", "-1\n", "one\n", "1 2\n"] {
+            assert_eq!(parse_active_calls(garbage), None, "{garbage:?}");
+        }
     }
 
     #[test]

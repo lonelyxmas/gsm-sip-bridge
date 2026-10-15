@@ -250,6 +250,15 @@ fn run_inner(
     // registration machinery (specs/015-volte-host-ims); the LTE IMS PDN is
     // the other. For VoWiFi this is exactly the P-CSCF file read that used to
     // sit inline here — same source, same port, same error text.
+    // Before anything that can fail: an agent killed mid-call leaves a `1`
+    // behind, and its successor must clear it even if it never registers, or
+    // the supervisor would hold a stuck-rekey rebuild for a call that is gone
+    // (specs/093 research R5). Best-effort, like the count itself.
+    let _ = crate::ims::pcscf_files::write_active_calls(
+        &crate::ims::pcscf_files::calls_path(&config.pcscf_source_path),
+        0,
+    );
+
     let mut transport = EpdgTransport::new(config.pcscf_source_path.clone(), 5060);
     let transport_handle = transport.prepare()?;
     tracing::info!(
@@ -851,6 +860,12 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         app_config.bridge.sip_destination.clone(),
         transport,
     );
+    // VoWiFi only: its tunnel supervisor holds a stuck-rekey rebuild for a
+    // call (specs/093). VoLTE has no `pcscf_source` and no such supervisor.
+    let obs = match &pcscf_source {
+        Some(src) => obs.with_calls_file(crate::ims::pcscf_files::calls_path(src)),
+        None => obs,
+    };
 
     // Under the modem lock: `register_session` reads the IMEI over the AT port
     // the cellular path's SMS reader also uses (no-op on Wi-Fi, where the lock

@@ -61,18 +61,18 @@ Fixtures use synthetic identities only (`001010000000001`, `192.0.2.x`, `203.0.1
 **Goal**: an active call defers the rebuild until the call ends or 90s remain. Unknown call state never defers.
 **Independent test**: the tick tests below plus the call-state file tests.
 
-- [ ] T012 [P] [US3] In `ims/pcscf_files.rs`, add tests first, then `pub fn calls_path(selection_path: &str) -> PathBuf` (`<selection>.calls`), `pub fn render_active_calls(n: u32) -> String` (`"{n}\n"`), `pub fn parse_active_calls(contents: &str) -> Option<u32>` (trimmed, decimal) and `pub fn write_active_calls(path: &Path, n: u32) -> io::Result<()>` (via `write_atomic`). Tests: path beside the selection; round trip; garbage, empty and negative → `None`; the write is atomic and readable.
-- [ ] T013 [US3] In `ims/observability.rs`, give `AgentObservability` an optional `calls_file: Option<PathBuf>` with `pub fn with_calls_file(mut self, path: PathBuf) -> Self`. `set_active_calls` writes it best-effort; ignore errors, `tracing::debug!` on failure. Test: an obs with a calls file in a temp dir writes `1` then `0`.
-- [ ] T014 [US3] In `ims/agent/mod.rs`:
+- [X] T012 [P] [US3] In `ims/pcscf_files.rs`, add tests first, then `pub fn calls_path(selection_path: &str) -> PathBuf` (`<selection>.calls`), `pub fn render_active_calls(n: u32) -> String` (`"{n}\n"`), `pub fn parse_active_calls(contents: &str) -> Option<u32>` (trimmed, decimal) and `pub fn write_active_calls(path: &Path, n: u32) -> io::Result<()>` (via `write_atomic`). Tests: path beside the selection; round trip; garbage, empty and negative → `None`; the write is atomic and readable.
+- [X] T013 [US3] In `ims/observability.rs`, give `AgentObservability` an optional `calls_file: Option<PathBuf>` with `pub fn with_calls_file(mut self, path: PathBuf) -> Self`. `set_active_calls` writes it best-effort; ignore errors, `tracing::debug!` on failure. Test: an obs with a calls file in a temp dir writes `1` then `0`.
+- [X] T014 [US3] In `ims/agent/mod.rs`:
   - (a) At the start of `run_inner`, before `EpdgTransport::new`, best-effort `pcscf_files::write_active_calls(&calls_path(&config.pcscf_source_path), 0)`, with a comment citing research R5 (a killed agent's stale `1`).
   - (b) In `serve_inbound`, when `pcscf_source` is `Some`, attach `.with_calls_file(calls_path(src))` to the `AgentObservability` it builds. VoLTE (`None`) is unchanged.
-- [ ] T015 [US3] Write failing tick tests in `supervise/line_supervisor.rs`:
+- [X] T015 [US3] Write failing tick tests in `supervise/line_supervisor.rs`:
   - `rekey_stuck_defers_during_a_call`: expires 290 with `call_active` true → `StillUp`, no terminate, `rekey_stuck_deferral_logged == Some(#N)`. A second tick does not log again.
   - `..._rebuilds_when_the_call_ends`: the next tick with `call_active` false → rebuild.
   - `..._forced_under_margin`: expires 90 with the call active → rebuild, and the log says "despite an active call".
   - `..._call_state_read_only_when_stuck`: with expires 3000, the closure is never called. Use a `Cell` counter.
-- [ ] T016 [US3] Add the `call_active: &dyn Fn() -> bool` parameter to `tick_steady_state_with_pool`. `tick_steady_state` and the SWu loop in `supervise/orchestrate.rs` pass `&|| false`. Update the other test call sites. Implement the deferral rows of the decision table and the deferral log line (contracts/logs.md). T015's tests pass.
-- [ ] T017 [US3] In the strongswan steady-state loop in `supervise/orchestrate.rs`, pass a closure that reads `pcscf_files::calls_path(&line.pcscf_source_path)` via `runner.read_file` and returns `parse_active_calls(..).is_some_and(|n| n > 0)`. Orchestrator test: with a mock file containing `1` and expires 290 → no terminate. With `0`, or with the file missing → rebuild. Commit: `feat(supervise): hold a stuck-rekey rebuild for an active call, never past the margin (093 US3)`.
+- [X] T016 [US3] Add the `call_active: &dyn Fn() -> bool` parameter to `tick_steady_state_with_pool`. `tick_steady_state` and the SWu loop in `supervise/orchestrate.rs` pass `&|| false`. Update the other test call sites. Implement the deferral rows of the decision table and the deferral log line (contracts/logs.md). T015's tests pass.
+- [X] T017 [US3] In the strongswan steady-state loop in `supervise/orchestrate.rs`, pass a closure that reads `pcscf_files::calls_path(&line.pcscf_source_path)` via `runner.read_file` and returns `parse_active_calls(..).is_some_and(|n| n > 0)`. Orchestrator test: with a mock file containing `1` and expires 290 → no terminate. With `0`, or with the file missing → rebuild. Commit: `feat(supervise): hold a stuck-rekey rebuild for an active call, never past the margin (093 US3)`.
 
 ## Phase 5: Polish
 

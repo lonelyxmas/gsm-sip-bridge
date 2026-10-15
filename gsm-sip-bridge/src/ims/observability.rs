@@ -37,6 +37,10 @@ pub struct AgentObservability {
     /// `transport` label.
     transport: Transport,
     state: Mutex<AgentState>,
+    /// Where the active-call count is mirrored for this line's tunnel
+    /// supervisor, which holds a stuck-rekey rebuild for a call (specs/093
+    /// `contracts/files.md`). VoWiFi only; `None` on VoLTE.
+    calls_file: Option<std::path::PathBuf>,
 }
 
 impl AgentObservability {
@@ -54,7 +58,14 @@ impl AgentObservability {
             sip_destination,
             transport,
             state: Mutex::new(AgentState::default()),
+            calls_file: None,
         }
+    }
+
+    /// Also mirror every active-call count into `path`.
+    pub fn with_calls_file(mut self, path: std::path::PathBuf) -> Self {
+        self.calls_file = Some(path);
+        self
     }
 
     fn push(&self, events: Vec<ObservedEvent>) {
@@ -67,6 +78,14 @@ impl AgentObservability {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .active_calls = Some(n);
+        if let Some(path) = &self.calls_file {
+            // Best-effort like every other report: a write that fails costs
+            // only the deferral, and the supervisor reads a missing or stale
+            // file as "no call".
+            if let Err(e) = crate::ims::pcscf_files::write_active_calls(path, n) {
+                tracing::debug!(error = %e, path = %path.display(), "could not write the active-call count");
+            }
+        }
         self.push(Vec::new());
     }
 
@@ -250,6 +269,31 @@ pub fn map_bridge_failure_reason(raw: &str) -> BridgeFailureReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_calls_are_mirrored_into_the_calls_file() {
+        let dir = std::env::temp_dir().join(format!("obs-calls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pcscf-0.calls");
+        let obs = AgentObservability::new(
+            Reporter::spawn(
+                dir.join("no-daemon.sock").display().to_string(),
+                crate::control::protocol::AgentKind::Ims,
+                "card0".into(),
+                std::time::Duration::from_secs(3600),
+            ),
+            "card0".into(),
+            None,
+            "sip:pbx@192.0.2.1".into(),
+            Transport::Vowifi,
+        )
+        .with_calls_file(path.clone());
+        obs.set_active_calls(1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "1\n");
+        obs.set_active_calls(0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "0\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn map_bridge_failure_reason_covers_every_known_reason_constant() {

@@ -484,7 +484,15 @@ pub fn tick_steady_state(
     tracking: &mut SteadyTracking,
     poll_interval: Duration,
 ) -> SteadyOutcome {
-    tick_steady_state_with_pool(engine, runner, current_pcscf, &[], tracking, poll_interval)
+    tick_steady_state_with_pool(
+        engine,
+        runner,
+        current_pcscf,
+        &[],
+        tracking,
+        poll_interval,
+        &|| false,
+    )
 }
 
 /// [`tick_steady_state`] for a line whose whole advertised pool is known
@@ -504,6 +512,7 @@ pub fn tick_steady_state_with_pool(
     current_pool: &[String],
     tracking: &mut SteadyTracking,
     poll_interval: Duration,
+    call_active: &dyn Fn() -> bool,
 ) -> SteadyOutcome {
     if !engine.is_process_alive(runner) {
         // A respawned charon starts a fresh connection that gets its own first
@@ -611,7 +620,7 @@ pub fn tick_steady_state_with_pool(
         }
         SteadyStateHealth::Ok(None) => {}
         SteadyStateHealth::Ok(Some(child)) => {
-            if let Some(outcome) = check_rekey_stuck(engine, runner, child, tracking) {
+            if let Some(outcome) = check_rekey_stuck(engine, runner, child, tracking, call_active) {
                 return outcome;
             }
         }
@@ -701,6 +710,7 @@ fn check_rekey_stuck(
     runner: &dyn CommandRunner,
     child: ChildSaLifetime,
     tracking: &mut SteadyTracking,
+    call_active: &dyn Fn() -> bool,
 ) -> Option<SteadyOutcome> {
     let id = child.unique_id;
     // A guard set for an earlier CHILD_SA means nothing for this one.
@@ -730,12 +740,33 @@ fn check_rekey_stuck(
         return None;
     }
 
+    // Read only now, on a tick that would rebuild: a healthy line never
+    // touches the call-state file (specs/093 contracts/files.md).
+    let in_call = call_active();
+    let forced = expires_in <= REKEY_STUCK_FORCE_MARGIN.as_secs() as i64;
+    if in_call && !forced {
+        if tracking.rekey_stuck_deferral_logged != Some(id) {
+            tracking.rekey_stuck_deferral_logged = Some(id);
+            println!(
+                "{} CHILD_SA #{id} rekey overdue (expires in {expires_in}s); deferring the rebuild while a call is active (forced at {}s)",
+                engine.log_prefix(),
+                REKEY_STUCK_FORCE_MARGIN.as_secs()
+            );
+        }
+        return None;
+    }
+
     let rejection = engine
         .child_sa_rejection(runner)
         .map(|n| format!(", last rejection N({n})"))
         .unwrap_or_default();
+    let despite = if in_call {
+        " despite an active call"
+    } else {
+        ""
+    };
     println!(
-        "{} CHILD_SA #{id} rekey overdue (expires in {expires_in}s{rejection}); rebuilding before the hard expiry",
+        "{} CHILD_SA #{id} rekey overdue (expires in {expires_in}s{rejection}); rebuilding before the hard expiry{despite}",
         engine.log_prefix()
     );
     tracking.rekey_stuck_rebuilt = Some(id);
@@ -1210,6 +1241,7 @@ mod tests {
                 &pool(&["10.0.0.10", "10.0.1.10"]),
                 &mut tracking,
                 STEADY_STATE_POLL_INTERVAL,
+                &|| false,
             );
             assert_eq!(outcome, SteadyOutcome::StillUp);
         }
@@ -1238,6 +1270,7 @@ mod tests {
                 &pool(&["10.0.0.10", "10.0.1.10"]),
                 &mut tracking,
                 STEADY_STATE_POLL_INTERVAL,
+                &|| false,
             );
         }
         assert_eq!(
@@ -1260,6 +1293,7 @@ mod tests {
             &pool(&["10.0.0.10", "10.0.1.10", "10.0.2.10"]),
             &mut SteadyTracking::default(),
             STEADY_STATE_POLL_INTERVAL,
+            &|| false,
         );
         assert_eq!(*engine.probed.borrow(), pool(&["10.0.0.10"]));
     }
@@ -1976,8 +2010,91 @@ mod tests {
         health: SteadyStateHealth,
         tracking: &mut SteadyTracking,
     ) -> SteadyOutcome {
+        rekey_tick_in_call(engine, health, tracking, &|| false)
+    }
+
+    fn rekey_tick_in_call(
+        engine: &FakeEngine,
+        health: SteadyStateHealth,
+        tracking: &mut SteadyTracking,
+        call_active: &dyn Fn() -> bool,
+    ) -> SteadyOutcome {
         *engine.health.borrow_mut() = health;
-        tick_steady_state(engine, &MockCommandRunner::new(), "10.0.0.1", tracking)
+        super::tick_steady_state_with_pool(
+            engine,
+            &MockCommandRunner::new(),
+            "10.0.0.1",
+            &[],
+            tracking,
+            STEADY_STATE_POLL_INTERVAL,
+            call_active,
+        )
+    }
+
+    #[test]
+    fn rekey_stuck_defers_during_a_call() {
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking::default();
+        for expires in [290, 260] {
+            assert_eq!(
+                rekey_tick_in_call(&engine, lifetime(12, expires), &mut tracking, &|| true),
+                SteadyOutcome::StillUp
+            );
+            assert_eq!(tracking.rekey_stuck_deferral_logged, Some(12));
+        }
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn rekey_stuck_rebuilds_when_the_call_ends() {
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking::default();
+        assert_eq!(
+            rekey_tick_in_call(&engine, lifetime(12, 290), &mut tracking, &|| true),
+            SteadyOutcome::StillUp
+        );
+        assert_eq!(
+            rekey_tick_in_call(&engine, lifetime(12, 260), &mut tracking, &|| false),
+            REKEY_STUCK
+        );
+        assert_eq!(*engine.terminate_calls.borrow(), 1);
+    }
+
+    #[test]
+    fn rekey_stuck_forced_under_margin() {
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking::default();
+        let mut expires = 290;
+        while expires > REKEY_STUCK_FORCE_MARGIN.as_secs() as i64 {
+            assert_eq!(
+                rekey_tick_in_call(&engine, lifetime(12, expires), &mut tracking, &|| true),
+                SteadyOutcome::StillUp,
+                "{expires}"
+            );
+            expires -= 30;
+        }
+        assert!(expires > 0, "the forced rebuild still has {expires}s");
+        assert_eq!(
+            rekey_tick_in_call(&engine, lifetime(12, expires), &mut tracking, &|| true),
+            REKEY_STUCK
+        );
+        assert_eq!(*engine.terminate_calls.borrow(), 1);
+    }
+
+    #[test]
+    fn rekey_stuck_call_state_read_only_when_stuck() {
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking::default();
+        let reads = std::cell::Cell::new(0);
+        let call_active = || {
+            reads.set(reads.get() + 1);
+            false
+        };
+        rekey_tick_in_call(&engine, lifetime(12, 3000), &mut tracking, &call_active);
+        rekey_tick_in_call(&engine, lifetime(12, 301), &mut tracking, &call_active);
+        assert_eq!(reads.get(), 0);
+        rekey_tick_in_call(&engine, lifetime(12, 290), &mut tracking, &call_active);
+        assert_eq!(reads.get(), 1);
     }
 
     #[test]
