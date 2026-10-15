@@ -2820,6 +2820,11 @@ impl LoopState {
         // this thread indefinitely, exactly as the modem read did. The *waiting*
         // afterwards is tick-driven and needs no phase; `Phase::Origination`
         // therefore covers precisely this call and nothing else.
+        // Occupied from before the INVITE goes out, which can block: waiting
+        // for the next dispatch pass to publish it would leave the attempt
+        // unprotected from a stuck-rekey rebuild meanwhile (specs/093). The
+        // loop-top reconcile clears it again if the attempt never started.
+        p.obs.set_outbound_setup(true);
         self.origination = {
             let _phase = p.progress.phase_guard(watchdog::Phase::Origination);
             begin_origination(
