@@ -359,6 +359,53 @@ pub fn child_rekey_invalid_selectors_session(charon_log: &str, conn_name: &str) 
     session.filter(|_| rejected)
 }
 
+/// The notify the ePDG most recently refused a CREATE_CHILD_SA with in the
+/// current IKE_SA session (`"INVAL_SEL"`, `"TS_UNACCEPT"`, ...), or `None` if
+/// the latest one succeeded or none was refused (specs/093 research R4).
+///
+/// Only ever used to explain a stuck-rekey rebuild in its log line, never to
+/// trigger one: the trigger is the CHILD_SA's own lifetime, which works the
+/// same whatever (if anything) the carrier answered. Scoped per session like
+/// [`child_rekey_invalid_selectors_session`]. A refusal is a response whose
+/// payloads are all notifies (`[ N(INVAL_SEL) ]`); a success carries an `SA`
+/// (`[ SA No TSi TSr ]`) and clears it.
+pub fn child_sa_rejection_notify(charon_log: &str, conn_name: &str) -> Option<String> {
+    let established = format!("IKE_SA {conn_name}[");
+    let mut notify: Option<String> = None;
+    for line in lines_for_conn(charon_log, conn_name) {
+        if line
+            .find(&established)
+            .is_some_and(|pos| line[pos..].contains("] established"))
+        {
+            notify = None;
+            continue;
+        }
+        let Some(pos) = line.find("CREATE_CHILD_SA response") else {
+            continue;
+        };
+        let rest = &line[pos..];
+        let Some(payloads) = rest.find("[ ").and_then(|start| {
+            rest[start + 2..]
+                .find(" ]")
+                .map(|end| &rest[start + 2..start + 2 + end])
+        }) else {
+            continue;
+        };
+        let Some(first) = payloads.split_whitespace().next() else {
+            continue;
+        };
+        notify = if payloads.split_whitespace().all(|t| t.starts_with("N(")) {
+            first
+                .strip_prefix("N(")
+                .and_then(|t| t.strip_suffix(')'))
+                .map(str::to_string)
+        } else {
+            None
+        };
+    }
+    notify
+}
+
 /// The single charon daemon shared by every strongswan-engine line.
 ///
 /// One charon *per line* was the original design, and it was wrong for a
@@ -737,6 +784,17 @@ impl TunnelEngine for StrongswanEngine {
             .read_file(&self.shared.charon_log)
             .map(|c| ike_sa_loss_cause(&c, &self.conn_name))
             .unwrap_or(IkeSaLossCause::Unknown)
+    }
+
+    fn log_prefix(&self) -> String {
+        format!("[supervise] line {}: {}", self.idx, self.conn_name)
+    }
+
+    fn child_sa_rejection(&self, runner: &dyn CommandRunner) -> Option<String> {
+        runner
+            .read_file(&self.shared.charon_log)
+            .ok()
+            .and_then(|c| child_sa_rejection_notify(&c, &self.conn_name))
     }
 
     /// Graceful delete first, forced only if the ePDG does not acknowledge it
@@ -1540,6 +1598,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn child_sa_rejection_notify_table() {
+        const EST3: &str =
+            "<ims0|3> IKE_SA ims0[3] established between 10.0.0.2[x]...192.0.2.1[ims]\n";
+        const EST4: &str =
+            "<ims0|4> IKE_SA ims0[4] established between 10.0.0.2[x]...192.0.2.1[ims]\n";
+        const INVAL: &str = "<ims0|3> parsed CREATE_CHILD_SA response 12 [ N(INVAL_SEL) ]\n";
+        const TS: &str = "<ims0|3> parsed CREATE_CHILD_SA response 13 [ N(TS_UNACCEPT) ]\n";
+        const OK: &str = "<ims0|3> parsed CREATE_CHILD_SA response 14 [ SA No TSi TSr ]\n";
+        const OTHER: &str = "<ims1|7> parsed CREATE_CHILD_SA response 3 [ N(NO_PROP) ]\n";
+        let cases: [(&str, String, Option<&str>); 7] = [
+            ("INVALID_SELECTORS", format!("{EST3}{INVAL}"), Some("INVAL_SEL")),
+            ("the latest refusal wins", format!("{EST3}{INVAL}{TS}"), Some("TS_UNACCEPT")),
+            ("a later success clears it", format!("{EST3}{INVAL}{OK}"), None),
+            ("only an earlier session refused", format!("{EST3}{INVAL}{EST4}"), None),
+            ("another connection's refusal", format!("{EST3}{OTHER}"), None),
+            ("no CREATE_CHILD_SA at all", EST3.to_string(), None),
+            ("our own request is not a response", format!("{EST3}<ims0|3> generating CREATE_CHILD_SA request 12 [ N(REKEY_SA) SA No TSi TSr ]\n"), None),
+        ];
+        for (name, log, want) in cases {
+            assert_eq!(
+                child_sa_rejection_notify(&log, "ims0").as_deref(),
+                want,
+                "{name}"
+            );
+        }
+    }
+
     mod engine_wiring_tests {
         use super::*;
         use crate::supervise::runner::MockCommandRunner;
@@ -1622,6 +1708,80 @@ mod tests {
                     .any(|s| s.argv.contains(&"--initiate".to_string())
                         && s.argv.contains(&"ims0".to_string())),
                 "recovery must still re-initiate, scoped to this line's connection"
+            );
+        }
+
+        /// specs/093 FR-008/T011: a stuck rekey on line 0, through the real
+        /// engine and the real tick, rebuilds line 0's connection and nothing
+        /// else on the shared daemon.
+        #[test]
+        fn a_stuck_rekey_rebuilds_only_its_own_connection() {
+            use crate::supervise::line_supervisor::{
+                tick_steady_state, DegradeReason, SteadyOutcome, SteadyTracking,
+                STEADY_STATE_POLL_INTERVAL,
+            };
+            use std::os::unix::process::ExitStatusExt;
+            let runner = MockCommandRunner::new();
+            let engine = strongswan_engine();
+            assert!(engine.shared.ensure_started(&runner).is_some());
+            runner.set_netns_output("ims", &["ip", "link", "show", "tun23"], "5: tun23\n");
+            runner.set_run_output(
+                "timeout 10 env STRONGSWAN_CONF=/etc/strongswan-shared.conf swanctl --list-sas --ike ims0",
+                std::process::Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: b"ims0: #3, ESTABLISHED, IKEv2, aa_i* bb_r\n  ims0: #12, reqid 1, INSTALLED, TUNNEL-in-UDP, ESP:AES_CBC-128/HMAC_SHA1_96\n    installed 3670s ago, rekeying in -70s, expires in 290s\n".to_vec(),
+                    stderr: Vec::new(),
+                },
+            );
+            runner.set_file(
+                "/tmp/charon.log",
+                "<ims0|3> IKE_SA ims0[3] established between 192.0.2.10[x]...203.0.113.1[ims]\n<ims0|3> parsed CREATE_CHILD_SA response 9 [ N(INVAL_SEL) ]\n",
+            );
+            let mut tracking = SteadyTracking::default();
+            assert_eq!(
+                tick_steady_state(
+                    &engine,
+                    &runner,
+                    "",
+                    &mut tracking,
+                    STEADY_STATE_POLL_INTERVAL
+                ),
+                SteadyOutcome::Recovered {
+                    reason: DegradeReason::ChildSaRekeyStuck,
+                    ike_sa_loss_cause: None,
+                }
+            );
+            let ran = runner.run_calls.lock().unwrap().clone();
+            let terminates: Vec<_> = ran
+                .iter()
+                .filter(|a| a.iter().any(|x| x == "--terminate"))
+                .collect();
+            assert!(!terminates.is_empty(), "{ran:?}");
+            for t in &terminates {
+                assert!(
+                    t.windows(2).any(|w| w[0] == "--ike" && w[1] == "ims0"),
+                    "{t:?}"
+                );
+            }
+            let spawned: Vec<Vec<String>> = runner
+                .spawn_specs
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|s| s.argv.clone())
+                .collect();
+            assert!(
+                spawned
+                    .iter()
+                    .any(|a| a.windows(2).any(|w| w[0] == "--child" && w[1] == "ims0")),
+                "{spawned:?}"
+            );
+            assert!(
+                !ran.iter()
+                    .chain(spawned.iter())
+                    .flatten()
+                    .any(|a| a == "ims1"),
+                "another line's connection was touched"
             );
         }
 
