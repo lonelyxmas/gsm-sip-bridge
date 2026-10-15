@@ -2379,6 +2379,10 @@ fn dispatch_loop(
     st.perform_sub_action(session, p, first);
     loop {
         st.sync_shared_status(p);
+        // An outbound call being placed occupies the line for the tunnel
+        // supervisor before it is bridged (specs/093). Reconciled here, once
+        // per pass, rather than at each of the places an attempt can end.
+        p.obs.set_outbound_setup(st.origination.is_some());
 
         if st.handle_pbx_hangup(session, inbound, p) {
             continue;
@@ -2953,6 +2957,9 @@ impl LoopState {
         // fallback below lands on the same early dialog as the `180` that
         // `handle_invite` may already have sent (specs/084 FR-005).
         let to_tag = random_hex(4);
+        // Rings inside `handle_invite`; the line is occupied from here, not
+        // only once the call connects (specs/093).
+        p.obs.set_inbound_setup(true);
         match inbound::handle_invite(session, req, sink, inbound, &p.invite_ctx(), &to_tag) {
             Ok(call) => {
                 if call.is_none() {
@@ -2995,6 +3002,9 @@ impl LoopState {
                 );
             }
         }
+        // Setup is over either way. A connected call already counts through
+        // `set_active_calls(1)` above, so the line never reads free between.
+        p.obs.set_inbound_setup(false);
     }
 
     fn handle_carrier_bye(&mut self, p: &DispatchParams, req: &SipRequest, sink: &SipSink) {

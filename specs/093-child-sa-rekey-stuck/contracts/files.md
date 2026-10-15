@@ -6,12 +6,12 @@
 
 ## Format
 
-One unsigned decimal integer followed by a newline: the line's active-call count, `0` or `1` today.
+One unsigned decimal integer followed by a newline: how many calls occupy the line, `0` or `1` today. A call counts from the moment it starts being set up: an inbound call while it rings, an outbound call while it is being placed. It counts until the call ends or the attempt fails, not only once it connects.
 
 ## Writer: the VoWiFi IMS agent
 
 - Writes `0` at the start of every run, before any transport or registration work.
-- Rewrites the file every time it reports its active-call count (`AgentObservability::set_active_calls`).
+- Rewrites the file whenever that number changes: on `AgentObservability::set_active_calls`, around an inbound INVITE's ringing (`set_inbound_setup`), and once per dispatch-loop pass for an outbound attempt (`set_outbound_setup`, which writes only on a change).
 - Writes through `write_atomic` (temp file plus rename), so a reader never sees a torn value.
 - Never fails because of the file: write errors are ignored, at most logged at debug.
 - The VoLTE agent does not write it.
