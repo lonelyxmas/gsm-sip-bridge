@@ -79,8 +79,8 @@ Fixtures use synthetic identities only (`001010000000001`, `192.0.2.x`, `203.0.1
 - [X] T018 [P] Update `docs/configuration.md` (the `tunnel_address_family` row) and `config.toml.example` (its comment). The #107 symptom on a `dual` line is now an hourly `ChildSaRekeyStuck` planned rebuild, a few seconds without service, rather than an expiry followed by `ChildSaMissing`/`ChildSaStuck`. `ipv4` still removes it. `tests/test_config_docs.rs` must pass.
 - [X] T019 [P] In `RELEASE_NOTES.md`, add a `## Unreleased` entry with only the summary bold (memory). For example: **A failing tunnel rekey is now repaired before it drops the line** -- what changed for operators, the 300s/90s figures, call deferral, the new log line and reason, that it counts toward `[alerts.tunnel_failure]`, strongSwan engine only, no configuration change (#127). In `CHANGELOG.md`, add a `### Changed` entry under `[Unreleased]`.
 - [X] T020 Mark tasks done in this file. Run `make format && make lint && make test`. Commit: `docs(093): release notes, changelog and docs for the stuck-rekey rebuild`.
-- [ ] T021 Live check (quickstart.md "natural rekey"): build an image and run it on the local Vodafone rig via `test/` (memory: local docker tests). Watch one natural rekey: `#N` increments and no `rekey overdue` line appears. Record the result here.
-- [ ] T022 Push the branch and open the PR (`feat: rebuild the ePDG tunnel on a stuck CHILD_SA rekey (#127)`; the body links #127, #107 and #131 and covers the R1 finding about `REKEYING` sampling). Trigger a Greptile review. Fix its findings in code; never reply to Greptile comments (memory).
+- [X] T021 Live check (quickstart.md "natural rekey"): build an image and run it on the local Vodafone rig via `test/` (memory: local docker tests). Watch one natural rekey: `#N` increments and no `rekey overdue` line appears. Record the result here.
+- [X] T022 Push the branch and open the PR (`feat: rebuild the ePDG tunnel on a stuck CHILD_SA rekey (#127)`; the body links #127, #107 and #131 and covers the R1 finding about `REKEYING` sampling). Trigger a Greptile review. Fix its findings in code; never reply to Greptile comments (memory).
 
 ## Dependencies
 
@@ -97,3 +97,8 @@ Fixtures use synthetic identities only (`001010000000001`, `192.0.2.x`, `203.0.1
 ## Implementation strategy
 
 The MVP is Phase 2 plus Phase 3: on its own it removes the unplanned expiry and the ~60s of strikes. Phase 4 adds the call protection. Phase 5 adds docs, the live check and the PR.
+
+## Results
+
+- **T021, 2026-10-15, local Vodafone rig (`gsm-sip-bridge-test`, image `gsm-sip-bridge:stuck-rekey-093-local` built at 163ff57).** CHILD_SA `#1` was installed with `rekeying in 3355s, expires in 3958s`. It was naturally rekeyed to `#2` about 3390s later, with about 600s of its lifetime left, which is well above the 300s threshold. `#2` read `installed 11s ago, rekeying in 3266s, expires in 3950s`. The supervisor logged no `rekey overdue`, `ChildSaRekeyStuck`, `ChildSaMissing`, `ChildSaStuck` or `reports no expiry` line. The line stayed `Registered`, with `gm_connection: up` and `can_answer: true`, and `/tmp/pcscf-0.calls` read `0` while idle. SC-002 holds live for one natural rekey. The stuck path cannot be produced on this hardware; it is covered by T008–T011.
+- **T022: PR #132.** Greptile review 1 (4/5) found that a ringing or dialing call was not counted as occupying the line. Fixed in 163ff57. Review 2 (4/5) found that an outbound attempt was published only after its INVITE, which can block. Fixed in d3f5201. Review 3: 5/5, no findings. No replies were posted to the bot.
