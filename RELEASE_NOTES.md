@@ -1,9 +1,6 @@
 # Release Notes
 
-<!-- Rename the "## Unreleased" heading to the real "## vX.Y.Z" at release
-     time — publish.yml's notes extractor matches ^## v${TAG}$ exactly, so an
-     "Unreleased" heading is not picked up for the GitHub release. -->
-## Unreleased
+## v8.21.0
 
 - **A failing tunnel rekey is repaired before it drops the line** -- When a carrier's ePDG kept refusing a VoWiFi line's hourly CHILD_SA rekey, the bridge did nothing until the old CHILD_SA expired about 11 minutes later, at a moment nobody chose and possibly mid-call, and then needed another minute to notice and rebuild. Now a CHILD_SA still in place with under 5 minutes of its lifetime left is treated as a failed rekey and the tunnel is rebuilt then, while the old one still works: a few seconds without service instead of a minute or more. A call in progress is left alone until it ends or 90 seconds remain. The log shows `rekey overdue` with the carrier's last refusal (for example `N(INVAL_SEL)`) and the recovery `ChildSaRekeyStuck`, which counts toward `[alerts.tunnel_failure]` like other rebuilds. A healthy rekey never triggers it. Strongswan engine only; no configuration change (#127).
 - **Per-line tunnel address family for ePDGs that reject rekeys** -- An ePDG that assigns only an IPv4 inner address can reject every hourly CHILD_SA rekey that still proposes `::/0` with `INVALID_SELECTORS`, leaving the line without service for about a minute every hour. New `tunnel_address_family` under `[vowifi]` and `[[vowifi.line]]` (`dual`, the default, `ipv4` or `ipv6`) sets which inner address families a line's tunnel requests and carries; `ipv4` fixes the rejection reported in #107. It is opt-in: with the key unset or `dual`, every line negotiates exactly as before. A `dual` line now logs a hint pointing at the setting the first time a rekey is rejected that way in a tunnel session, and each line logs its effective family at startup. On an `ipv4` or `ipv6` line, P-CSCFs of the excluded family are ignored and logged. The `swu` engine refuses any value other than `dual`. Strongswan engine only; takes effect when the container is recreated (#126; #107).
