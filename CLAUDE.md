@@ -1,7 +1,7 @@
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan at
-`specs/092-epdg-inner-address-family/plan.md`.
+`specs/093-child-sa-rekey-stuck/plan.md`.
 <!-- SPECKIT END -->
 
 ## Pre-commit Checklist

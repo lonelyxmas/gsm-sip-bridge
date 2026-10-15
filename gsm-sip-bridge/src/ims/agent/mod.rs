@@ -250,6 +250,15 @@ fn run_inner(
     // registration machinery (specs/015-volte-host-ims); the LTE IMS PDN is
     // the other. For VoWiFi this is exactly the P-CSCF file read that used to
     // sit inline here — same source, same port, same error text.
+    // Before anything that can fail: an agent killed mid-call leaves a `1`
+    // behind, and its successor must clear it even if it never registers, or
+    // the supervisor would hold a stuck-rekey rebuild for a call that is gone
+    // (specs/093 research R5). Best-effort, like the count itself.
+    let _ = crate::ims::pcscf_files::write_active_calls(
+        &crate::ims::pcscf_files::calls_path(&config.pcscf_source_path),
+        0,
+    );
+
     let mut transport = EpdgTransport::new(config.pcscf_source_path.clone(), 5060);
     let transport_handle = transport.prepare()?;
     tracing::info!(
@@ -851,6 +860,12 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         app_config.bridge.sip_destination.clone(),
         transport,
     );
+    // VoWiFi only: its tunnel supervisor holds a stuck-rekey rebuild for a
+    // call (specs/093). VoLTE has no `pcscf_source` and no such supervisor.
+    let obs = match &pcscf_source {
+        Some(src) => obs.with_calls_file(crate::ims::pcscf_files::calls_path(src)),
+        None => obs,
+    };
 
     // Under the modem lock: `register_session` reads the IMEI over the AT port
     // the cellular path's SMS reader also uses (no-op on Wi-Fi, where the lock
@@ -2364,6 +2379,10 @@ fn dispatch_loop(
     st.perform_sub_action(session, p, first);
     loop {
         st.sync_shared_status(p);
+        // An outbound call being placed occupies the line for the tunnel
+        // supervisor before it is bridged (specs/093). Reconciled here, once
+        // per pass, rather than at each of the places an attempt can end.
+        p.obs.set_outbound_setup(st.origination.is_some());
 
         if st.handle_pbx_hangup(session, inbound, p) {
             continue;
@@ -2801,6 +2820,11 @@ impl LoopState {
         // this thread indefinitely, exactly as the modem read did. The *waiting*
         // afterwards is tick-driven and needs no phase; `Phase::Origination`
         // therefore covers precisely this call and nothing else.
+        // Occupied from before the INVITE goes out, which can block: waiting
+        // for the next dispatch pass to publish it would leave the attempt
+        // unprotected from a stuck-rekey rebuild meanwhile (specs/093). The
+        // loop-top reconcile clears it again if the attempt never started.
+        p.obs.set_outbound_setup(true);
         self.origination = {
             let _phase = p.progress.phase_guard(watchdog::Phase::Origination);
             begin_origination(
@@ -2938,6 +2962,9 @@ impl LoopState {
         // fallback below lands on the same early dialog as the `180` that
         // `handle_invite` may already have sent (specs/084 FR-005).
         let to_tag = random_hex(4);
+        // Rings inside `handle_invite`; the line is occupied from here, not
+        // only once the call connects (specs/093).
+        p.obs.set_inbound_setup(true);
         match inbound::handle_invite(session, req, sink, inbound, &p.invite_ctx(), &to_tag) {
             Ok(call) => {
                 if call.is_none() {
@@ -2980,6 +3007,9 @@ impl LoopState {
                 );
             }
         }
+        // Setup is over either way. A connected call already counts through
+        // `set_active_calls(1)` above, so the line never reads free between.
+        p.obs.set_inbound_setup(false);
     }
 
     fn handle_carrier_bye(&mut self, p: &DispatchParams, req: &SipRequest, sink: &SipSink) {

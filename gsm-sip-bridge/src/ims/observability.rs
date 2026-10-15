@@ -37,6 +37,24 @@ pub struct AgentObservability {
     /// `transport` label.
     transport: Transport,
     state: Mutex<AgentState>,
+    /// Where the active-call count is mirrored for this line's tunnel
+    /// supervisor, which holds a stuck-rekey rebuild for a call (specs/093
+    /// `contracts/files.md`). VoWiFi only; `None` on VoLTE.
+    calls_file: Option<std::path::PathBuf>,
+    /// Calls being set up, which [`Self::calls_file`] counts as occupying the
+    /// line though the `active_calls` gauge does not: an inbound call ringing
+    /// or an outbound one being placed would be cut by a rebuild as surely as
+    /// a connected one.
+    setup: Mutex<CallSetup>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CallSetup {
+    inbound: bool,
+    outbound: bool,
+    /// What the calls file was last written with, so an unchanged state is
+    /// not rewritten on every dispatch-loop pass.
+    written: Option<u32>,
 }
 
 impl AgentObservability {
@@ -54,7 +72,15 @@ impl AgentObservability {
             sip_destination,
             transport,
             state: Mutex::new(AgentState::default()),
+            calls_file: None,
+            setup: Mutex::new(CallSetup::default()),
         }
+    }
+
+    /// Also mirror every active-call count into `path`.
+    pub fn with_calls_file(mut self, path: std::path::PathBuf) -> Self {
+        self.calls_file = Some(path);
+        self
     }
 
     fn push(&self, events: Vec<ObservedEvent>) {
@@ -67,7 +93,51 @@ impl AgentObservability {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .active_calls = Some(n);
+        self.sync_calls_file();
         self.push(Vec::new());
+    }
+
+    /// An inbound call is ringing (`true`) or its setup has ended either way.
+    pub fn set_inbound_setup(&self, on: bool) {
+        self.setup.lock().unwrap_or_else(|e| e.into_inner()).inbound = on;
+        self.sync_calls_file();
+    }
+
+    /// An outbound call is being placed (`true`) or is not. Cheap to call on
+    /// every dispatch-loop pass: the file is only rewritten on a change.
+    pub fn set_outbound_setup(&self, on: bool) {
+        self.setup
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .outbound = on;
+        self.sync_calls_file();
+    }
+
+    /// Mirrors "how many calls occupy this line" (connected plus being set
+    /// up) into the calls file, for the tunnel supervisor (specs/093).
+    fn sync_calls_file(&self) {
+        let Some(path) = &self.calls_file else {
+            return;
+        };
+        let active = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active_calls
+            .unwrap_or(0);
+        let mut setup = self.setup.lock().unwrap_or_else(|e| e.into_inner());
+        let n = active.max(u32::from(setup.inbound || setup.outbound));
+        if setup.written == Some(n) {
+            return;
+        }
+        // Best-effort like every other report: a write that fails costs only
+        // the deferral, and the supervisor reads a missing file as "no call".
+        match crate::ims::pcscf_files::write_active_calls(path, n) {
+            Ok(()) => setup.written = Some(n),
+            Err(e) => {
+                tracing::debug!(error = %e, path = %path.display(), "could not write the active-call count")
+            }
+        }
     }
 
     pub fn set_registered(&self, registered: bool) {
@@ -250,6 +320,44 @@ pub fn map_bridge_failure_reason(raw: &str) -> BridgeFailureReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calls_in_progress_or_being_set_up_are_mirrored_into_the_calls_file() {
+        let dir = std::env::temp_dir().join(format!("obs-calls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pcscf-0.calls");
+        let obs = AgentObservability::new(
+            Reporter::spawn(
+                dir.join("no-daemon.sock").display().to_string(),
+                crate::control::protocol::AgentKind::Ims,
+                "card0".into(),
+                std::time::Duration::from_secs(3600),
+            ),
+            "card0".into(),
+            None,
+            "sip:pbx@192.0.2.1".into(),
+            Transport::Vowifi,
+        )
+        .with_calls_file(path.clone());
+        let read = || std::fs::read_to_string(&path).unwrap();
+        obs.set_active_calls(1);
+        assert_eq!(read(), "1\n");
+        obs.set_active_calls(0);
+        assert_eq!(read(), "0\n");
+        // A call being set up occupies the line before the gauge counts it.
+        obs.set_inbound_setup(true);
+        assert_eq!(read(), "1\n", "ringing");
+        obs.set_active_calls(1);
+        obs.set_inbound_setup(false);
+        assert_eq!(read(), "1\n", "answered: still occupied");
+        obs.set_active_calls(0);
+        assert_eq!(read(), "0\n");
+        obs.set_outbound_setup(true);
+        assert_eq!(read(), "1\n", "dialing");
+        obs.set_outbound_setup(false);
+        assert_eq!(read(), "0\n", "the attempt failed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn map_bridge_failure_reason_covers_every_known_reason_constant() {

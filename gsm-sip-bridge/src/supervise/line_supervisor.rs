@@ -54,6 +54,11 @@ pub enum DegradeReason {
     /// surviving IKE_SA, and only a fresh IKE_SA recovers. The agent must
     /// re-register because the new IKE_SA brings a new VIP/P-CSCF pool.
     ChildSaStuck,
+    /// The same CHILD_SA outlived the window a natural rekey replaces it in,
+    /// so its rekey has failed, and it was rebuilt before its hard expiry
+    /// rather than after (#127, specs/093). Same remedy as `ChildSaStuck`;
+    /// the difference is that the old CHILD_SA was still carrying traffic.
+    ChildSaRekeyStuck,
     PcscfChanged,
     /// The P-CSCF became unreachable from inside this line's namespace for
     /// several consecutive ticks, while every structural check still passed
@@ -91,7 +96,9 @@ pub enum DegradeReason {
 /// concept."
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SteadyStateHealth {
-    Ok,
+    /// Structurally healthy, with the newest usable CHILD_SA's lifetime.
+    /// `None` when the engine reports no CHILD_SA lifetimes (swu).
+    Ok(Option<ChildSaLifetime>),
     ViciBroken,
     TunVanished,
     /// No IKE_SA is listed for this connection at all (specs/087).
@@ -99,6 +106,19 @@ pub enum SteadyStateHealth {
     /// An IKE_SA is listed (any state, `CONNECTING` included) but has no
     /// usable CHILD_SA.
     ChildSaMissing,
+}
+
+/// What one steady-state tick saw of a line's newest usable CHILD_SA
+/// (specs/093). The newest is the highest `#N`, so during a rekey's brief
+/// overlap the replacement is judged, never the SA it is replacing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildSaLifetime {
+    /// The `#N` on the CHILD_SA's `--list-sas` header (vici's `uniqueid`).
+    /// It changes whenever the CHILD_SA is replaced, by a rekey or otherwise.
+    pub unique_id: u32,
+    /// Seconds until the hard expiry (`expires in Ns`); `None` when the
+    /// listing carries no such field.
+    pub expires_in: Option<i64>,
 }
 
 /// Matches the establish-time loop's `sleep 2` between polls, both engines.
@@ -184,6 +204,17 @@ pub trait TunnelEngine {
     /// strongswan engine can tell; the default is `Unknown` (specs/087).
     fn ike_sa_loss_cause(&self, _runner: &dyn CommandRunner) -> IkeSaLossCause {
         IkeSaLossCause::Unknown
+    }
+    /// The notify the ePDG last refused a CHILD_SA with in the current
+    /// IKE_SA session, for the stuck-rekey log line only (specs/093 R4). Only
+    /// the strongswan engine can tell; the default is `None`.
+    fn child_sa_rejection(&self, _runner: &dyn CommandRunner) -> Option<String> {
+        None
+    }
+    /// What the steady-state tick's own log lines start with, naming this
+    /// line and connection (`[supervise] line 0: ims0`).
+    fn log_prefix(&self) -> String {
+        "[supervise]".to_string()
     }
     /// Steady-state-only health beyond process-alive/P-CSCF-change.
     fn steady_state_health(&self, runner: &dyn CommandRunner) -> SteadyStateHealth;
@@ -334,12 +365,45 @@ pub struct SteadyTracking {
     pub child_sa_missing: u32,
     /// Whether the last tick saw a usable CHILD_SA.
     pub child_sa_usable: bool,
+    /// The CHILD_SA (`#N`) a stuck-rekey rebuild was already issued for, so
+    /// it gets exactly one (specs/093 FR-006). Like the two fields below, it
+    /// only counts while that `#N` is still the line's newest usable CHILD_SA.
+    pub rekey_stuck_rebuilt: Option<u32>,
+    /// The CHILD_SA whose stuck-rekey deferral for an active call was logged.
+    pub rekey_stuck_deferral_logged: Option<u32>,
+    /// The CHILD_SA whose missing `expires in` was logged (FR-011).
+    pub lifetime_missing_logged: Option<u32>,
+}
+
+impl SteadyTracking {
+    /// Forgets every per-CHILD_SA stuck-rekey guard.
+    fn clear_rekey_guards(&mut self) {
+        self.rekey_stuck_rebuilt = None;
+        self.rekey_stuck_deferral_logged = None;
+        self.lifetime_missing_logged = None;
+    }
 }
 
 /// Consecutive missing-CHILD_SA ticks before the IKE_SA is rebuilt. Tick-based
 /// on purpose: only the strongswan engine, polled every 30s, ever reports
 /// `ChildSaMissing`, so 2 is about 60s. No backoff between repeated rebuilds.
 pub const CHILD_SA_MISSING_STRIKES: u32 = 2;
+
+/// Time to hard expiry under which a CHILD_SA that is still the same `#N` has
+/// a stuck rekey (specs/093 R2).
+///
+/// With the daemon's default lifetimes (rekey 3600s with up to 360s of jitter
+/// below it, hard expiry 3960s) a natural rekey replaces the CHILD_SA with
+/// 360-720s still left, so a CHILD_SA that is still around with less than
+/// 300s has not been replaced and will not be. The first 30s tick to see it
+/// still has 270s or more, far more than a rebuild takes.
+pub const REKEY_STUCK_THRESHOLD: Duration = Duration::from_secs(300);
+
+/// Time to hard expiry under which a stuck-rekey rebuild goes ahead even
+/// during a call (specs/093 R6): the call is about to be cut by the expiry
+/// anyway, and a planned rebuild recovers sooner than an expiry does. The
+/// first tick under it still leaves 60s or more for the rebuild.
+pub const REKEY_STUCK_FORCE_MARGIN: Duration = Duration::from_secs(90);
 
 /// IKE_SA rebuilds within the tunnel-failure window that count as flapping.
 pub const FLAP_REBUILDS: usize = 3;
@@ -420,7 +484,15 @@ pub fn tick_steady_state(
     tracking: &mut SteadyTracking,
     poll_interval: Duration,
 ) -> SteadyOutcome {
-    tick_steady_state_with_pool(engine, runner, current_pcscf, &[], tracking, poll_interval)
+    tick_steady_state_with_pool(
+        engine,
+        runner,
+        current_pcscf,
+        &[],
+        tracking,
+        poll_interval,
+        &|| false,
+    )
 }
 
 /// [`tick_steady_state`] for a line whose whole advertised pool is known
@@ -440,12 +512,14 @@ pub fn tick_steady_state_with_pool(
     current_pool: &[String],
     tracking: &mut SteadyTracking,
     poll_interval: Duration,
+    call_active: &dyn Fn() -> bool,
 ) -> SteadyOutcome {
     if !engine.is_process_alive(runner) {
         // A respawned charon starts a fresh connection that gets its own first
         // retry, so a miss counted against the old one must not carry over.
         tracking.child_sa_missing = 0;
         tracking.child_sa_usable = false;
+        tracking.clear_rekey_guards();
         engine.restart_process(runner);
         return SteadyOutcome::Recovered {
             reason: DegradeReason::ProcessDied,
@@ -456,9 +530,12 @@ pub fn tick_steady_state_with_pool(
     let health = engine.steady_state_health(runner);
     // Only a fully healthy structural check counts as a usable CHILD_SA; an
     // unreachable P-CSCF later in the tick does not undo that (specs/086).
-    tracking.child_sa_usable = matches!(health, SteadyStateHealth::Ok);
+    tracking.child_sa_usable = matches!(health, SteadyStateHealth::Ok(_));
     if health != SteadyStateHealth::ChildSaMissing {
         tracking.child_sa_missing = 0;
+    }
+    if !matches!(health, SteadyStateHealth::Ok(Some(_))) {
+        tracking.clear_rekey_guards();
     }
     match health {
         SteadyStateHealth::ViciBroken => {
@@ -541,7 +618,12 @@ pub fn tick_steady_state_with_pool(
                 ike_sa_loss_cause: None,
             };
         }
-        SteadyStateHealth::Ok => {}
+        SteadyStateHealth::Ok(None) => {}
+        SteadyStateHealth::Ok(Some(child)) => {
+            if let Some(outcome) = check_rekey_stuck(engine, runner, child, tracking, call_active) {
+                return outcome;
+            }
+        }
     }
 
     // Reachability is checked last, and deliberately *after* the P-CSCF-changed
@@ -612,6 +694,88 @@ pub fn tick_steady_state_with_pool(
     }
 
     SteadyOutcome::StillUp
+}
+
+/// The stuck-rekey decision for a structurally healthy tick (specs/093,
+/// data-model.md's decision table): `Some` when it rebuilt the tunnel.
+///
+/// The trigger is the newest CHILD_SA's own time to hard expiry, never its
+/// state. A refused rekey is answered within a round trip and the CHILD_SA
+/// reads `INSTALLED` again until the next retry a few seconds later, so a 30s
+/// tick would almost never catch it `REKEYING` (#107: 105 refusals in 11
+/// minutes). Being the same `#N` with less than [`REKEY_STUCK_THRESHOLD`] left
+/// is what every failed rekey has in common, whatever the carrier answered.
+fn check_rekey_stuck(
+    engine: &dyn TunnelEngine,
+    runner: &dyn CommandRunner,
+    child: ChildSaLifetime,
+    tracking: &mut SteadyTracking,
+    call_active: &dyn Fn() -> bool,
+) -> Option<SteadyOutcome> {
+    let id = child.unique_id;
+    // A guard set for an earlier CHILD_SA means nothing for this one.
+    for guard in [
+        &mut tracking.rekey_stuck_rebuilt,
+        &mut tracking.rekey_stuck_deferral_logged,
+        &mut tracking.lifetime_missing_logged,
+    ] {
+        if guard.is_some_and(|g| g != id) {
+            *guard = None;
+        }
+    }
+
+    let Some(expires_in) = child.expires_in else {
+        if tracking.lifetime_missing_logged != Some(id) {
+            tracking.lifetime_missing_logged = Some(id);
+            println!(
+                "{} CHILD_SA #{id} reports no expiry; stuck-rekey detection is off for it",
+                engine.log_prefix()
+            );
+        }
+        return None;
+    };
+    if expires_in > REKEY_STUCK_THRESHOLD.as_secs() as i64
+        || tracking.rekey_stuck_rebuilt == Some(id)
+    {
+        return None;
+    }
+
+    // Read only now, on a tick that would rebuild: a healthy line never
+    // touches the call-state file (specs/093 contracts/files.md).
+    let in_call = call_active();
+    let forced = expires_in <= REKEY_STUCK_FORCE_MARGIN.as_secs() as i64;
+    if in_call && !forced {
+        if tracking.rekey_stuck_deferral_logged != Some(id) {
+            tracking.rekey_stuck_deferral_logged = Some(id);
+            println!(
+                "{} CHILD_SA #{id} rekey overdue (expires in {expires_in}s); deferring the rebuild while a call is active (forced at {}s)",
+                engine.log_prefix(),
+                REKEY_STUCK_FORCE_MARGIN.as_secs()
+            );
+        }
+        return None;
+    }
+
+    let rejection = engine
+        .child_sa_rejection(runner)
+        .map(|n| format!(", last rejection N({n})"))
+        .unwrap_or_default();
+    let despite = if in_call {
+        " despite an active call"
+    } else {
+        ""
+    };
+    println!(
+        "{} CHILD_SA #{id} rekey overdue (expires in {expires_in}s{rejection}); rebuilding before the hard expiry{despite}",
+        engine.log_prefix()
+    );
+    tracking.rekey_stuck_rebuilt = Some(id);
+    engine.terminate(runner);
+    engine.reinitiate(runner);
+    Some(SteadyOutcome::Recovered {
+        reason: DegradeReason::ChildSaRekeyStuck,
+        ike_sa_loss_cause: None,
+    })
 }
 
 /// Whether a [`SteadyOutcome::Recovered`] reason also means "restart this
@@ -715,6 +879,8 @@ mod tests {
         /// Recovery calls in the order they were issued. Counts alone cannot
         /// express the ordering the TunVanished branch depends on.
         call_order: RefCell<Vec<&'static str>>,
+        /// What `child_sa_rejection` reports (specs/093 R4).
+        rejection: RefCell<Option<String>>,
     }
 
     impl Default for FakeEngine {
@@ -734,7 +900,7 @@ mod tests {
                 route_missing: RefCell::new(false),
                 route_repairs: RefCell::new(0),
                 alive: RefCell::new(true),
-                health: RefCell::new(SteadyStateHealth::Ok),
+                health: RefCell::new(SteadyStateHealth::Ok(None)),
                 max_attempts: None,
                 reinitiate_cadence: Some(STRONGSWAN_REINITIATE_EVERY),
                 terminate_calls: RefCell::new(0),
@@ -743,6 +909,7 @@ mod tests {
                 recreate_interface_calls: RefCell::new(0),
                 recreate_ok: true,
                 call_order: RefCell::new(Vec::new()),
+                rejection: RefCell::new(None),
             }
         }
     }
@@ -779,6 +946,10 @@ mod tests {
         fn ike_sa_loss_cause(&self, _runner: &dyn CommandRunner) -> IkeSaLossCause {
             self.call_order.borrow_mut().push("loss_cause");
             IkeSaLossCause::Unknown
+        }
+        fn child_sa_rejection(&self, _runner: &dyn CommandRunner) -> Option<String> {
+            self.call_order.borrow_mut().push("rejection");
+            self.rejection.borrow().clone()
         }
         fn repair_default_route(&self, _runner: &dyn CommandRunner) -> bool {
             if !*self.route_missing.borrow() {
@@ -1070,6 +1241,7 @@ mod tests {
                 &pool(&["10.0.0.10", "10.0.1.10"]),
                 &mut tracking,
                 STEADY_STATE_POLL_INTERVAL,
+                &|| false,
             );
             assert_eq!(outcome, SteadyOutcome::StillUp);
         }
@@ -1098,6 +1270,7 @@ mod tests {
                 &pool(&["10.0.0.10", "10.0.1.10"]),
                 &mut tracking,
                 STEADY_STATE_POLL_INTERVAL,
+                &|| false,
             );
         }
         assert_eq!(
@@ -1120,6 +1293,7 @@ mod tests {
             &pool(&["10.0.0.10", "10.0.1.10", "10.0.2.10"]),
             &mut SteadyTracking::default(),
             STEADY_STATE_POLL_INTERVAL,
+            &|| false,
         );
         assert_eq!(*engine.probed.borrow(), pool(&["10.0.0.10"]));
     }
@@ -1522,9 +1696,11 @@ mod tests {
             DegradeReason::ViciBroken,
             DegradeReason::TunVanished,
             DegradeReason::ChildSaStuck,
+            DegradeReason::ChildSaRekeyStuck,
             DegradeReason::IkeSaLost,
             DegradeReason::PcscfUnreachable,
         ] {
+            assert!(recovery_restarts_agent(r), "{r:?}");
             assert!(recovery_renegotiates(r), "{r:?}");
         }
     }
@@ -1586,7 +1762,7 @@ mod tests {
         };
         let mut tracking = SteadyTracking::default();
         child_sa_tick(&engine, &runner, &mut tracking);
-        *engine.health.borrow_mut() = SteadyStateHealth::Ok;
+        *engine.health.borrow_mut() = SteadyStateHealth::Ok(None);
         child_sa_tick(&engine, &runner, &mut tracking);
         *engine.health.borrow_mut() = SteadyStateHealth::ChildSaMissing;
         assert_eq!(
@@ -1690,7 +1866,7 @@ mod tests {
             SteadyStateHealth::TunVanished,
             SteadyStateHealth::ViciBroken,
         ] {
-            *engine.health.borrow_mut() = SteadyStateHealth::Ok;
+            *engine.health.borrow_mut() = SteadyStateHealth::Ok(None);
             tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
             assert!(tracking.child_sa_usable);
             *engine.health.borrow_mut() = health;
@@ -1698,7 +1874,7 @@ mod tests {
             assert!(!tracking.child_sa_usable, "{health:?}");
         }
 
-        *engine.health.borrow_mut() = SteadyStateHealth::Ok;
+        *engine.health.borrow_mut() = SteadyStateHealth::Ok(None);
         tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
         *engine.alive.borrow_mut() = false;
         tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
@@ -1784,6 +1960,7 @@ mod tests {
             DegradeReason::PcscfUnreachable,
             DegradeReason::DefaultRouteMissing,
             DegradeReason::ChildSaStuck,
+            DegradeReason::ChildSaRekeyStuck,
             DegradeReason::IkeSaLost,
         ] {
             match reason {
@@ -1794,6 +1971,8 @@ mod tests {
                 // A fresh IKE_SA brings a new VIP/P-CSCF pool, so the agent
                 // must re-register.
                 | DegradeReason::ChildSaStuck
+                // The same rebuild, done before the hard expiry (specs/093).
+                | DegradeReason::ChildSaRekeyStuck
                 // Likewise: a new IKE_SA, a new VIP and P-CSCF pool.
                 | DegradeReason::IkeSaLost
                 // A rebuilt tunnel means a new data path, which the agent has
@@ -1809,5 +1988,326 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- specs/093: stuck CHILD_SA rekey ---------------------------------
+
+    fn lifetime(unique_id: u32, expires_in: i64) -> SteadyStateHealth {
+        SteadyStateHealth::Ok(Some(ChildSaLifetime {
+            unique_id,
+            expires_in: Some(expires_in),
+        }))
+    }
+
+    const REKEY_STUCK: SteadyOutcome = SteadyOutcome::Recovered {
+        reason: DegradeReason::ChildSaRekeyStuck,
+        ike_sa_loss_cause: None,
+    };
+
+    /// One strongswan-cadence tick with `health` as the engine's report.
+    fn rekey_tick(
+        engine: &FakeEngine,
+        health: SteadyStateHealth,
+        tracking: &mut SteadyTracking,
+    ) -> SteadyOutcome {
+        rekey_tick_in_call(engine, health, tracking, &|| false)
+    }
+
+    fn rekey_tick_in_call(
+        engine: &FakeEngine,
+        health: SteadyStateHealth,
+        tracking: &mut SteadyTracking,
+        call_active: &dyn Fn() -> bool,
+    ) -> SteadyOutcome {
+        *engine.health.borrow_mut() = health;
+        super::tick_steady_state_with_pool(
+            engine,
+            &MockCommandRunner::new(),
+            "10.0.0.1",
+            &[],
+            tracking,
+            STEADY_STATE_POLL_INTERVAL,
+            call_active,
+        )
+    }
+
+    #[test]
+    fn rekey_stuck_defers_during_a_call() {
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking::default();
+        for expires in [290, 260] {
+            assert_eq!(
+                rekey_tick_in_call(&engine, lifetime(12, expires), &mut tracking, &|| true),
+                SteadyOutcome::StillUp
+            );
+            assert_eq!(tracking.rekey_stuck_deferral_logged, Some(12));
+        }
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn rekey_stuck_rebuilds_when_the_call_ends() {
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking::default();
+        assert_eq!(
+            rekey_tick_in_call(&engine, lifetime(12, 290), &mut tracking, &|| true),
+            SteadyOutcome::StillUp
+        );
+        assert_eq!(
+            rekey_tick_in_call(&engine, lifetime(12, 260), &mut tracking, &|| false),
+            REKEY_STUCK
+        );
+        assert_eq!(*engine.terminate_calls.borrow(), 1);
+    }
+
+    #[test]
+    fn rekey_stuck_forced_under_margin() {
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking::default();
+        let mut expires = 290;
+        while expires > REKEY_STUCK_FORCE_MARGIN.as_secs() as i64 {
+            assert_eq!(
+                rekey_tick_in_call(&engine, lifetime(12, expires), &mut tracking, &|| true),
+                SteadyOutcome::StillUp,
+                "{expires}"
+            );
+            expires -= 30;
+        }
+        assert!(expires > 0, "the forced rebuild still has {expires}s");
+        assert_eq!(
+            rekey_tick_in_call(&engine, lifetime(12, expires), &mut tracking, &|| true),
+            REKEY_STUCK
+        );
+        assert_eq!(*engine.terminate_calls.borrow(), 1);
+    }
+
+    #[test]
+    fn rekey_stuck_call_state_read_only_when_stuck() {
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking::default();
+        let reads = std::cell::Cell::new(0);
+        let call_active = || {
+            reads.set(reads.get() + 1);
+            false
+        };
+        rekey_tick_in_call(&engine, lifetime(12, 3000), &mut tracking, &call_active);
+        rekey_tick_in_call(&engine, lifetime(12, 301), &mut tracking, &call_active);
+        assert_eq!(reads.get(), 0);
+        rekey_tick_in_call(&engine, lifetime(12, 290), &mut tracking, &call_active);
+        assert_eq!(reads.get(), 1);
+    }
+
+    #[test]
+    fn rekey_stuck_rebuilds_at_threshold() {
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking::default();
+        assert_eq!(
+            rekey_tick(&engine, lifetime(12, 300), &mut tracking),
+            REKEY_STUCK
+        );
+        assert_eq!(
+            *engine.call_order.borrow(),
+            vec!["rejection", "terminate", "reinitiate"]
+        );
+        assert_eq!(tracking.rekey_stuck_rebuilt, Some(12));
+    }
+
+    #[test]
+    fn rekey_stuck_above_threshold_is_still_up() {
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking::default();
+        assert_eq!(
+            rekey_tick(&engine, lifetime(12, 301), &mut tracking),
+            SteadyOutcome::StillUp
+        );
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+        assert!(!engine.call_order.borrow().contains(&"rejection"));
+    }
+
+    #[test]
+    fn rekey_stuck_rebuilds_once_per_child_sa() {
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking::default();
+        assert_eq!(
+            rekey_tick(&engine, lifetime(12, 290), &mut tracking),
+            REKEY_STUCK
+        );
+        // The terminate did not take; the same CHILD_SA is still listed.
+        for expires in [260, 230, 30] {
+            assert_eq!(
+                rekey_tick(&engine, lifetime(12, expires), &mut tracking),
+                SteadyOutcome::StillUp
+            );
+        }
+        assert_eq!(*engine.terminate_calls.borrow(), 1);
+    }
+
+    #[test]
+    fn rekey_stuck_new_child_sa_rearms() {
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking::default();
+        assert_eq!(
+            rekey_tick(&engine, lifetime(12, 290), &mut tracking),
+            REKEY_STUCK
+        );
+        assert_eq!(
+            rekey_tick(&engine, lifetime(13, 3960), &mut tracking),
+            SteadyOutcome::StillUp
+        );
+        assert_eq!(
+            tracking.rekey_stuck_rebuilt, None,
+            "a new CHILD_SA clears the guard"
+        );
+        assert_eq!(
+            rekey_tick(&engine, lifetime(13, 290), &mut tracking),
+            REKEY_STUCK
+        );
+        assert_eq!(*engine.terminate_calls.borrow(), 2);
+    }
+
+    #[test]
+    fn rekey_stuck_natural_rekey_overlap_never_rebuilds() {
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking::default();
+        for health in [
+            lifetime(12, 700),
+            lifetime(12, 400),
+            lifetime(12, 370),
+            // The rekey landed: the replacement is the newest.
+            lifetime(13, 3960),
+            lifetime(13, 3930),
+        ] {
+            assert_eq!(
+                rekey_tick(&engine, health, &mut tracking),
+                SteadyOutcome::StillUp
+            );
+        }
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn rekey_stuck_structural_failure_takes_precedence() {
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking::default();
+        assert_eq!(
+            rekey_tick(&engine, lifetime(12, 290), &mut tracking),
+            REKEY_STUCK
+        );
+        assert_eq!(
+            rekey_tick(&engine, SteadyStateHealth::ChildSaMissing, &mut tracking),
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::ChildSaMissing,
+                ike_sa_loss_cause: None,
+            }
+        );
+        assert_eq!(tracking.rekey_stuck_rebuilt, None);
+    }
+
+    #[test]
+    fn rekey_stuck_no_lifetime_logs_once_and_never_rebuilds() {
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking::default();
+        let no_expiry = SteadyStateHealth::Ok(Some(ChildSaLifetime {
+            unique_id: 12,
+            expires_in: None,
+        }));
+        for _ in 0..2 {
+            assert_eq!(
+                rekey_tick(&engine, no_expiry, &mut tracking),
+                SteadyOutcome::StillUp
+            );
+            assert_eq!(tracking.lifetime_missing_logged, Some(12));
+        }
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn rekey_stuck_swu_none_does_nothing() {
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking::default();
+        assert_eq!(
+            rekey_tick(&engine, SteadyStateHealth::Ok(None), &mut tracking),
+            SteadyOutcome::StillUp
+        );
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn rekey_stuck_process_died_clears_guards() {
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking::default();
+        assert_eq!(
+            rekey_tick(&engine, lifetime(12, 290), &mut tracking),
+            REKEY_STUCK
+        );
+        *engine.alive.borrow_mut() = false;
+        rekey_tick(&engine, lifetime(12, 260), &mut tracking);
+        assert_eq!(tracking.rekey_stuck_rebuilt, None);
+    }
+
+    #[test]
+    fn rekey_stuck_names_the_last_rejection() {
+        // The reason is only read once the rebuild is decided; it never
+        // triggers one by itself (clarification Q2).
+        let engine = FakeEngine {
+            rejection: RefCell::new(Some("INVAL_SEL".into())),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        assert_eq!(
+            rekey_tick(&engine, lifetime(12, 3000), &mut tracking),
+            SteadyOutcome::StillUp
+        );
+        assert_eq!(
+            rekey_tick(&engine, lifetime(12, 290), &mut tracking),
+            REKEY_STUCK
+        );
+    }
+
+    /// SC-002: six hours of healthy hourly rekeys at the 30s cadence never
+    /// trigger a rebuild, wherever in its jitter window each rekey lands.
+    #[test]
+    fn rekey_stuck_six_hour_soak_of_natural_rekeys() {
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking::default();
+        let mut id = 1;
+        let mut expires: i64 = 3960;
+        // Remaining lifetime at which each successive rekey lands: the edges
+        // of the 360-720s window and points between.
+        let rekey_at = [360, 720, 400, 661, 365, 500, 710];
+        let mut rekeys = 0;
+        for _ in 0..720 {
+            assert_eq!(
+                rekey_tick(&engine, lifetime(id, expires), &mut tracking),
+                SteadyOutcome::StillUp,
+                "#{id} at {expires}s"
+            );
+            expires -= 30;
+            if expires <= rekey_at[rekeys % rekey_at.len()] {
+                id += 1;
+                rekeys += 1;
+                expires = 3960;
+            }
+        }
+        assert!(rekeys >= 6, "{rekeys} rekeys");
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+    }
+
+    /// SC-001/SC-003: a #107-style window -- the same CHILD_SA aging all the
+    /// way to its hard expiry -- gets exactly one rebuild, with time to spare.
+    #[test]
+    fn rekey_stuck_107_replay_rebuilds_once_with_margin() {
+        let engine = FakeEngine::default();
+        let mut tracking = SteadyTracking::default();
+        let mut rebuilt_at = Vec::new();
+        let mut expires: i64 = 3960 - 7;
+        while expires > 0 {
+            if rekey_tick(&engine, lifetime(12, expires), &mut tracking) == REKEY_STUCK {
+                rebuilt_at.push(expires);
+            }
+            expires -= 30;
+        }
+        assert_eq!(rebuilt_at.len(), 1, "{rebuilt_at:?}");
+        assert!(rebuilt_at[0] >= 270, "{rebuilt_at:?}");
     }
 }

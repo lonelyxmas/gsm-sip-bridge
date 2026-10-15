@@ -5,7 +5,7 @@
 //! current script's `grep`/`sed` pattern with the same fixture the original
 //! bash comment used, tested independently of any [`CommandRunner`].
 
-use super::line_supervisor::{SteadyStateHealth, TunnelEngine};
+use super::line_supervisor::{ChildSaLifetime, SteadyStateHealth, TunnelEngine};
 use super::runner::{ChildHandle, ChildSpec, CommandRunner};
 use crate::config::TunnelAddressFamily;
 use crate::control::protocol::IkeSaLossCause;
@@ -224,18 +224,72 @@ const USABLE_CHILD_SA_STATES: &[&str] = &["INSTALLED", "REKEYING", "REKEYED", "U
 /// scoped to one connection so another line's healthy SA never masks this
 /// one's missing one.
 pub fn list_sas_has_child_sa(sas_output: &str, conn_name: &str) -> bool {
-    let prefix = format!("{conn_name}: #");
-    sas_output.lines().any(|l| {
-        let Some(rest) = l.strip_prefix("  ") else {
-            return false;
+    sas_output
+        .lines()
+        .filter_map(|l| child_sa_header(l, conn_name))
+        .any(|(_, state)| USABLE_CHILD_SA_STATES.contains(&state))
+}
+
+/// `(unique_id, state)` from a CHILD_SA header line of `conn_name`
+/// (`  ims0: #12, reqid 1, INSTALLED, ...`), or `None` for any other line.
+///
+/// Shared by [`list_sas_has_child_sa`] and [`newest_child_sa_lifetime`] so
+/// "is there a usable CHILD_SA" and "which one is it" can never disagree about
+/// what a CHILD_SA line looks like.
+fn child_sa_header<'a>(line: &'a str, conn_name: &str) -> Option<(u32, &'a str)> {
+    let rest = line.strip_prefix("  ")?;
+    if rest.starts_with(' ') {
+        return None;
+    }
+    let rest = rest.strip_prefix(conn_name)?.strip_prefix(": #")?;
+    let mut fields = rest.split(", ");
+    let id = fields.next()?.parse().ok()?;
+    let state = fields.nth(1)?;
+    Some((id, state))
+}
+
+/// The newest usable CHILD_SA of `conn_name` and its time to hard expiry,
+/// from `swanctl --list-sas` (specs/093 research R1).
+///
+/// "Newest" is the highest `#N`, so during a natural rekey's overlap (old
+/// `REKEYED` beside new `INSTALLED`) the replacement, with its full lifetime,
+/// is what gets judged. The lifetime is the `expires in Ns` field on the
+/// details line right under the header, as the pinned 5.9.3 prints it:
+///
+/// ```text
+///   ims0: #12, reqid 1, INSTALLED, TUNNEL-in-UDP, ESP:AES_CBC-128/HMAC_SHA1_96
+///     installed 1109s ago, rekeying in 2167s, expires in 2852s
+/// ```
+///
+/// `expires_in` is `None` when that field is missing; the CHILD_SA is still
+/// reported, so the caller can tell "no lifetime" from "no CHILD_SA".
+pub fn newest_child_sa_lifetime(sas_output: &str, conn_name: &str) -> Option<ChildSaLifetime> {
+    let mut newest: Option<ChildSaLifetime> = None;
+    let mut lines = sas_output.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some((unique_id, state)) = child_sa_header(line, conn_name) else {
+            continue;
         };
-        if rest.starts_with(' ') || !rest.starts_with(&prefix) {
-            return false;
+        if !USABLE_CHILD_SA_STATES.contains(&state) {
+            continue;
         }
-        rest.split(", ")
-            .nth(2)
-            .is_some_and(|state| USABLE_CHILD_SA_STATES.contains(&state))
-    })
+        let expires_in = lines
+            .peek()
+            .filter(|d| d.starts_with("    ") && !d.starts_with("     "))
+            .and_then(|d| {
+                d.split(", ")
+                    .find_map(|f| f.trim().strip_prefix("expires in "))
+            })
+            .and_then(|v| v.strip_suffix('s'))
+            .and_then(|v| v.parse().ok());
+        if newest.is_none_or(|n| unique_id > n.unique_id) {
+            newest = Some(ChildSaLifetime {
+                unique_id,
+                expires_in,
+            });
+        }
+    }
+    newest
 }
 
 /// Whether `swanctl --list-sas --ike <conn>` lists an IKE_SA for `conn_name`
@@ -303,6 +357,53 @@ pub fn child_rekey_invalid_selectors_session(charon_log: &str, conn_name: &str) 
         }
     }
     session.filter(|_| rejected)
+}
+
+/// The notify the ePDG most recently refused a CREATE_CHILD_SA with in the
+/// current IKE_SA session (`"INVAL_SEL"`, `"TS_UNACCEPT"`, ...), or `None` if
+/// the latest one succeeded or none was refused (specs/093 research R4).
+///
+/// Only ever used to explain a stuck-rekey rebuild in its log line, never to
+/// trigger one: the trigger is the CHILD_SA's own lifetime, which works the
+/// same whatever (if anything) the carrier answered. Scoped per session like
+/// [`child_rekey_invalid_selectors_session`]. A refusal is a response whose
+/// payloads are all notifies (`[ N(INVAL_SEL) ]`); a success carries an `SA`
+/// (`[ SA No TSi TSr ]`) and clears it.
+pub fn child_sa_rejection_notify(charon_log: &str, conn_name: &str) -> Option<String> {
+    let established = format!("IKE_SA {conn_name}[");
+    let mut notify: Option<String> = None;
+    for line in lines_for_conn(charon_log, conn_name) {
+        if line
+            .find(&established)
+            .is_some_and(|pos| line[pos..].contains("] established"))
+        {
+            notify = None;
+            continue;
+        }
+        let Some(pos) = line.find("CREATE_CHILD_SA response") else {
+            continue;
+        };
+        let rest = &line[pos..];
+        let Some(payloads) = rest.find("[ ").and_then(|start| {
+            rest[start + 2..]
+                .find(" ]")
+                .map(|end| &rest[start + 2..start + 2 + end])
+        }) else {
+            continue;
+        };
+        let Some(first) = payloads.split_whitespace().next() else {
+            continue;
+        };
+        notify = if payloads.split_whitespace().all(|t| t.starts_with("N(")) {
+            first
+                .strip_prefix("N(")
+                .and_then(|t| t.strip_suffix(')'))
+                .map(str::to_string)
+        } else {
+            None
+        };
+    }
+    notify
 }
 
 /// The single charon daemon shared by every strongswan-engine line.
@@ -685,6 +786,17 @@ impl TunnelEngine for StrongswanEngine {
             .unwrap_or(IkeSaLossCause::Unknown)
     }
 
+    fn log_prefix(&self) -> String {
+        format!("[supervise] line {}: {}", self.idx, self.conn_name)
+    }
+
+    fn child_sa_rejection(&self, runner: &dyn CommandRunner) -> Option<String> {
+        runner
+            .read_file(&self.shared.charon_log)
+            .ok()
+            .and_then(|c| child_sa_rejection_notify(&c, &self.conn_name))
+    }
+
     /// Graceful delete first, forced only if the ePDG does not acknowledge it
     /// (specs/087, research R3).
     ///
@@ -782,7 +894,7 @@ impl TunnelEngine for StrongswanEngine {
             );
             return SteadyStateHealth::ChildSaMissing;
         }
-        SteadyStateHealth::Ok
+        SteadyStateHealth::Ok(newest_child_sa_lifetime(&sas_output, &self.conn_name))
     }
 
     /// Recovery for "the process died" and "vici is unreachable".
@@ -988,7 +1100,7 @@ impl TunnelEngine for SwuEngine {
         // The swu steady-state loop has exactly one check (is the dialer
         // alive), already covered by `is_process_alive` before this is ever
         // consulted — so there is nothing left for this engine to report.
-        SteadyStateHealth::Ok
+        SteadyStateHealth::Ok(None)
     }
 
     fn restart_process(&self, runner: &dyn CommandRunner) {
@@ -1193,7 +1305,121 @@ mod tests {
     }
 
     fn child(conn: &str, n: u32, state: &str) -> String {
-        format!("  {conn}: #{n}, reqid 1, {state}, TUNNEL-in-UDP, ESP:AES_CBC-128/HMAC_SHA1_96\n    installed 10 ago\n")
+        format!("  {conn}: #{n}, reqid 1, {state}, TUNNEL-in-UDP, ESP:AES_CBC-128/HMAC_SHA1_96\n    installed 10s ago\n")
+    }
+
+    /// A CHILD_SA in the exact shape the pinned 5.9.3 prints, details line
+    /// included (specs/093 research R1, sampled live; identities synthetic).
+    fn child_with_life(conn: &str, n: u32, state: &str, details: &str) -> String {
+        format!(
+            "  {conn}: #{n}, reqid 1, {state}, TUNNEL-in-UDP, ESP:AES_CBC-128/HMAC_SHA1_96\n    {details}\n    in  cea6576a (-|0x00000017),  21600 bytes,   242 packets,     4s ago\n    local  192.0.2.10/32\n    remote 0.0.0.0/0\n"
+        )
+    }
+
+    fn life(n: u32, expires_in: Option<i64>) -> Option<ChildSaLifetime> {
+        Some(ChildSaLifetime {
+            unique_id: n,
+            expires_in,
+        })
+    }
+
+    #[test]
+    fn child_sa_lifetime_table() {
+        let h = ike_header("ims0");
+        let full = "installed 1109s ago, rekeying in 2167s, expires in 2852s";
+        let cases: Vec<(String, Option<ChildSaLifetime>)> = vec![
+            (
+                format!("{h}{}", child_with_life("ims0", 12, "INSTALLED", full)),
+                life(12, Some(2852)),
+            ),
+            // A natural rekey's overlap: the replacement is the one judged.
+            (
+                format!(
+                    "{h}{}{}",
+                    child_with_life(
+                        "ims0",
+                        12,
+                        "REKEYED",
+                        "installed 3660s ago, expires in 300s"
+                    ),
+                    child_with_life(
+                        "ims0",
+                        13,
+                        "INSTALLED",
+                        "installed 0s ago, rekeying in 3300s, expires in 3960s"
+                    )
+                ),
+                life(13, Some(3960)),
+            ),
+            (
+                format!(
+                    "{h}{}",
+                    child_with_life(
+                        "ims0",
+                        12,
+                        "REKEYING",
+                        "installed 3670s ago, rekeying in -40s, expires in 290s"
+                    )
+                ),
+                life(12, Some(290)),
+            ),
+            // A replacement still being installed is not usable yet.
+            (
+                format!(
+                    "{h}{}{}",
+                    child_with_life("ims0", 12, "INSTALLED", full),
+                    child_with_life("ims0", 13, "INSTALLING", "installed 0s ago")
+                ),
+                life(12, Some(2852)),
+            ),
+            (
+                format!(
+                    "{h}{}",
+                    child_with_life("ims0", 12, "INSTALLED", "installed 1109s ago")
+                ),
+                life(12, None),
+            ),
+            (
+                format!("{h}{}", child("ims0", 4, "INSTALLED")),
+                life(4, None),
+            ),
+            (
+                format!(
+                    "{}{}",
+                    ike_header("ims1"),
+                    child_with_life("ims1", 2, "INSTALLED", full)
+                ),
+                None,
+            ),
+            (
+                format!(
+                    "{}{}",
+                    ike_header("ims10"),
+                    child_with_life("ims10", 2, "INSTALLED", full)
+                ),
+                None,
+            ),
+            (h.clone(), None),
+            (String::new(), None),
+        ];
+        for (i, (out, want)) in cases.iter().enumerate() {
+            assert_eq!(
+                newest_child_sa_lifetime(out, "ims0"),
+                *want,
+                "case {i}: {out}"
+            );
+        }
+        assert_eq!(
+            newest_child_sa_lifetime(
+                &format!(
+                    "{}{}",
+                    ike_header("ims10"),
+                    child_with_life("ims10", 2, "INSTALLED", full)
+                ),
+                "ims1"
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1372,6 +1598,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn child_sa_rejection_notify_table() {
+        const EST3: &str =
+            "<ims0|3> IKE_SA ims0[3] established between 10.0.0.2[x]...192.0.2.1[ims]\n";
+        const EST4: &str =
+            "<ims0|4> IKE_SA ims0[4] established between 10.0.0.2[x]...192.0.2.1[ims]\n";
+        const INVAL: &str = "<ims0|3> parsed CREATE_CHILD_SA response 12 [ N(INVAL_SEL) ]\n";
+        const TS: &str = "<ims0|3> parsed CREATE_CHILD_SA response 13 [ N(TS_UNACCEPT) ]\n";
+        const OK: &str = "<ims0|3> parsed CREATE_CHILD_SA response 14 [ SA No TSi TSr ]\n";
+        const OTHER: &str = "<ims1|7> parsed CREATE_CHILD_SA response 3 [ N(NO_PROP) ]\n";
+        let cases: [(&str, String, Option<&str>); 7] = [
+            ("INVALID_SELECTORS", format!("{EST3}{INVAL}"), Some("INVAL_SEL")),
+            ("the latest refusal wins", format!("{EST3}{INVAL}{TS}"), Some("TS_UNACCEPT")),
+            ("a later success clears it", format!("{EST3}{INVAL}{OK}"), None),
+            ("only an earlier session refused", format!("{EST3}{INVAL}{EST4}"), None),
+            ("another connection's refusal", format!("{EST3}{OTHER}"), None),
+            ("no CREATE_CHILD_SA at all", EST3.to_string(), None),
+            ("our own request is not a response", format!("{EST3}<ims0|3> generating CREATE_CHILD_SA request 12 [ N(REKEY_SA) SA No TSi TSr ]\n"), None),
+        ];
+        for (name, log, want) in cases {
+            assert_eq!(
+                child_sa_rejection_notify(&log, "ims0").as_deref(),
+                want,
+                "{name}"
+            );
+        }
+    }
+
     mod engine_wiring_tests {
         use super::*;
         use crate::supervise::runner::MockCommandRunner;
@@ -1457,6 +1711,80 @@ mod tests {
             );
         }
 
+        /// specs/093 FR-008/T011: a stuck rekey on line 0, through the real
+        /// engine and the real tick, rebuilds line 0's connection and nothing
+        /// else on the shared daemon.
+        #[test]
+        fn a_stuck_rekey_rebuilds_only_its_own_connection() {
+            use crate::supervise::line_supervisor::{
+                tick_steady_state, DegradeReason, SteadyOutcome, SteadyTracking,
+                STEADY_STATE_POLL_INTERVAL,
+            };
+            use std::os::unix::process::ExitStatusExt;
+            let runner = MockCommandRunner::new();
+            let engine = strongswan_engine();
+            assert!(engine.shared.ensure_started(&runner).is_some());
+            runner.set_netns_output("ims", &["ip", "link", "show", "tun23"], "5: tun23\n");
+            runner.set_run_output(
+                "timeout 10 env STRONGSWAN_CONF=/etc/strongswan-shared.conf swanctl --list-sas --ike ims0",
+                std::process::Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: b"ims0: #3, ESTABLISHED, IKEv2, aa_i* bb_r\n  ims0: #12, reqid 1, INSTALLED, TUNNEL-in-UDP, ESP:AES_CBC-128/HMAC_SHA1_96\n    installed 3670s ago, rekeying in -70s, expires in 290s\n".to_vec(),
+                    stderr: Vec::new(),
+                },
+            );
+            runner.set_file(
+                "/tmp/charon.log",
+                "<ims0|3> IKE_SA ims0[3] established between 192.0.2.10[x]...203.0.113.1[ims]\n<ims0|3> parsed CREATE_CHILD_SA response 9 [ N(INVAL_SEL) ]\n",
+            );
+            let mut tracking = SteadyTracking::default();
+            assert_eq!(
+                tick_steady_state(
+                    &engine,
+                    &runner,
+                    "",
+                    &mut tracking,
+                    STEADY_STATE_POLL_INTERVAL
+                ),
+                SteadyOutcome::Recovered {
+                    reason: DegradeReason::ChildSaRekeyStuck,
+                    ike_sa_loss_cause: None,
+                }
+            );
+            let ran = runner.run_calls.lock().unwrap().clone();
+            let terminates: Vec<_> = ran
+                .iter()
+                .filter(|a| a.iter().any(|x| x == "--terminate"))
+                .collect();
+            assert!(!terminates.is_empty(), "{ran:?}");
+            for t in &terminates {
+                assert!(
+                    t.windows(2).any(|w| w[0] == "--ike" && w[1] == "ims0"),
+                    "{t:?}"
+                );
+            }
+            let spawned: Vec<Vec<String>> = runner
+                .spawn_specs
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|s| s.argv.clone())
+                .collect();
+            assert!(
+                spawned
+                    .iter()
+                    .any(|a| a.windows(2).any(|w| w[0] == "--child" && w[1] == "ims0")),
+                "{spawned:?}"
+            );
+            assert!(
+                !ran.iter()
+                    .chain(spawned.iter())
+                    .flatten()
+                    .any(|a| a == "ims1"),
+                "another line's connection was touched"
+            );
+        }
+
         #[test]
         fn steady_state_health_distinguishes_a_bare_ike_sa_from_one_with_a_child() {
             use std::os::unix::process::ExitStatusExt;
@@ -1482,8 +1810,14 @@ mod tests {
                 engine.steady_state_health(&bare),
                 SteadyStateHealth::ChildSaMissing
             );
-            let healthy = seed("ims0: #1, ESTABLISHED, IKEv2, aa_i* bb_r\n  ims0: #4, reqid 1, INSTALLED, TUNNEL-in-UDP, ESP:AES_CBC-128/HMAC_SHA1_96\n");
-            assert_eq!(engine.steady_state_health(&healthy), SteadyStateHealth::Ok);
+            let healthy = seed("ims0: #1, ESTABLISHED, IKEv2, aa_i* bb_r\n  ims0: #4, reqid 1, INSTALLED, TUNNEL-in-UDP, ESP:AES_CBC-128/HMAC_SHA1_96\n    installed 1109s ago, rekeying in 2167s, expires in 2852s\n");
+            assert_eq!(
+                engine.steady_state_health(&healthy),
+                SteadyStateHealth::Ok(Some(ChildSaLifetime {
+                    unique_id: 4,
+                    expires_in: Some(2852),
+                }))
+            );
         }
 
         #[test]

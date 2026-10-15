@@ -48,6 +48,8 @@ Prometheus-compatible metrics are served at `http://<host>:9091/metrics`
 
 The `tunnel_failure` alert fires when **either** the IMS agent's tunnel signal or the CHILD_SA signal (`vowifi_child_sa_up`) has been unhealthy continuously for `unhealthy_sec`, once per outage, and recovers when both are healthy again.
 
+**Stuck CHILD_SA rekey** (strongswan engine, specs/093): a CHILD_SA is normally rekeyed with 6 to 12 minutes of its lifetime left. If the same CHILD_SA is still in place with under 5 minutes left, its rekey has failed (the ePDG refused or ignored it), and the supervisor rebuilds the tunnel then, while the old CHILD_SA still carries traffic, instead of letting it expire. The log shows `[supervise] line N: imsN CHILD_SA #M rekey overdue (expires in Ss[, last rejection N(...)]); rebuilding before the hard expiry`, then `recovered from ChildSaRekeyStuck`. While the line has a call in progress the rebuild waits (`deferring the rebuild while a call is active`) until the call ends or 90 seconds remain. Each rebuild counts toward the `tunnel_failure` flapping rule like any other. A line that logs this every hour has a carrier rejecting its rekeys; on an IPv4-only ePDG that logs `N(INVAL_SEL)`, set `tunnel_address_family = "ipv4"` (see [configuration.md](configuration.md)).
+
 **SIP server mode gauges**: `sip_server_*` appear only when
 `[sip_server].enabled` (see [configuration.md](configuration.md)).
 

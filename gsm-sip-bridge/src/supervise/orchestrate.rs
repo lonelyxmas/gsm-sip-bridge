@@ -1873,6 +1873,7 @@ fn start_vowifi_line_strongswan(
             &current_pool,
             &mut tracking,
             line_supervisor::STEADY_STATE_POLL_INTERVAL,
+            &|| line_in_call(runner.as_ref(), &line.pcscf_source_path),
         );
         report_pcscf_sibling(idx, &current_pcscf, via_sibling_before, &tracking);
         let renegotiated = matches!(
@@ -2062,6 +2063,18 @@ fn start_vowifi_line_strongswan(
             }
         }
     }
+}
+
+/// Whether this line's VoWiFi agent reports a call in progress, from the
+/// count it mirrors beside the P-CSCF files (specs/093 contracts/files.md).
+/// A missing or unreadable file is "no call": an unknown call state must
+/// never hold a stuck-rekey rebuild back.
+fn line_in_call(runner: &dyn CommandRunner, pcscf_source_path: &str) -> bool {
+    runner
+        .read_file(&crate::ims::pcscf_files::calls_path(pcscf_source_path))
+        .ok()
+        .and_then(|c| crate::ims::pcscf_files::parse_active_calls(&c))
+        .is_some_and(|n| n > 0)
 }
 
 /// Rebuilds a line's veth pair if it has gone missing, and says so.
@@ -2847,6 +2860,9 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
             &current_pool,
             &mut tracking,
             line_supervisor::SWU_STEADY_STATE_POLL_INTERVAL,
+            // The swu engine reports no CHILD_SA lifetimes, so it never has a
+            // stuck-rekey rebuild to hold.
+            &|| false,
         );
         report_pcscf_sibling(idx, &current_pcscf, via_sibling_before, &tracking);
         match outcome {
@@ -3357,6 +3373,19 @@ mod tests {
             .unwrap()
             .iter()
             .any(|argv| argv.iter().any(|a| a.contains(needle)))
+    }
+
+    #[test]
+    fn line_in_call_reads_the_agents_calls_file_and_defaults_to_no_call() {
+        let mock = MockCommandRunner::new();
+        assert!(!line_in_call(&mock, "/tmp/pcscf-0"), "no file: no call");
+        mock.set_file("/tmp/pcscf-0.calls", "1\n");
+        assert!(line_in_call(&mock, "/tmp/pcscf-0"));
+        assert!(!line_in_call(&mock, "/tmp/pcscf-1"), "another line's file");
+        mock.set_file("/tmp/pcscf-0.calls", "0\n");
+        assert!(!line_in_call(&mock, "/tmp/pcscf-0"));
+        mock.set_file("/tmp/pcscf-0.calls", "garbage\n");
+        assert!(!line_in_call(&mock, "/tmp/pcscf-0"));
     }
 
     fn ok_stdout(stdout: &str) -> std::process::Output {

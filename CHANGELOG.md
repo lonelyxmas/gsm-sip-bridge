@@ -62,6 +62,17 @@ across releases.
   `vowifi-status` recent calls show the negotiated `phone_codec`. The
   circuit-switched path is unchanged.
 
+### Changed
+
+- **Stuck CHILD_SA rekeys are rebuilt before the hard expiry.** A CHILD_SA
+  still in place with under 300 s left (a natural rekey replaces it with
+  360-720 s left) is rebuilt by the supervisor as `ChildSaRekeyStuck`,
+  once per CHILD_SA, instead of being left to expire and then recovered
+  through `ChildSaMissing`/`ChildSaStuck`. The rebuild waits for an active
+  call until 90 s remain; the VoWiFi agent publishes its call count in
+  `/tmp/pcscf-N.calls`. Strongswan engine only
+  ([#127](https://github.com/selvakn/gsm-sip-bridge/issues/127)).
+
 ### Fixed
 
 - **NOTIFYs answered per subscription dialog.** A reg-event `NOTIFY` for a

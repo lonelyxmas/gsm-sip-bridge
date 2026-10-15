@@ -368,8 +368,10 @@ tunnel_engine = "strongswan"
 # Set "ipv4" on a line whose ePDG assigns only an IPv4 inner address and then
 # rejects every hourly CHILD_SA rekey that still proposes ::/0 (#107, #126).
 # The symptom: the charon log shows `CREATE_CHILD_SA response ... N(INVAL_SEL)`,
-# the line loses service for about a minute roughly every hour, and the
-# supervisor logs ChildSaMissing/ChildSaStuck recoveries. A "dual" line logs
+# and about once an hour the supervisor logs `rekey overdue (... last rejection
+# N(INVAL_SEL))` and rebuilds the tunnel before the old CHILD_SA expires
+# (recovery ChildSaRekeyStuck), a few seconds without service each time. A
+# "dual" line logs
 # a hint pointing here the first time a rekey is rejected that way in a tunnel
 # session. Go back to "dual" if the carrier starts assigning an IPv6 inner
 # address. P-CSCFs of an excluded family are ignored. The swu engine always
