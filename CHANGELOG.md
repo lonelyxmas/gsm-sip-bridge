@@ -94,6 +94,19 @@ across releases.
   go out on another line (TS 24.229 §5.1.1.7)
   ([#124](https://github.com/selvakn/gsm-sip-bridge/issues/124)).
 
+- **Inbound INVITEs with multipart bodies.** Since v8.15.0 any inbound
+  VoWiFi/VoLTE INVITE whose body was not bare SDP was refused `415`, which
+  failed every inbound T2 call (SDP inside `multipart/mixed` beside a
+  PIDF-LO part). SIP bodies are now decoded as MIME (RFC 5621) and the one
+  SDP is taken from any `multipart/mixed`, `multipart/alternative` or nested
+  body; no usable SDP is still `415` (now with `Accept`), a broken or
+  ambiguous multipart body gets `400`, and `OPTIONS` advertises the same
+  `Accept`. The SDP answer to a QoS-precondition offer (RFC 3312) states the
+  desired status back without requesting a confirmation, and an
+  `application/vnd.3gpp.sms` content type with parameters is decoded as SMS.
+  Bare-SDP calls without preconditions get byte-identical answers
+  ([#103](https://github.com/selvakn/gsm-sip-bridge/issues/103)).
+
 - **Carrier-deleted IKE_SA recovered, with its cause.** The supervisor now
   tells a lost IKE_SA from a lost CHILD_SA, re-initiates, and restarts the
   IMS agent once, logging `carrier DELETE`, `dead-peer timeout` or `unknown`.
