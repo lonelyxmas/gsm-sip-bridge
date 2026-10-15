@@ -7,6 +7,7 @@
 
 use super::line_supervisor::{SteadyStateHealth, TunnelEngine};
 use super::runner::{ChildHandle, ChildSpec, CommandRunner};
+use crate::config::TunnelAddressFamily;
 use crate::control::protocol::IkeSaLossCause;
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -274,6 +275,36 @@ pub fn ike_sa_loss_cause(charon_log: &str, conn_name: &str) -> IkeSaLossCause {
     cause
 }
 
+/// The current IKE_SA session's tag (`"ims0[3]"`) if, within that session,
+/// the ePDG answered a CREATE_CHILD_SA (a CHILD_SA rekey) with
+/// `N(INVAL_SEL)`, i.e. `INVALID_SELECTORS` (specs/092 FR-009a, #107).
+///
+/// Scoped like [`ike_sa_loss_cause`]: the most recent `IKE_SA <conn>[N]
+/// established` starts a session and clears any earlier rejection, so a
+/// rebuilt session is judged only on its own rekeys and returns its own tag.
+/// The match is on the parsed-message summary charon logs at level 1
+/// (`parsed CREATE_CHILD_SA response 12 [ N(INVAL_SEL) ]`), which is what
+/// #107's capture from the pinned fork shows.
+pub fn child_rekey_invalid_selectors_session(charon_log: &str, conn_name: &str) -> Option<String> {
+    let established = format!("IKE_SA {conn_name}[");
+    let mut session: Option<String> = None;
+    let mut rejected = false;
+    for line in lines_for_conn(charon_log, conn_name) {
+        if let Some(pos) = line.find(&established) {
+            let rest = &line[pos + established.len()..];
+            if let Some(end) = rest.find("] established") {
+                session = Some(format!("{conn_name}[{}]", &rest[..end]));
+                rejected = false;
+                continue;
+            }
+        }
+        if line.contains("CREATE_CHILD_SA response") && line.contains("N(INVAL_SEL)") {
+            rejected = true;
+        }
+    }
+    session.filter(|_| rejected)
+}
+
 /// The single charon daemon shared by every strongswan-engine line.
 ///
 /// One charon *per line* was the original design, and it was wrong for a
@@ -473,6 +504,10 @@ pub struct StrongswanEngine {
     /// an operator-watched startup sequence needs an actual deadline rather
     /// than retrying forever.
     pub max_establish_attempts: Option<u32>,
+    /// This line's effective `tunnel_address_family` (specs/092). Filters the
+    /// P-CSCFs this engine selects and publishes (FR-013), and gates the
+    /// `INVALID_SELECTORS` rekey hint to `Dual` lines (FR-009a).
+    pub address_family: TunnelAddressFamily,
 }
 
 impl StrongswanEngine {
@@ -524,20 +559,16 @@ impl StrongswanEngine {
     /// The P-CSCF of a negotiation logged after `mark`, if one has completed.
     /// A log truncated since the mark (charon restarted) is read from its
     /// start: everything in it is newer than the mark.
+    ///
+    /// Only addresses this line's `address_family` admits count (FR-013).
     pub fn fresh_pcscf_since(&self, runner: &dyn CommandRunner, mark: LogMark) -> Option<String> {
-        let offset = if self.shared.log_generation.load(Ordering::SeqCst) == mark.generation {
-            mark.len
-        } else {
-            0
-        };
-        runner
-            .read_file(&self.shared.charon_log)
-            .ok()
-            .and_then(|c| extract_pcscf_after(&c, &self.conn_name, offset))
+        self.fresh_pcscf_pool_since(runner, mark)
+            .and_then(|pool| pick_stable_pcscf(&pool))
     }
 
-    /// The whole pool of a negotiation logged after `mark`; see
-    /// [`Self::fresh_pcscf_since`].
+    /// The whole pool of a negotiation logged after `mark`, filtered to this
+    /// line's address family; `None` while there is none, or when the family
+    /// excludes every address. See [`Self::fresh_pcscf_since`].
     pub fn fresh_pcscf_pool_since(
         &self,
         runner: &dyn CommandRunner,
@@ -552,6 +583,38 @@ impl StrongswanEngine {
             .read_file(&self.shared.charon_log)
             .ok()
             .and_then(|c| extract_pcscf_pool_after(&c, &self.conn_name, offset))
+            .map(|pool| self.filtered(pool))
+            .filter(|pool| !pool.is_empty())
+    }
+
+    /// Keeps the addresses this line's `address_family` admits (specs/092
+    /// FR-013). A no-op for `Dual`.
+    fn filtered(&self, batch: Vec<String>) -> Vec<String> {
+        batch
+            .into_iter()
+            .filter(|a| self.address_family.admits(a))
+            .collect()
+    }
+
+    /// The latest negotiation's P-CSCFs that this line's address family
+    /// excludes, for the "ignoring P-CSCF" log at each publication point.
+    /// Always empty for `Dual`.
+    pub fn ignored_pcscfs(&self, runner: &dyn CommandRunner) -> Vec<String> {
+        runner
+            .read_file(&self.shared.charon_log)
+            .map(|c| extract_latest_pcscf_pool(&c, &self.conn_name))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| !self.address_family.admits(a))
+            .collect()
+    }
+
+    /// [`child_rekey_invalid_selectors_session`] over the shared charon log.
+    pub fn rekey_invalid_selectors_session(&self, runner: &dyn CommandRunner) -> Option<String> {
+        runner
+            .read_file(&self.shared.charon_log)
+            .ok()
+            .and_then(|c| child_rekey_invalid_selectors_session(&c, &self.conn_name))
     }
 
     /// Backgrounded `swanctl` invocation — matches the bash calls that end
@@ -595,18 +658,20 @@ impl TunnelEngine for StrongswanEngine {
             .unwrap_or(false)
     }
 
+    /// `pick_stable_pcscf` over the family-filtered pool. For `Dual` that is
+    /// exactly [`extract_latest_pcscf`]: the pick is a minimum, so
+    /// deduplicating the batch first cannot change it.
     fn latest_pcscf(&self, runner: &dyn CommandRunner) -> Option<String> {
-        runner
-            .read_file(&self.shared.charon_log)
-            .ok()
-            .and_then(|c| extract_latest_pcscf(&c, &self.conn_name))
+        pick_stable_pcscf(&self.latest_pcscf_pool(runner))
     }
 
     fn latest_pcscf_pool(&self, runner: &dyn CommandRunner) -> Vec<String> {
-        runner
-            .read_file(&self.shared.charon_log)
-            .map(|c| extract_latest_pcscf_pool(&c, &self.conn_name))
-            .unwrap_or_default()
+        self.filtered(
+            runner
+                .read_file(&self.shared.charon_log)
+                .map(|c| extract_latest_pcscf_pool(&c, &self.conn_name))
+                .unwrap_or_default(),
+        )
     }
 
     fn is_process_alive(&self, runner: &dyn CommandRunner) -> bool {
@@ -1277,6 +1342,36 @@ mod tests {
         assert_eq!(extract_swu_pcscf("STATE CONNECTED\n"), None);
     }
 
+    #[test]
+    fn child_rekey_invalid_selectors_session_table() {
+        const EST3: &str =
+            "<ims0|3> IKE_SA ims0[3] established between 10.0.0.2[x]...192.0.2.1[ims]\n";
+        const EST4: &str =
+            "<ims0|4> IKE_SA ims0[4] established between 10.0.0.2[x]...192.0.2.1[ims]\n";
+        const REJ3: &str = "<ims0|3> parsed CREATE_CHILD_SA response 12 [ N(INVAL_SEL) ]\n";
+        const REJ4: &str = "<ims0|4> parsed CREATE_CHILD_SA response 7 [ N(INVAL_SEL) ]\n";
+        const OK3: &str = "<ims0|3> parsed CREATE_CHILD_SA response 12 [ SA No TSi TSr ]\n";
+        let cases: [(&str, String, Option<&str>); 6] = [
+            ("no rejection", format!("{EST3}{OK3}"), None),
+            ("rejected in the current session", format!("{EST3}{REJ3}"), Some("ims0[3]")),
+            ("only an earlier session rejected", format!("{EST3}{REJ3}{EST4}"), None),
+            (
+                "another connection's rejection",
+                format!("{EST3}<ims1|7> IKE_SA ims1[7] established\n<ims1|7> parsed CREATE_CHILD_SA response 3 [ N(INVAL_SEL) ]\n"),
+                None,
+            ),
+            ("two sessions rejected", format!("{EST3}{REJ3}{EST4}{REJ4}"), Some("ims0[4]")),
+            ("a response without INVAL_SEL", format!("{EST3}{OK3}{OK3}"), None),
+        ];
+        for (name, log, want) in cases {
+            assert_eq!(
+                child_rekey_invalid_selectors_session(&log, "ims0").as_deref(),
+                want,
+                "{name}"
+            );
+        }
+    }
+
     mod engine_wiring_tests {
         use super::*;
         use crate::supervise::runner::MockCommandRunner;
@@ -1303,6 +1398,7 @@ mod tests {
                 if_id: "23".to_string(),
                 shared: shared_charon(),
                 max_establish_attempts: None,
+                address_family: TunnelAddressFamily::Dual,
             }
         }
 
@@ -1787,6 +1883,127 @@ mod tests {
             assert!(
                 sigs.contains(&crate::supervise::runner::Signal::Term),
                 "the replaced child must be terminated, got {sigs:?}"
+            );
+        }
+
+        /// One closed mixed-family batch (specs/092 T009).
+        const MIXED_LOG: &str = "[CFG] <ims0|1> received P-CSCF server IP 2402:8100::10\n\
+             [CFG] <ims0|1> received P-CSCF server IP 10.0.1.10\n\
+             [CFG] <ims0|1> received P-CSCF server IP 2402:8100::11\n\
+             [CFG] <ims0|1> received P-CSCF server IP 10.0.0.10\n\
+             [IKE] <ims0|1> CHILD_SA ims0{1} established with SPIs x\n";
+
+        fn engine_with(family: TunnelAddressFamily) -> StrongswanEngine {
+            StrongswanEngine {
+                address_family: family,
+                ..strongswan_engine()
+            }
+        }
+
+        fn strings(v: &[&str]) -> Vec<String> {
+            v.iter().map(|s| s.to_string()).collect()
+        }
+
+        #[test]
+        fn pcscf_selection_and_pool_follow_the_address_family() {
+            for (family, pick, pool, ignored) in [
+                (
+                    TunnelAddressFamily::Ipv4,
+                    "10.0.0.10",
+                    ["10.0.1.10", "10.0.0.10"],
+                    ["2402:8100::10", "2402:8100::11"],
+                ),
+                (
+                    TunnelAddressFamily::Ipv6,
+                    "2402:8100::10",
+                    ["2402:8100::10", "2402:8100::11"],
+                    ["10.0.1.10", "10.0.0.10"],
+                ),
+            ] {
+                let runner = MockCommandRunner::new();
+                let engine = engine_with(family);
+                let mark = engine.log_mark(&runner);
+                runner.set_file(&engine.shared.charon_log, MIXED_LOG);
+                assert_eq!(
+                    TunnelEngine::latest_pcscf(&engine, &runner).as_deref(),
+                    Some(pick),
+                    "{family}"
+                );
+                assert_eq!(
+                    TunnelEngine::latest_pcscf_pool(&engine, &runner),
+                    strings(&pool),
+                    "{family}"
+                );
+                assert_eq!(
+                    engine.ignored_pcscfs(&runner),
+                    strings(&ignored),
+                    "{family}"
+                );
+                assert_eq!(
+                    engine.fresh_pcscf_since(&runner, mark).as_deref(),
+                    Some(pick),
+                    "{family}"
+                );
+                assert_eq!(
+                    engine.fresh_pcscf_pool_since(&runner, mark),
+                    Some(strings(&pool)),
+                    "{family}"
+                );
+            }
+
+            // An ipv6 line on an ePDG advertising only IPv4 has no P-CSCF.
+            let runner = MockCommandRunner::new();
+            let engine = engine_with(TunnelAddressFamily::Ipv6);
+            let mark = engine.log_mark(&runner);
+            runner.set_file(
+                &engine.shared.charon_log,
+                "[CFG] <ims0|1> received P-CSCF server IP 10.0.0.10\n\
+                 [IKE] <ims0|1> CHILD_SA ims0{1} established x\n",
+            );
+            assert_eq!(TunnelEngine::latest_pcscf(&engine, &runner), None);
+            assert!(TunnelEngine::latest_pcscf_pool(&engine, &runner).is_empty());
+            assert_eq!(engine.fresh_pcscf_since(&runner, mark), None);
+            assert_eq!(engine.fresh_pcscf_pool_since(&runner, mark), None);
+        }
+
+        #[test]
+        fn dual_engine_selection_and_pool_match_the_pure_extractors() {
+            let runner = MockCommandRunner::new();
+            let engine = engine_with(TunnelAddressFamily::Dual);
+            let mark = engine.log_mark(&runner);
+            runner.set_file(&engine.shared.charon_log, MIXED_LOG);
+            assert_eq!(
+                TunnelEngine::latest_pcscf(&engine, &runner),
+                extract_latest_pcscf(MIXED_LOG, "ims0")
+            );
+            assert_eq!(
+                TunnelEngine::latest_pcscf_pool(&engine, &runner),
+                extract_latest_pcscf_pool(MIXED_LOG, "ims0")
+            );
+            assert!(engine.ignored_pcscfs(&runner).is_empty());
+            assert_eq!(
+                engine.fresh_pcscf_since(&runner, mark),
+                extract_pcscf_after(MIXED_LOG, "ims0", 0)
+            );
+            assert_eq!(
+                engine.fresh_pcscf_pool_since(&runner, mark),
+                extract_pcscf_pool_after(MIXED_LOG, "ims0", 0)
+            );
+        }
+
+        #[test]
+        fn the_engine_reports_the_rejected_rekeys_session() {
+            let runner = MockCommandRunner::new();
+            let engine = strongswan_engine();
+            assert_eq!(engine.rekey_invalid_selectors_session(&runner), None);
+            runner.set_file(
+                &engine.shared.charon_log,
+                "<ims0|5> IKE_SA ims0[5] established between a...b\n\
+                 <ims0|5> parsed CREATE_CHILD_SA response 9 [ N(INVAL_SEL) ]\n",
+            );
+            assert_eq!(
+                engine.rekey_invalid_selectors_session(&runner).as_deref(),
+                Some("ims0[5]")
             );
         }
     }

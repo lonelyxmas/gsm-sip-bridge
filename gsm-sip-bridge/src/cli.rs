@@ -314,6 +314,11 @@ pub enum RenderAsset {
         /// override configured).
         #[arg(long)]
         src_addr: Option<String>,
+        /// Inner address families to request: `dual` (both, the default),
+        /// `ipv4` or `ipv6` (specs/092). Without the flag the output is the
+        /// same as `dual`.
+        #[arg(long, default_value = "dual")]
+        address_family: crate::config::TunnelAddressFamily,
     },
     /// This line's strongSwan updown wrapper (sets NETNS/STRONGSWAN_TUN_IFACE,
     /// execs the shared ims.updown script).

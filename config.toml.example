@@ -356,6 +356,25 @@ keepalive_interval_sec = 20
 # Python dialer, kept as an explicit fallback until strongswan is proven
 # against every carrier — see specs/012-strongswan-epdg/tasks.md).
 tunnel_engine = "strongswan"
+# strongswan engine only: which inner address families each line's ePDG
+# tunnel requests (charon's `vips`) and carries (`remote_ts`). Overridable
+# per [[vowifi.line]]; takes effect when the container is recreated.
+#   "dual" (default) - request both an IPv4 and an IPv6 inner address, as
+#                      every release before this setting did.
+#   "ipv4"           - request and carry IPv4 only.
+#   "ipv6"           - request and carry IPv6 only. Risky: on a carrier that
+#                      assigns only IPv4 the tunnel gets no address and no
+#                      P-CSCF, and the line never registers.
+# Set "ipv4" on a line whose ePDG assigns only an IPv4 inner address and then
+# rejects every hourly CHILD_SA rekey that still proposes ::/0 (#107, #126).
+# The symptom: the charon log shows `CREATE_CHILD_SA response ... N(INVAL_SEL)`,
+# the line loses service for about a minute roughly every hour, and the
+# supervisor logs ChildSaMissing/ChildSaStuck recoveries. A "dual" line logs
+# a hint pointing here the first time a rekey is rejected that way in a tunnel
+# session. Go back to "dual" if the carrier starts assigning an IPv6 inner
+# address. P-CSCFs of an excluded family are ignored. The swu engine always
+# negotiates both families and refuses any value other than "dual".
+# tunnel_address_family = "dual"
 # strongswan engine only: pcscd's vpcd virtual smart-card reader, bridged to
 # each line's SIM by vowifi-usim-bridge. One shared reader serves every line,
 # at vpcd_port + line-index — keep the base below the kernel's ephemeral port
@@ -391,6 +410,7 @@ max_lines = 8
 # imei_override = "864650053414154" # override the IMEI from the modem for this line
 # msisdn = "+919000000001"         # this line's phone number, shown in its alerts
 # reg_rejected_cooldown_sec = 1800 # this line's reg-event "rejected" cooldown
+# tunnel_address_family = "ipv4"   # this line only; see [vowifi]
 #
 # Setting both imsi_override and imei_override (alongside mcc/mnc above)
 # pins this line's network identity completely, so vowifi-ims-agent never

@@ -12,6 +12,8 @@
 //! dropped directive shows up as a failing snapshot diff in `cargo test`,
 //! before any image is built (spec FR-002/FR-003).
 
+use crate::config::TunnelAddressFamily;
+
 /// Renders the **one shared** `strongswan.conf`: the single vici socket and
 /// filelog path used by the single charon daemon that serves every line.
 ///
@@ -124,6 +126,10 @@ pub struct SwanctlEpdgParams<'a> {
     /// `sed -e "/local_addrs.*@SRC_ADDR@/d"` deletion branch (spec Acceptance
     /// Scenario 2).
     pub src_addr: Option<&'a str>,
+    /// This line's effective `tunnel_address_family` (specs/092): supplies
+    /// `@VIPS@` and `@REMOTE_TS@`. `Dual` renders what every line did
+    /// before the setting existed.
+    pub address_family: TunnelAddressFamily,
 }
 
 /// Renders the per-line ePDG `swanctl.conf` connection block by substituting
@@ -140,7 +146,9 @@ pub fn render_swanctl_epdg(template: &str, params: &SwanctlEpdgParams<'_>) -> St
         .replace("@MNC@", params.mnc)
         .replace("@EPDG_IP@", params.epdg_ip)
         .replace("@IF_ID@", params.if_id)
-        .replace("@UPDOWN@", params.updown_script);
+        .replace("@UPDOWN@", params.updown_script)
+        .replace("@VIPS@", params.address_family.vips())
+        .replace("@REMOTE_TS@", params.address_family.remote_ts());
 
     rendered = match params.src_addr {
         Some(addr) => rendered.replace("@SRC_ADDR@", addr),
@@ -291,6 +299,7 @@ connections {
             if_id: "24",
             updown_script: "/etc/strongswan.d/ims-updown-1.sh",
             src_addr: None,
+            address_family: TunnelAddressFamily::Dual,
         };
         let rendered = render_swanctl_epdg(EPDG_TEMPLATE, &params);
         assert!(
@@ -319,6 +328,7 @@ connections {
             if_id: "23",
             updown_script: "/etc/strongswan.d/ims-updown-0.sh",
             src_addr: Some("192.168.1.50"),
+            address_family: TunnelAddressFamily::Dual,
         };
         let rendered = render_swanctl_epdg(EPDG_TEMPLATE, &params);
         insta::assert_snapshot!(rendered);
@@ -350,6 +360,7 @@ after
             if_id: "1",
             updown_script: "1",
             src_addr: None,
+            address_family: TunnelAddressFamily::Dual,
         };
         let rendered = render_swanctl_epdg(template, &params);
         assert!(rendered.contains("optional; entrypoint deletes the local_addrs line"));
@@ -371,11 +382,112 @@ after
             if_id: "23",
             updown_script: "/etc/strongswan.d/ims-updown-0.sh",
             src_addr: None,
+            address_family: TunnelAddressFamily::Dual,
         };
         let rendered = render_swanctl_epdg(EPDG_TEMPLATE, &params);
         insta::assert_snapshot!(rendered);
         assert!(!rendered.contains("local_addrs"));
         assert!(!rendered.contains("@SRC_ADDR@"));
+    }
+
+    /// The real template, as the image ships it.
+    const REAL_EPDG_TEMPLATE: &str =
+        include_str!("../../../docker/strongswan/swanctl-epdg.conf.template");
+
+    /// Drops every comment line (first non-whitespace character `#`) and
+    /// keeps every other line, newline included, exactly. charon parses only
+    /// the setting lines, so this is what "renders unchanged" means
+    /// (specs/092 research R2).
+    fn strip_comments(s: &str) -> String {
+        s.split_inclusive('\n')
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect()
+    }
+
+    /// Fixed synthetic parameters for real-template renders (specs/092).
+    fn real_template_params() -> SwanctlEpdgParams<'static> {
+        SwanctlEpdgParams {
+            conn_name: "ims0",
+            imsi: "001010000000001",
+            mcc: "001",
+            mnc: "001",
+            epdg_ip: "192.0.2.1",
+            if_id: "23",
+            updown_script: "/etc/strongswan.d/ims-updown-0.sh",
+            src_addr: None,
+            address_family: TunnelAddressFamily::Dual,
+        }
+    }
+
+    #[test]
+    fn real_template_dual_render_matches_the_pre_092_baseline() {
+        // Recorded on the template as it was before specs/092 added the
+        // tunnel_address_family placeholders. The `dual` default must keep
+        // every setting line byte-identical (FR-003, SC-001): never update
+        // this snapshot to make a later change pass.
+        let rendered = render_swanctl_epdg(REAL_EPDG_TEMPLATE, &real_template_params());
+        insta::assert_snapshot!(strip_comments(&rendered));
+    }
+
+    fn render_family(conn_name: &'static str, family: TunnelAddressFamily) -> String {
+        render_swanctl_epdg(
+            REAL_EPDG_TEMPLATE,
+            &SwanctlEpdgParams {
+                conn_name,
+                address_family: family,
+                ..real_template_params()
+            },
+        )
+    }
+
+    #[test]
+    fn ipv4_and_ipv6_change_only_vips_and_remote_ts() {
+        let dual = strip_comments(&render_family("ims0", TunnelAddressFamily::Dual));
+        for (family, vips, remote_ts) in [
+            (
+                TunnelAddressFamily::Ipv4,
+                "        vips = 0.0.0.0\n",
+                "                remote_ts = 0.0.0.0/0\n",
+            ),
+            (
+                TunnelAddressFamily::Ipv6,
+                "        vips = ::\n",
+                "                remote_ts = ::/0\n",
+            ),
+        ] {
+            let rendered = render_family("ims0", family);
+            assert!(rendered.contains(vips), "{family}: {rendered}");
+            assert!(rendered.contains(remote_ts), "{family}: {rendered}");
+            assert!(!rendered.contains("@VIPS@") && !rendered.contains("@REMOTE_TS@"));
+            let stripped = strip_comments(&rendered);
+            let (a, b): (Vec<_>, Vec<_>) = (dual.lines().collect(), stripped.lines().collect());
+            assert_eq!(a.len(), b.len(), "{family}");
+            for (d, f) in a.iter().zip(&b) {
+                let setting = d.trim_start();
+                if setting.starts_with("vips =") || setting.starts_with("remote_ts =") {
+                    continue;
+                }
+                assert_eq!(d, f, "{family}: only vips/remote_ts may differ");
+            }
+        }
+    }
+
+    #[test]
+    fn two_lines_render_independently() {
+        // Comments name `ims0`, `ims1`, ... as examples; settings must not.
+        let ims0 = strip_comments(&render_family("ims0", TunnelAddressFamily::Dual));
+        let ims1 = strip_comments(&render_family("ims1", TunnelAddressFamily::Ipv4));
+        assert!(ims0.contains("vips = 0.0.0.0, ::\n"));
+        assert!(ims1.contains("vips = 0.0.0.0\n"));
+        assert!(ims0.contains("    ims0 {") && !ims0.contains("ims1"));
+        assert!(ims1.contains("    ims1 {") && !ims1.contains("ims0"));
+    }
+
+    #[test]
+    fn dual_render_leaves_no_placeholder() {
+        let rendered = render_swanctl_epdg(REAL_EPDG_TEMPLATE, &real_template_params());
+        assert!(!rendered.contains("@VIPS@"), "{rendered}");
+        assert!(!rendered.contains("@REMOTE_TS@"), "{rendered}");
     }
 
     #[test]

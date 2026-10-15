@@ -20,7 +20,7 @@ use super::shutdown::{self, StartedState};
 use super::{daemon_supervisor, epdg_iface, sim_recovery, vpcd};
 use crate::alerts::{self, discord::DiscordClient, AlertContext};
 use crate::config::secret::Secret;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, TunnelAddressFamily};
 use crate::vowifi::discovery::LineResolutionEntry;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -1521,6 +1521,8 @@ pub(super) fn establish_line_tunnel(
         .read_file(Path::new("/etc/strongswan.d/swanctl-epdg.conf.template"))
         .unwrap_or_default();
     let src_addr = config.vowifi.src_addr.clone();
+    let address_family = line.config.tunnel_address_family;
+    println!("[supervise] line {idx}: tunnel address family: {address_family}");
     let params = super::render::SwanctlEpdgParams {
         conn_name: &conn_name,
         imsi: &imsi,
@@ -1530,6 +1532,7 @@ pub(super) fn establish_line_tunnel(
         if_id: &if_id,
         updown_script: &updown_path,
         src_addr: src_addr.as_deref(),
+        address_family,
     };
     let swanctl_epdg = super::render::render_swanctl_epdg(&epdg_template, &params);
     let _ = runner.write_file(
@@ -1627,6 +1630,11 @@ pub(super) fn establish_line_tunnel(
         if_id: if_id.clone(),
         shared: Arc::clone(ctx.shared_charon),
         max_establish_attempts,
+        // The family the connection above was rendered with, so the P-CSCF
+        // this establish loop selects is one the tunnel can carry. The VoLTE
+        // priming capture comes through here too; its line is a VoWiFi line
+        // and carries the same `[vowifi]`-derived family.
+        address_family,
     };
     {
         // Greptile P1 (round 3, same design gap): the RwLock guard added for
@@ -1683,6 +1691,10 @@ pub(super) fn establish_line_tunnel(
     println!("[supervise] line {idx}: waiting for the strongSwan tunnel (CHILD_SA + P-CSCF assignment) ...");
     let mut attempt = 0u32;
     let mut stuck = false;
+    // Logged here too, not only once the tunnel is up: a line whose family
+    // excludes every advertised P-CSCF never establishes, and this is the only
+    // place that says why.
+    let mut logged_ignored = Vec::new();
     let pcscf = loop {
         if ctx.real_shutting_down.is_some_and(|f| *f.read().unwrap()) {
             println!(
@@ -1708,6 +1720,7 @@ pub(super) fn establish_line_tunnel(
                 break None;
             }
             line_supervisor::EstablishOutcome::StillEstablishing => {
+                log_ignored_pcscfs(&engine, runner.as_ref(), &mut logged_ignored);
                 runner.sleep(line_supervisor::ESTABLISH_POLL_INTERVAL);
             }
         }
@@ -1766,10 +1779,25 @@ fn start_vowifi_line_strongswan(
     println!("[supervise] line {idx}: tunnel UP. P-CSCF: {pcscf}");
     signal.child_sa_up = true;
     report_tunnel(signal);
-    let mut current_pool = runner
-        .read_file(&ctx.shared_charon.charon_log)
-        .map(|c| super::engines::extract_latest_pcscf_pool(&c, &vowifi_conn_name(idx)))
-        .unwrap_or_default();
+    // Rebuilt rather than threaded out of `establish_line_tunnel`: a plain
+    // value struct over `ctx.shared_charon` (an `Arc`, cheap to re-derive),
+    // and the steady-state loop below needs the exact same identifiers that
+    // function already used to initiate this connection.
+    let engine = StrongswanEngine {
+        idx,
+        conn_name: vowifi_conn_name(idx),
+        netns: netns.clone(),
+        tun_iface: line.strongswan_tun_iface.clone(),
+        if_id: line.strongswan_if_id.to_string(),
+        shared: Arc::clone(ctx.shared_charon),
+        max_establish_attempts: None,
+        address_family: line.config.tunnel_address_family,
+    };
+
+    let mut current_pool = engine.latest_pcscf_pool(runner.as_ref());
+    // The ignored set last logged, so each one is logged once per change.
+    let mut logged_ignored = Vec::new();
+    log_ignored_pcscfs(&engine, runner.as_ref(), &mut logged_ignored);
     let mut published_pool = if publish_pcscf(
         runner.as_ref(),
         idx,
@@ -1794,20 +1822,6 @@ fn start_vowifi_line_strongswan(
         Arc::clone(&rebuild_gate),
     );
 
-    // Rebuilt rather than threaded out of `establish_line_tunnel`: a plain
-    // value struct over `ctx.shared_charon` (an `Arc`, cheap to re-derive),
-    // and the steady-state loop below needs the exact same identifiers that
-    // function already used to initiate this connection.
-    let engine = StrongswanEngine {
-        idx,
-        conn_name: vowifi_conn_name(idx),
-        netns: netns.clone(),
-        tun_iface: line.strongswan_tun_iface.clone(),
-        if_id: line.strongswan_if_id.to_string(),
-        shared: Arc::clone(ctx.shared_charon),
-        max_establish_attempts: None,
-    };
-
     // Steady-state supervision loop — runs for the container's lifetime.
     let mut current_pcscf = pcscf;
     // Consecutive ticks the P-CSCF has been unreachable. Owned by the loop, like
@@ -1821,6 +1835,9 @@ fn start_vowifi_line_strongswan(
         ctx.config.alerts.tunnel_failure_thresholds.unhealthy_sec,
     ));
     let mut last_loss_cause = None;
+    // The IKE_SA session already warned about for an INVALID_SELECTORS rekey
+    // rejection, so the hint appears once per tunnel session (specs/092).
+    let mut warned_inval_sel: Option<String> = None;
     loop {
         runner.sleep(line_supervisor::STEADY_STATE_POLL_INTERVAL);
         // Held across the whole tick_steady_state call, not just a one-off
@@ -1890,11 +1907,27 @@ fn start_vowifi_line_strongswan(
                     &mut published_pool,
                     engine.latest_pcscf_pool(runner.as_ref()),
                 );
+                // Every tick, not only when the published pool changes: a
+                // negotiation that changes only excluded addresses leaves the
+                // pool as it was.
+                log_ignored_pcscfs(&engine, runner.as_ref(), &mut logged_ignored);
+                // Only a dual line can be told to narrow its family.
+                if engine.address_family == TunnelAddressFamily::Dual {
+                    if let Some(warning) = inval_sel_warning(
+                        idx,
+                        engine.address_family,
+                        engine.rekey_invalid_selectors_session(runner.as_ref()),
+                        &mut warned_inval_sel,
+                    ) {
+                        println!("{warning}");
+                    }
+                }
             }
             line_supervisor::SteadyOutcome::PcscfChanged { new_pcscf } => {
                 drop(guard);
                 println!("[supervise] line {idx}: P-CSCF changed ({current_pcscf} -> {new_pcscf}); refreshing");
                 current_pool = engine.latest_pcscf_pool(runner.as_ref());
+                log_ignored_pcscfs(&engine, runner.as_ref(), &mut logged_ignored);
                 published_pool = if publish_pcscf(
                     runner.as_ref(),
                     idx,
@@ -1976,6 +2009,7 @@ fn start_vowifi_line_strongswan(
                             current_pool = engine
                                 .fresh_pcscf_pool_since(runner.as_ref(), mark)
                                 .unwrap_or_default();
+                            log_ignored_pcscfs(&engine, runner.as_ref(), &mut logged_ignored);
                             published_pool = if publish_pcscf(
                                 runner.as_ref(),
                                 idx,
@@ -2184,6 +2218,75 @@ fn republish_pool_after_set_change(
             }
         }
     }
+}
+
+/// Logs each P-CSCF the latest negotiation advertised that this line's
+/// `tunnel_address_family` excludes (specs/092 FR-013). Safe to call every
+/// tick: see [`ignored_pcscf_lines`]. Silent for a `dual` line.
+fn log_ignored_pcscfs(
+    engine: &StrongswanEngine,
+    runner: &dyn CommandRunner,
+    last_logged: &mut Vec<String>,
+) {
+    for line in ignored_pcscf_lines(
+        engine.idx,
+        engine.address_family,
+        engine.ignored_pcscfs(runner),
+        last_logged,
+    ) {
+        println!("{line}");
+    }
+}
+
+/// The "ignoring P-CSCF" lines for `ignored`, or none when it equals the set
+/// `last_logged` already reported. Tracked apart from the published pool, so
+/// a negotiation whose admitted pool is empty or unchanged is still logged
+/// once.
+fn ignored_pcscf_lines(
+    idx: u32,
+    family: TunnelAddressFamily,
+    ignored: Vec<String>,
+    last_logged: &mut Vec<String>,
+) -> Vec<String> {
+    if ignored == *last_logged {
+        return Vec::new();
+    }
+    let lines = ignored
+        .iter()
+        .map(|addr| {
+            format!(
+                "[supervise] line {idx}: ignoring P-CSCF {addr} (tunnel_address_family = {family})"
+            )
+        })
+        .collect();
+    *last_logged = ignored;
+    lines
+}
+
+/// The hint for a `dual` line whose CHILD_SA rekey the ePDG rejected with
+/// `INVALID_SELECTORS` (specs/092 FR-009a, #107), at most once per IKE_SA
+/// session: `session` is the rejected session's tag, and `last_warned`
+/// remembers the one already warned about. The bridge never changes the
+/// setting itself.
+fn inval_sel_warning(
+    idx: u32,
+    family: TunnelAddressFamily,
+    session: Option<String>,
+    last_warned: &mut Option<String>,
+) -> Option<String> {
+    if family != TunnelAddressFamily::Dual {
+        return None;
+    }
+    let session = session?;
+    if last_warned.as_ref() == Some(&session) {
+        return None;
+    }
+    *last_warned = Some(session);
+    Some(format!(
+        "[supervise] line {idx}: ePDG rejected the CHILD_SA rekey's traffic selectors \
+         (INVALID_SELECTORS); if this repeats, set tunnel_address_family = \"ipv4\" for \
+         this line (see config.toml.example)"
+    ))
 }
 
 /// Waits up to `wait` for a negotiation newer than a log marker to report its
@@ -2791,6 +2894,56 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ignored_pcscf_lines_log_each_set_once_even_with_nothing_admitted() {
+        use TunnelAddressFamily::Ipv6;
+        let v = |a: &[&str]| a.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let mut last = Vec::new();
+        // An ipv6 line offered only IPv4 P-CSCFs: nothing to publish, but
+        // the operator still learns why.
+        assert_eq!(
+            ignored_pcscf_lines(1, Ipv6, v(&["10.0.0.10", "10.0.1.10"]), &mut last),
+            v(&[
+                "[supervise] line 1: ignoring P-CSCF 10.0.0.10 (tunnel_address_family = ipv6)",
+                "[supervise] line 1: ignoring P-CSCF 10.0.1.10 (tunnel_address_family = ipv6)",
+            ])
+        );
+        // The same set on the next tick is not repeated.
+        assert!(ignored_pcscf_lines(1, Ipv6, v(&["10.0.0.10", "10.0.1.10"]), &mut last).is_empty());
+        // A negotiation that changes only excluded addresses is logged.
+        assert_eq!(
+            ignored_pcscf_lines(1, Ipv6, v(&["10.0.0.10"]), &mut last),
+            v(&["[supervise] line 1: ignoring P-CSCF 10.0.0.10 (tunnel_address_family = ipv6)"])
+        );
+        // Nothing ignored logs nothing, and a later return is logged again.
+        assert!(ignored_pcscf_lines(1, Ipv6, Vec::new(), &mut last).is_empty());
+        assert_eq!(
+            ignored_pcscf_lines(1, Ipv6, v(&["10.0.0.10"]), &mut last).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn inval_sel_warning_fires_once_per_session_on_dual_lines_only() {
+        use TunnelAddressFamily::{Dual, Ipv4};
+        let s = |t: &str| Some(t.to_string());
+        let mut last = None;
+        let first = inval_sel_warning(0, Dual, s("ims0[3]"), &mut last).expect("warns");
+        assert_eq!(
+            first,
+            "[supervise] line 0: ePDG rejected the CHILD_SA rekey's traffic selectors \
+             (INVALID_SELECTORS); if this repeats, set tunnel_address_family = \"ipv4\" \
+             for this line (see config.toml.example)"
+        );
+        assert_eq!(inval_sel_warning(0, Dual, s("ims0[3]"), &mut last), None);
+        assert!(inval_sel_warning(0, Dual, s("ims0[4]"), &mut last).is_some());
+        assert_eq!(inval_sel_warning(0, Dual, None, &mut last), None);
+
+        let mut last = None;
+        assert_eq!(inval_sel_warning(0, Ipv4, s("ims0[3]"), &mut last), None);
+        assert_eq!(last, None);
+    }
 
     #[test]
     fn sim_alert_transition_fires_failure_once_on_give_up() {
