@@ -5,7 +5,7 @@
 //! current script's `grep`/`sed` pattern with the same fixture the original
 //! bash comment used, tested independently of any [`CommandRunner`].
 
-use super::line_supervisor::{SteadyStateHealth, TunnelEngine};
+use super::line_supervisor::{ChildSaLifetime, SteadyStateHealth, TunnelEngine};
 use super::runner::{ChildHandle, ChildSpec, CommandRunner};
 use crate::config::TunnelAddressFamily;
 use crate::control::protocol::IkeSaLossCause;
@@ -224,18 +224,72 @@ const USABLE_CHILD_SA_STATES: &[&str] = &["INSTALLED", "REKEYING", "REKEYED", "U
 /// scoped to one connection so another line's healthy SA never masks this
 /// one's missing one.
 pub fn list_sas_has_child_sa(sas_output: &str, conn_name: &str) -> bool {
-    let prefix = format!("{conn_name}: #");
-    sas_output.lines().any(|l| {
-        let Some(rest) = l.strip_prefix("  ") else {
-            return false;
+    sas_output
+        .lines()
+        .filter_map(|l| child_sa_header(l, conn_name))
+        .any(|(_, state)| USABLE_CHILD_SA_STATES.contains(&state))
+}
+
+/// `(unique_id, state)` from a CHILD_SA header line of `conn_name`
+/// (`  ims0: #12, reqid 1, INSTALLED, ...`), or `None` for any other line.
+///
+/// Shared by [`list_sas_has_child_sa`] and [`newest_child_sa_lifetime`] so
+/// "is there a usable CHILD_SA" and "which one is it" can never disagree about
+/// what a CHILD_SA line looks like.
+fn child_sa_header<'a>(line: &'a str, conn_name: &str) -> Option<(u32, &'a str)> {
+    let rest = line.strip_prefix("  ")?;
+    if rest.starts_with(' ') {
+        return None;
+    }
+    let rest = rest.strip_prefix(conn_name)?.strip_prefix(": #")?;
+    let mut fields = rest.split(", ");
+    let id = fields.next()?.parse().ok()?;
+    let state = fields.nth(1)?;
+    Some((id, state))
+}
+
+/// The newest usable CHILD_SA of `conn_name` and its time to hard expiry,
+/// from `swanctl --list-sas` (specs/093 research R1).
+///
+/// "Newest" is the highest `#N`, so during a natural rekey's overlap (old
+/// `REKEYED` beside new `INSTALLED`) the replacement, with its full lifetime,
+/// is what gets judged. The lifetime is the `expires in Ns` field on the
+/// details line right under the header, as the pinned 5.9.3 prints it:
+///
+/// ```text
+///   ims0: #12, reqid 1, INSTALLED, TUNNEL-in-UDP, ESP:AES_CBC-128/HMAC_SHA1_96
+///     installed 1109s ago, rekeying in 2167s, expires in 2852s
+/// ```
+///
+/// `expires_in` is `None` when that field is missing; the CHILD_SA is still
+/// reported, so the caller can tell "no lifetime" from "no CHILD_SA".
+pub fn newest_child_sa_lifetime(sas_output: &str, conn_name: &str) -> Option<ChildSaLifetime> {
+    let mut newest: Option<ChildSaLifetime> = None;
+    let mut lines = sas_output.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some((unique_id, state)) = child_sa_header(line, conn_name) else {
+            continue;
         };
-        if rest.starts_with(' ') || !rest.starts_with(&prefix) {
-            return false;
+        if !USABLE_CHILD_SA_STATES.contains(&state) {
+            continue;
         }
-        rest.split(", ")
-            .nth(2)
-            .is_some_and(|state| USABLE_CHILD_SA_STATES.contains(&state))
-    })
+        let expires_in = lines
+            .peek()
+            .filter(|d| d.starts_with("    ") && !d.starts_with("     "))
+            .and_then(|d| {
+                d.split(", ")
+                    .find_map(|f| f.trim().strip_prefix("expires in "))
+            })
+            .and_then(|v| v.strip_suffix('s'))
+            .and_then(|v| v.parse().ok());
+        if newest.is_none_or(|n| unique_id > n.unique_id) {
+            newest = Some(ChildSaLifetime {
+                unique_id,
+                expires_in,
+            });
+        }
+    }
+    newest
 }
 
 /// Whether `swanctl --list-sas --ike <conn>` lists an IKE_SA for `conn_name`
@@ -782,7 +836,7 @@ impl TunnelEngine for StrongswanEngine {
             );
             return SteadyStateHealth::ChildSaMissing;
         }
-        SteadyStateHealth::Ok
+        SteadyStateHealth::Ok(newest_child_sa_lifetime(&sas_output, &self.conn_name))
     }
 
     /// Recovery for "the process died" and "vici is unreachable".
@@ -988,7 +1042,7 @@ impl TunnelEngine for SwuEngine {
         // The swu steady-state loop has exactly one check (is the dialer
         // alive), already covered by `is_process_alive` before this is ever
         // consulted — so there is nothing left for this engine to report.
-        SteadyStateHealth::Ok
+        SteadyStateHealth::Ok(None)
     }
 
     fn restart_process(&self, runner: &dyn CommandRunner) {
@@ -1193,7 +1247,121 @@ mod tests {
     }
 
     fn child(conn: &str, n: u32, state: &str) -> String {
-        format!("  {conn}: #{n}, reqid 1, {state}, TUNNEL-in-UDP, ESP:AES_CBC-128/HMAC_SHA1_96\n    installed 10 ago\n")
+        format!("  {conn}: #{n}, reqid 1, {state}, TUNNEL-in-UDP, ESP:AES_CBC-128/HMAC_SHA1_96\n    installed 10s ago\n")
+    }
+
+    /// A CHILD_SA in the exact shape the pinned 5.9.3 prints, details line
+    /// included (specs/093 research R1, sampled live; identities synthetic).
+    fn child_with_life(conn: &str, n: u32, state: &str, details: &str) -> String {
+        format!(
+            "  {conn}: #{n}, reqid 1, {state}, TUNNEL-in-UDP, ESP:AES_CBC-128/HMAC_SHA1_96\n    {details}\n    in  cea6576a (-|0x00000017),  21600 bytes,   242 packets,     4s ago\n    local  192.0.2.10/32\n    remote 0.0.0.0/0\n"
+        )
+    }
+
+    fn life(n: u32, expires_in: Option<i64>) -> Option<ChildSaLifetime> {
+        Some(ChildSaLifetime {
+            unique_id: n,
+            expires_in,
+        })
+    }
+
+    #[test]
+    fn child_sa_lifetime_table() {
+        let h = ike_header("ims0");
+        let full = "installed 1109s ago, rekeying in 2167s, expires in 2852s";
+        let cases: Vec<(String, Option<ChildSaLifetime>)> = vec![
+            (
+                format!("{h}{}", child_with_life("ims0", 12, "INSTALLED", full)),
+                life(12, Some(2852)),
+            ),
+            // A natural rekey's overlap: the replacement is the one judged.
+            (
+                format!(
+                    "{h}{}{}",
+                    child_with_life(
+                        "ims0",
+                        12,
+                        "REKEYED",
+                        "installed 3660s ago, expires in 300s"
+                    ),
+                    child_with_life(
+                        "ims0",
+                        13,
+                        "INSTALLED",
+                        "installed 0s ago, rekeying in 3300s, expires in 3960s"
+                    )
+                ),
+                life(13, Some(3960)),
+            ),
+            (
+                format!(
+                    "{h}{}",
+                    child_with_life(
+                        "ims0",
+                        12,
+                        "REKEYING",
+                        "installed 3670s ago, rekeying in -40s, expires in 290s"
+                    )
+                ),
+                life(12, Some(290)),
+            ),
+            // A replacement still being installed is not usable yet.
+            (
+                format!(
+                    "{h}{}{}",
+                    child_with_life("ims0", 12, "INSTALLED", full),
+                    child_with_life("ims0", 13, "INSTALLING", "installed 0s ago")
+                ),
+                life(12, Some(2852)),
+            ),
+            (
+                format!(
+                    "{h}{}",
+                    child_with_life("ims0", 12, "INSTALLED", "installed 1109s ago")
+                ),
+                life(12, None),
+            ),
+            (
+                format!("{h}{}", child("ims0", 4, "INSTALLED")),
+                life(4, None),
+            ),
+            (
+                format!(
+                    "{}{}",
+                    ike_header("ims1"),
+                    child_with_life("ims1", 2, "INSTALLED", full)
+                ),
+                None,
+            ),
+            (
+                format!(
+                    "{}{}",
+                    ike_header("ims10"),
+                    child_with_life("ims10", 2, "INSTALLED", full)
+                ),
+                None,
+            ),
+            (h.clone(), None),
+            (String::new(), None),
+        ];
+        for (i, (out, want)) in cases.iter().enumerate() {
+            assert_eq!(
+                newest_child_sa_lifetime(out, "ims0"),
+                *want,
+                "case {i}: {out}"
+            );
+        }
+        assert_eq!(
+            newest_child_sa_lifetime(
+                &format!(
+                    "{}{}",
+                    ike_header("ims10"),
+                    child_with_life("ims10", 2, "INSTALLED", full)
+                ),
+                "ims1"
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1482,8 +1650,14 @@ mod tests {
                 engine.steady_state_health(&bare),
                 SteadyStateHealth::ChildSaMissing
             );
-            let healthy = seed("ims0: #1, ESTABLISHED, IKEv2, aa_i* bb_r\n  ims0: #4, reqid 1, INSTALLED, TUNNEL-in-UDP, ESP:AES_CBC-128/HMAC_SHA1_96\n");
-            assert_eq!(engine.steady_state_health(&healthy), SteadyStateHealth::Ok);
+            let healthy = seed("ims0: #1, ESTABLISHED, IKEv2, aa_i* bb_r\n  ims0: #4, reqid 1, INSTALLED, TUNNEL-in-UDP, ESP:AES_CBC-128/HMAC_SHA1_96\n    installed 1109s ago, rekeying in 2167s, expires in 2852s\n");
+            assert_eq!(
+                engine.steady_state_health(&healthy),
+                SteadyStateHealth::Ok(Some(ChildSaLifetime {
+                    unique_id: 4,
+                    expires_in: Some(2852),
+                }))
+            );
         }
 
         #[test]

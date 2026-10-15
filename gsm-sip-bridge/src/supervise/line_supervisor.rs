@@ -91,7 +91,9 @@ pub enum DegradeReason {
 /// concept."
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SteadyStateHealth {
-    Ok,
+    /// Structurally healthy, with the newest usable CHILD_SA's lifetime.
+    /// `None` when the engine reports no CHILD_SA lifetimes (swu).
+    Ok(Option<ChildSaLifetime>),
     ViciBroken,
     TunVanished,
     /// No IKE_SA is listed for this connection at all (specs/087).
@@ -99,6 +101,19 @@ pub enum SteadyStateHealth {
     /// An IKE_SA is listed (any state, `CONNECTING` included) but has no
     /// usable CHILD_SA.
     ChildSaMissing,
+}
+
+/// What one steady-state tick saw of a line's newest usable CHILD_SA
+/// (specs/093). The newest is the highest `#N`, so during a rekey's brief
+/// overlap the replacement is judged, never the SA it is replacing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildSaLifetime {
+    /// The `#N` on the CHILD_SA's `--list-sas` header (vici's `uniqueid`).
+    /// It changes whenever the CHILD_SA is replaced, by a rekey or otherwise.
+    pub unique_id: u32,
+    /// Seconds until the hard expiry (`expires in Ns`); `None` when the
+    /// listing carries no such field.
+    pub expires_in: Option<i64>,
 }
 
 /// Matches the establish-time loop's `sleep 2` between polls, both engines.
@@ -456,7 +471,7 @@ pub fn tick_steady_state_with_pool(
     let health = engine.steady_state_health(runner);
     // Only a fully healthy structural check counts as a usable CHILD_SA; an
     // unreachable P-CSCF later in the tick does not undo that (specs/086).
-    tracking.child_sa_usable = matches!(health, SteadyStateHealth::Ok);
+    tracking.child_sa_usable = matches!(health, SteadyStateHealth::Ok(_));
     if health != SteadyStateHealth::ChildSaMissing {
         tracking.child_sa_missing = 0;
     }
@@ -541,7 +556,7 @@ pub fn tick_steady_state_with_pool(
                 ike_sa_loss_cause: None,
             };
         }
-        SteadyStateHealth::Ok => {}
+        SteadyStateHealth::Ok(_) => {}
     }
 
     // Reachability is checked last, and deliberately *after* the P-CSCF-changed
@@ -734,7 +749,7 @@ mod tests {
                 route_missing: RefCell::new(false),
                 route_repairs: RefCell::new(0),
                 alive: RefCell::new(true),
-                health: RefCell::new(SteadyStateHealth::Ok),
+                health: RefCell::new(SteadyStateHealth::Ok(None)),
                 max_attempts: None,
                 reinitiate_cadence: Some(STRONGSWAN_REINITIATE_EVERY),
                 terminate_calls: RefCell::new(0),
@@ -1586,7 +1601,7 @@ mod tests {
         };
         let mut tracking = SteadyTracking::default();
         child_sa_tick(&engine, &runner, &mut tracking);
-        *engine.health.borrow_mut() = SteadyStateHealth::Ok;
+        *engine.health.borrow_mut() = SteadyStateHealth::Ok(None);
         child_sa_tick(&engine, &runner, &mut tracking);
         *engine.health.borrow_mut() = SteadyStateHealth::ChildSaMissing;
         assert_eq!(
@@ -1690,7 +1705,7 @@ mod tests {
             SteadyStateHealth::TunVanished,
             SteadyStateHealth::ViciBroken,
         ] {
-            *engine.health.borrow_mut() = SteadyStateHealth::Ok;
+            *engine.health.borrow_mut() = SteadyStateHealth::Ok(None);
             tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
             assert!(tracking.child_sa_usable);
             *engine.health.borrow_mut() = health;
@@ -1698,7 +1713,7 @@ mod tests {
             assert!(!tracking.child_sa_usable, "{health:?}");
         }
 
-        *engine.health.borrow_mut() = SteadyStateHealth::Ok;
+        *engine.health.borrow_mut() = SteadyStateHealth::Ok(None);
         tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
         *engine.alive.borrow_mut() = false;
         tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);

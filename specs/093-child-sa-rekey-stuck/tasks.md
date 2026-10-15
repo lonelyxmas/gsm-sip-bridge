@@ -10,12 +10,12 @@ Fixtures use synthetic identities only (`001010000000001`, `192.0.2.x`, `203.0.1
 
 ## Phase 1: Setup
 
-- [ ] T001 Confirm the branch is `093-child-sa-rekey-stuck` on top of `origin/main`, and that `make test` is green before any change.
+- [X] T001 Confirm the branch is `093-child-sa-rekey-stuck` on top of `origin/main`, and that `make test` is green before any change.
 
 ## Phase 2: Foundational (blocks US1–US3)
 
-- [ ] T002 In `supervise/line_supervisor.rs`, add `pub struct ChildSaLifetime { pub unique_id: u32, pub expires_in: Option<i64> }` (`Debug, Clone, Copy, PartialEq, Eq`), with a doc comment per data-model.md. Change `SteadyStateHealth::Ok` to `Ok(Option<ChildSaLifetime>)`, documented as: "`None` when the engine reports no CHILD_SA lifetimes (SWu)". Update every use: `matches!(health, SteadyStateHealth::Ok(_))` at the `child_sa_usable` line, the `SteadyStateHealth::Ok(_) => {}` match arm, the `FakeEngine` defaults and test assignments (`SteadyStateHealth::Ok(None)`), `supervise/engines.rs` (SWu returns `Ok(None)`; strongSwan temporarily `Ok(None)`), and the `engines.rs` test assertion. There is no behaviour change, so `make test` stays green.
-- [ ] T003 [P] In `supervise/engines.rs`, add tests first, then `pub fn newest_child_sa_lifetime(sas_output: &str, conn_name: &str) -> Option<ChildSaLifetime>` per plan.md design note 1. It matches CHILD_SA headers exactly as `list_sas_has_child_sa` does (factor out a shared header parser returning `(unique_id, state)` so the two cannot drift). It reads `expires in Ns` from the immediately following four-space-indented line, and returns the usable header with the highest `#N`. Add a test helper `child_with_life(conn, n, state, installed, rekeying, expires)` that renders the real 5.9.3 shape from research.md R1 (`    installed 1109s ago, rekeying in 2167s, expires in 2852s`). Table test `child_sa_lifetime_table` cases:
+- [X] T002 In `supervise/line_supervisor.rs`, add `pub struct ChildSaLifetime { pub unique_id: u32, pub expires_in: Option<i64> }` (`Debug, Clone, Copy, PartialEq, Eq`), with a doc comment per data-model.md. Change `SteadyStateHealth::Ok` to `Ok(Option<ChildSaLifetime>)`, documented as: "`None` when the engine reports no CHILD_SA lifetimes (SWu)". Update every use: `matches!(health, SteadyStateHealth::Ok(_))` at the `child_sa_usable` line, the `SteadyStateHealth::Ok(_) => {}` match arm, the `FakeEngine` defaults and test assignments (`SteadyStateHealth::Ok(None)`), `supervise/engines.rs` (SWu returns `Ok(None)`; strongSwan temporarily `Ok(None)`), and the `engines.rs` test assertion. There is no behaviour change, so `make test` stays green.
+- [X] T003 [P] In `supervise/engines.rs`, add tests first, then `pub fn newest_child_sa_lifetime(sas_output: &str, conn_name: &str) -> Option<ChildSaLifetime>` per plan.md design note 1. It matches CHILD_SA headers exactly as `list_sas_has_child_sa` does (factor out a shared header parser returning `(unique_id, state)` so the two cannot drift). It reads `expires in Ns` from the immediately following four-space-indented line, and returns the usable header with the highest `#N`. Add a test helper `child_with_life(conn, n, state, installed, rekeying, expires)` that renders the real 5.9.3 shape from research.md R1 (`    installed 1109s ago, rekeying in 2167s, expires in 2852s`). Table test `child_sa_lifetime_table` cases:
   - single `INSTALLED #12` → `Some{12, Some(2852)}`
   - natural overlap `REKEYED #12` (expires 300) plus `INSTALLED #13` (expires 3960) → `#13`, 3960
   - `REKEYING #12` with `expires in 290s` → `#12`, 290
@@ -27,7 +27,7 @@ Fixtures use synthetic identities only (`001010000000001`, `192.0.2.x`, `203.0.1
   - empty input → `None`
 
   Also fix the existing `child()` helper's details line to the real `installed 10s ago` form.
-- [ ] T004 Wire `StrongswanEngine::steady_state_health` in `supervise/engines.rs` to return `SteadyStateHealth::Ok(newest_child_sa_lifetime(&sas_output, &self.conn_name))`. Extend the existing healthy-path engine test to assert the lifetime it now returns. Commit: `refactor(supervise): report the newest CHILD_SA's lifetime with a healthy tick (093)`.
+- [X] T004 Wire `StrongswanEngine::steady_state_health` in `supervise/engines.rs` to return `SteadyStateHealth::Ok(newest_child_sa_lifetime(&sas_output, &self.conn_name))`. Extend the existing healthy-path engine test to assert the lifetime it now returns. Commit: `refactor(supervise): report the newest CHILD_SA's lifetime with a healthy tick (093)`.
 
 ## Phase 3: User Stories 1 + 2: rebuild a stuck rekey once, never on a natural rekey (P1) 🎯 MVP
 
