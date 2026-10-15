@@ -1691,6 +1691,10 @@ pub(super) fn establish_line_tunnel(
     println!("[supervise] line {idx}: waiting for the strongSwan tunnel (CHILD_SA + P-CSCF assignment) ...");
     let mut attempt = 0u32;
     let mut stuck = false;
+    // Logged here too, not only once the tunnel is up: a line whose family
+    // excludes every advertised P-CSCF never establishes, and this is the only
+    // place that says why.
+    let mut logged_ignored = Vec::new();
     let pcscf = loop {
         if ctx.real_shutting_down.is_some_and(|f| *f.read().unwrap()) {
             println!(
@@ -1716,6 +1720,7 @@ pub(super) fn establish_line_tunnel(
                 break None;
             }
             line_supervisor::EstablishOutcome::StillEstablishing => {
+                log_ignored_pcscfs(&engine, runner.as_ref(), &mut logged_ignored);
                 runner.sleep(line_supervisor::ESTABLISH_POLL_INTERVAL);
             }
         }
@@ -1790,7 +1795,9 @@ fn start_vowifi_line_strongswan(
     };
 
     let mut current_pool = engine.latest_pcscf_pool(runner.as_ref());
-    log_ignored_pcscfs(&engine, runner.as_ref());
+    // The ignored set last logged, so each one is logged once per change.
+    let mut logged_ignored = Vec::new();
+    log_ignored_pcscfs(&engine, runner.as_ref(), &mut logged_ignored);
     let mut published_pool = if publish_pcscf(
         runner.as_ref(),
         idx,
@@ -1892,7 +1899,6 @@ fn start_vowifi_line_strongswan(
                 // recreate the pair the plan just deleted.
                 repair_line_veth(runner.as_ref(), idx, &netns, line);
                 drop(guard);
-                let published_before = published_pool.clone();
                 republish_pool_after_set_change(
                     runner.as_ref(),
                     idx,
@@ -1901,9 +1907,10 @@ fn start_vowifi_line_strongswan(
                     &mut published_pool,
                     engine.latest_pcscf_pool(runner.as_ref()),
                 );
-                if published_pool != published_before {
-                    log_ignored_pcscfs(&engine, runner.as_ref());
-                }
+                // Every tick, not only when the published pool changes: a
+                // negotiation that changes only excluded addresses leaves the
+                // pool as it was.
+                log_ignored_pcscfs(&engine, runner.as_ref(), &mut logged_ignored);
                 // Only a dual line can be told to narrow its family.
                 if engine.address_family == TunnelAddressFamily::Dual {
                     if let Some(warning) = inval_sel_warning(
@@ -1920,7 +1927,7 @@ fn start_vowifi_line_strongswan(
                 drop(guard);
                 println!("[supervise] line {idx}: P-CSCF changed ({current_pcscf} -> {new_pcscf}); refreshing");
                 current_pool = engine.latest_pcscf_pool(runner.as_ref());
-                log_ignored_pcscfs(&engine, runner.as_ref());
+                log_ignored_pcscfs(&engine, runner.as_ref(), &mut logged_ignored);
                 published_pool = if publish_pcscf(
                     runner.as_ref(),
                     idx,
@@ -2002,7 +2009,7 @@ fn start_vowifi_line_strongswan(
                             current_pool = engine
                                 .fresh_pcscf_pool_since(runner.as_ref(), mark)
                                 .unwrap_or_default();
-                            log_ignored_pcscfs(&engine, runner.as_ref());
+                            log_ignored_pcscfs(&engine, runner.as_ref(), &mut logged_ignored);
                             published_pool = if publish_pcscf(
                                 runner.as_ref(),
                                 idx,
@@ -2214,16 +2221,46 @@ fn republish_pool_after_set_change(
 }
 
 /// Logs each P-CSCF the latest negotiation advertised that this line's
-/// `tunnel_address_family` excludes (specs/092 FR-013). Called only at the
-/// publication points, which happen once per negotiation or pool change, so
-/// it never repeats every tick. Silent for a `dual` line.
-fn log_ignored_pcscfs(engine: &StrongswanEngine, runner: &dyn CommandRunner) {
-    for addr in engine.ignored_pcscfs(runner) {
-        println!(
-            "[supervise] line {}: ignoring P-CSCF {addr} (tunnel_address_family = {})",
-            engine.idx, engine.address_family
-        );
+/// `tunnel_address_family` excludes (specs/092 FR-013). Safe to call every
+/// tick: see [`ignored_pcscf_lines`]. Silent for a `dual` line.
+fn log_ignored_pcscfs(
+    engine: &StrongswanEngine,
+    runner: &dyn CommandRunner,
+    last_logged: &mut Vec<String>,
+) {
+    for line in ignored_pcscf_lines(
+        engine.idx,
+        engine.address_family,
+        engine.ignored_pcscfs(runner),
+        last_logged,
+    ) {
+        println!("{line}");
     }
+}
+
+/// The "ignoring P-CSCF" lines for `ignored`, or none when it equals the set
+/// `last_logged` already reported. Tracked apart from the published pool, so
+/// a negotiation whose admitted pool is empty or unchanged is still logged
+/// once.
+fn ignored_pcscf_lines(
+    idx: u32,
+    family: TunnelAddressFamily,
+    ignored: Vec<String>,
+    last_logged: &mut Vec<String>,
+) -> Vec<String> {
+    if ignored == *last_logged {
+        return Vec::new();
+    }
+    let lines = ignored
+        .iter()
+        .map(|addr| {
+            format!(
+                "[supervise] line {idx}: ignoring P-CSCF {addr} (tunnel_address_family = {family})"
+            )
+        })
+        .collect();
+    *last_logged = ignored;
+    lines
 }
 
 /// The hint for a `dual` line whose CHILD_SA rekey the ePDG rejected with
@@ -2857,6 +2894,35 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ignored_pcscf_lines_log_each_set_once_even_with_nothing_admitted() {
+        use TunnelAddressFamily::Ipv6;
+        let v = |a: &[&str]| a.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let mut last = Vec::new();
+        // An ipv6 line offered only IPv4 P-CSCFs: nothing to publish, but
+        // the operator still learns why.
+        assert_eq!(
+            ignored_pcscf_lines(1, Ipv6, v(&["10.0.0.10", "10.0.1.10"]), &mut last),
+            v(&[
+                "[supervise] line 1: ignoring P-CSCF 10.0.0.10 (tunnel_address_family = ipv6)",
+                "[supervise] line 1: ignoring P-CSCF 10.0.1.10 (tunnel_address_family = ipv6)",
+            ])
+        );
+        // The same set on the next tick is not repeated.
+        assert!(ignored_pcscf_lines(1, Ipv6, v(&["10.0.0.10", "10.0.1.10"]), &mut last).is_empty());
+        // A negotiation that changes only excluded addresses is logged.
+        assert_eq!(
+            ignored_pcscf_lines(1, Ipv6, v(&["10.0.0.10"]), &mut last),
+            v(&["[supervise] line 1: ignoring P-CSCF 10.0.0.10 (tunnel_address_family = ipv6)"])
+        );
+        // Nothing ignored logs nothing, and a later return is logged again.
+        assert!(ignored_pcscf_lines(1, Ipv6, Vec::new(), &mut last).is_empty());
+        assert_eq!(
+            ignored_pcscf_lines(1, Ipv6, v(&["10.0.0.10"]), &mut last).len(),
+            1
+        );
+    }
 
     #[test]
     fn inval_sel_warning_fires_once_per_session_on_dual_lines_only() {
