@@ -1088,6 +1088,11 @@ mod mock {
         pub agent_statuses: Mutex<Map<String, AgentStatusProbe>>,
         /// Every address `agent_status` was asked about, in call order.
         pub agent_status_queries: Mutex<Vec<String>>,
+        /// See [`Self::hold_agent_status_until`]: the number of queries that
+        /// must be in flight together, how many are in flight, and how many
+        /// gave up waiting.
+        agent_status_rendezvous: Mutex<AgentStatusRendezvous>,
+        agent_status_arrived: std::sync::Condvar,
         /// Argv substrings that make a future `spawn()` create its child
         /// already dead (`is_alive` false from the start) — lets a test
         /// force a deterministic `EstablishOutcome::FatalProcessDied` for a
@@ -1096,6 +1101,16 @@ mod mock {
         /// thread) for handle-ID order.
         pub born_dead_substrings: Mutex<Vec<String>>,
         next_id: AtomicU64,
+    }
+
+    /// State behind [`MockCommandRunner::hold_agent_status_until`]. A
+    /// `target` of 0 (the default) means queries reply at once.
+    #[derive(Debug, Default)]
+    struct AgentStatusRendezvous {
+        target: usize,
+        patience: std::time::Duration,
+        arrived: usize,
+        gave_up: usize,
     }
 
     impl MockCommandRunner {
@@ -1180,6 +1195,24 @@ mod mock {
         /// Every address `agent_status` was asked about so far, oldest first.
         pub fn agent_status_queries(&self) -> Vec<String> {
             self.agent_status_queries.lock().unwrap().clone()
+        }
+
+        /// Makes every `agent_status` call wait, up to `patience`, until
+        /// `n` calls are in flight at once before replying. Callers that
+        /// query one at a time never get there, and each waiting query that
+        /// gives up is counted in [`Self::agent_status_gave_up`]. This lets a
+        /// test prove queries overlap without hanging when they don't.
+        pub fn hold_agent_status_until(&self, n: usize, patience: std::time::Duration) {
+            *self.agent_status_rendezvous.lock().unwrap() = AgentStatusRendezvous {
+                target: n,
+                patience,
+                ..Default::default()
+            };
+        }
+
+        /// How many held `agent_status` calls gave up waiting for the others.
+        pub fn agent_status_gave_up(&self) -> usize {
+            self.agent_status_rendezvous.lock().unwrap().gave_up
         }
 
         pub fn kill_child(&self, handle: &ChildHandle, exit_code: i32) {
@@ -1409,6 +1442,19 @@ mod mock {
                 .lock()
                 .unwrap()
                 .push(addr.to_string());
+            let mut rv = self.agent_status_rendezvous.lock().unwrap();
+            if rv.target > 0 {
+                rv.arrived += 1;
+                self.agent_status_arrived.notify_all();
+                let patience = rv.patience;
+                let (mut rv, timeout) = self
+                    .agent_status_arrived
+                    .wait_timeout_while(rv, patience, |r| r.arrived < r.target)
+                    .unwrap();
+                if timeout.timed_out() {
+                    rv.gave_up += 1;
+                }
+            }
             self.agent_statuses
                 .lock()
                 .unwrap()

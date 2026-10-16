@@ -1360,6 +1360,34 @@ mod tests {
         );
     }
 
+    /// Each agent query can take up to 2s against a silent agent, and
+    /// Docker kills the HEALTHCHECK at 5s, so line checks must overlap
+    /// rather than run one after another. Every query here waits until all
+    /// four are in flight together; a sequential loop never gets there, so
+    /// each query gives up after its patience runs out and is counted.
+    #[test]
+    fn line_checks_query_every_agent_at_once() {
+        let runner = MockCommandRunner::new();
+        let lines: Vec<_> = (0..4).map(|i| ready_line(&runner, i)).collect();
+        for i in 0..4 {
+            runner.set_agent_status(
+                &agent_addr(i),
+                AgentStatusProbe::Reply(status_reply("up", None)),
+            );
+        }
+        runner.hold_agent_status_until(4, std::time::Duration::from_secs(2));
+
+        let health = evaluate(&runner, true, true, true, &resolution(lines), "strongswan");
+
+        assert_eq!(
+            runner.agent_status_gave_up(),
+            0,
+            "line checks ran one after another instead of all at once"
+        );
+        assert_eq!(runner.agent_status_queries().len(), 4);
+        assert_eq!(health, Health::Healthy);
+    }
+
     /// The live-found bug this encodes: hardcoding `tun1` for every engine
     /// made every strongswan-engine container report unhealthy regardless of
     /// real tunnel state.
