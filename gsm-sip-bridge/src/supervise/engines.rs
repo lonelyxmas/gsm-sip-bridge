@@ -927,16 +927,29 @@ impl TunnelEngine for StrongswanEngine {
         Some(super::line_supervisor::STRONGSWAN_REINITIATE_EVERY)
     }
 
-    fn repair_default_route(&self, runner: &dyn CommandRunner) -> bool {
-        if super::epdg_iface::has_default_route(runner, &self.netns, &self.tun_iface) {
+    fn repair_default_route(&self, runner: &dyn CommandRunner, pcscf: &str) -> bool {
+        use super::epdg_iface::{ensure_default_route, has_default_route, RouteFamily};
+        // The P-CSCF's family is the route that matters. One that does not
+        // parse is never expected (it comes from charon's log as an address),
+        // so fall back to requiring both rather than guessing one.
+        let families = match RouteFamily::of_addr(pcscf) {
+            Some(f) => vec![f],
+            None => RouteFamily::ALL.to_vec(),
+        };
+        let missing = |f: RouteFamily| !has_default_route(runner, &self.netns, &self.tun_iface, f);
+        let Some(gone) = families.iter().copied().find(|&f| missing(f)) else {
             return false;
-        }
+        };
         println!(
-            "[supervise] line {}: netns {} has no default route via {} — the P-CSCF is \
+            "[supervise] line {}: netns {} has no {} default route via {} — the P-CSCF is \
              unreachable for that reason alone, not because the tunnel is broken; reinstating it",
-            self.idx, self.netns, self.tun_iface
+            self.idx,
+            self.netns,
+            gone.label(),
+            self.tun_iface
         );
-        super::epdg_iface::ensure_default_route(runner, &self.netns, &self.tun_iface)
+        ensure_default_route(runner, &self.netns, &self.tun_iface);
+        !families.into_iter().any(missing)
     }
 
     fn recreate_interface(&self, runner: &dyn CommandRunner) -> bool {
@@ -1132,7 +1145,7 @@ impl TunnelEngine for SwuEngine {
         true
     }
 
-    fn repair_default_route(&self, _runner: &dyn CommandRunner) -> bool {
+    fn repair_default_route(&self, _runner: &dyn CommandRunner, _pcscf: &str) -> bool {
         // Same reason: the dialer owns this engine's device and its routing, so
         // there is no externally-managed route here to have gone missing.
         // `false` means "nothing repaired", which leaves the caller's escalation
@@ -1654,6 +1667,75 @@ mod tests {
                 max_establish_attempts: None,
                 address_family: TunnelAddressFamily::Dual,
             }
+        }
+
+        const V4_ROUTE_SHOW: &[&str] = &["ip", "route", "show", "default", "dev", "tun23"];
+        const V6_ROUTE_SHOW: &[&str] = &["ip", "-6", "route", "show", "default", "dev", "tun23"];
+
+        /// A runner whose `ims` netns has the default route in `present` only.
+        fn routes_present(present: &[&[&str]]) -> MockCommandRunner {
+            let runner = MockCommandRunner::new();
+            for argv in present {
+                runner.set_netns_output("ims", argv, "default scope link \n");
+            }
+            runner
+        }
+
+        fn route_replaces(runner: &MockCommandRunner) -> Vec<Vec<String>> {
+            runner
+                .run_in_netns_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(ns, c)| ns == "ims" && c.contains(&"replace".to_string()))
+                .map(|(_, c)| c.clone())
+                .collect()
+        }
+
+        #[test]
+        fn an_ipv6_pcscf_line_repairs_a_lost_ipv6_route_though_ipv4_is_present() {
+            // #133, as observed on the Vodafone rig: only the IPv6 route was
+            // deleted, the old IPv4-only check called it present, and the line
+            // waited out 82s of unreachable strikes and rebuilt the tunnel.
+            let runner = routes_present(&[V4_ROUTE_SHOW]);
+            strongswan_engine().repair_default_route(&runner, "2001:db8::1");
+            assert!(route_replaces(&runner)
+                .iter()
+                .any(|c| c == &["ip", "-6", "route", "replace", "default", "dev", "tun23"]));
+        }
+
+        #[test]
+        fn an_ipv6_pcscf_line_ignores_a_missing_ipv4_route() {
+            let runner = routes_present(&[V6_ROUTE_SHOW]);
+            assert!(!strongswan_engine().repair_default_route(&runner, "2001:db8::1"));
+            assert!(route_replaces(&runner).is_empty());
+        }
+
+        #[test]
+        fn an_ipv4_pcscf_line_ignores_a_missing_ipv6_route() {
+            let runner = routes_present(&[V4_ROUTE_SHOW]);
+            assert!(!strongswan_engine().repair_default_route(&runner, "10.0.0.1"));
+            assert!(route_replaces(&runner).is_empty());
+        }
+
+        #[test]
+        fn an_ipv4_pcscf_line_repairs_a_lost_ipv4_route() {
+            let runner = routes_present(&[V6_ROUTE_SHOW]);
+            strongswan_engine().repair_default_route(&runner, "10.0.0.1");
+            assert!(route_replaces(&runner)
+                .iter()
+                .any(|c| c == &["ip", "route", "replace", "default", "dev", "tun23"]));
+        }
+
+        #[test]
+        fn an_unparseable_pcscf_requires_both_routes() {
+            let runner = routes_present(&[V4_ROUTE_SHOW]);
+            strongswan_engine().repair_default_route(&runner, "pcscf.example");
+            assert!(!route_replaces(&runner).is_empty());
+
+            let runner = routes_present(&[V4_ROUTE_SHOW, V6_ROUTE_SHOW]);
+            assert!(!strongswan_engine().repair_default_route(&runner, "pcscf.example"));
+            assert!(route_replaces(&runner).is_empty());
         }
 
         #[test]

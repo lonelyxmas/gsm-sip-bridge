@@ -347,28 +347,77 @@ pub fn reclaim_leftover_lines(
     }
 }
 
-/// Whether this line's netns has a default route through its tunnel.
+/// One address family's routing table, as `ip` addresses it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteFamily {
+    V4,
+    V6,
+}
+
+impl RouteFamily {
+    pub const ALL: [Self; 2] = [Self::V4, Self::V6];
+
+    /// The family of an IP address, or `None` when `addr` is not one.
+    pub fn of_addr(addr: &str) -> Option<Self> {
+        addr.parse::<std::net::IpAddr>()
+            .ok()
+            .map(|a| if a.is_ipv6() { Self::V6 } else { Self::V4 })
+    }
+
+    /// The flag `ip` needs to address this family's table: none for IPv4.
+    fn ip_flag(self) -> Option<&'static str> {
+        match self {
+            Self::V4 => None,
+            Self::V6 => Some("-6"),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::V4 => "IPv4",
+            Self::V6 => "IPv6",
+        }
+    }
+}
+
+/// Whether this line's netns has a `family` default route through its tunnel.
 ///
 /// Worth asking on its own, because a line can have a perfectly healthy
 /// CHILD_SA, a present interface and a carrier-assigned address while having no
 /// route at all — and in that state every connect fails with `ENETUNREACH`
 /// while every structural check passes. See [`ensure_default_route`].
-pub fn has_default_route(runner: &dyn CommandRunner, netns: &str, tun_iface: &str) -> bool {
+///
+/// One family at a time, and the caller picks it from the P-CSCF it needs to
+/// reach. A bare `ip route show` lists IPv4 only, which once made a missing
+/// IPv6 route invisible on a line whose Gm runs over IPv6 (Vodafone IN): the
+/// IPv4 route was still there, the instant repair never ran, and the line
+/// waited out the ~90s unreachable window and rebuilt the tunnel instead
+/// (#133).
+pub fn has_default_route(
+    runner: &dyn CommandRunner,
+    netns: &str,
+    tun_iface: &str,
+    family: RouteFamily,
+) -> bool {
+    let mut argv = vec!["ip"];
+    argv.extend(family.ip_flag());
+    argv.extend(["route", "show", "default", "dev", tun_iface]);
     runner
-        .run_in_netns(netns, &["ip", "route", "show", "default", "dev", tun_iface])
+        .run_in_netns(netns, &argv)
         .map(|o| o.status.success() && !o.stdout.is_empty())
         .unwrap_or(false)
 }
 
 /// Install the default route through the tunnel, for both families.
 ///
-/// Returns whether an IPv4 default route is present afterwards — the family
-/// that carries Gm for the carriers here.
+/// Both, whatever the line's P-CSCF family: `replace` is idempotent, and a
+/// route on a family with no address is harmless. Callers that need to know
+/// the outcome re-check the family they care about with [`has_default_route`].
 ///
 /// **This is not the only thing that installs it**, and deliberately so:
 /// `docker/strongswan/ims.updown` installs it alongside the carrier address on
-/// every `up-client`, because the kernel deletes an interface's default route
-/// when the last address of that family is removed. That made the route a
+/// every `up-client`, because the kernel deletes an interface's IPv4 default
+/// route when its last IPv4 address is removed. That made the route a
 /// casualty of every CHILD_SA teardown, including the ones this function's
 /// callers perform themselves, and cost a 6-hour outage on 2026-08-19 when a
 /// 2-minute WAN blip tore the SA down and the reconnect restored only the
@@ -377,16 +426,16 @@ pub fn has_default_route(runner: &dyn CommandRunner, netns: &str, tun_iface: &st
 /// Failures are logged rather than discarded. The previous version threw away
 /// the result of every one of these commands, which is why 202 consecutive
 /// recovery attempts produced no record of why the data path never returned.
-pub fn ensure_default_route(runner: &dyn CommandRunner, netns: &str, tun_iface: &str) -> bool {
-    for family in [None, Some("-6")] {
+pub fn ensure_default_route(runner: &dyn CommandRunner, netns: &str, tun_iface: &str) {
+    for family in RouteFamily::ALL {
         let mut argv = vec!["ip"];
-        argv.extend(family);
+        argv.extend(family.ip_flag());
         argv.extend(["route", "replace", "default", "dev", tun_iface]);
         match runner.run_in_netns(netns, &argv) {
             Ok(out) if !out.status.success() => eprintln!(
                 "[supervise] could not install the {} default route via {tun_iface} in netns \
                  {netns}: {}",
-                if family.is_some() { "IPv6" } else { "IPv4" },
+                family.label(),
                 String::from_utf8_lossy(&out.stderr).trim()
             ),
             Err(e) => eprintln!(
@@ -396,7 +445,6 @@ pub fn ensure_default_route(runner: &dyn CommandRunner, netns: &str, tun_iface: 
             _ => {}
         }
     }
-    has_default_route(runner, netns, tun_iface)
 }
 
 /// Idempotently ensures netns `netns` and its pre-created XFRM interface
@@ -914,6 +962,63 @@ src 2402:8100::1/128 dst ::/0
                 && c == &["ip", "route", "replace", "default", "dev", "tun23-0"]));
         assert!(netns_calls.iter().any(|(ns, c)| ns == "ims0"
             && c == &["ip", "-6", "route", "replace", "default", "dev", "tun23-0"]));
+    }
+
+    const V4_DEFAULT: &str = "default scope link \n";
+    const V6_DEFAULT: &str = "default metric 1024 pref medium\n";
+
+    #[test]
+    fn a_missing_ipv6_default_route_is_seen_while_the_ipv4_one_is_present() {
+        // #133. `ip route show` without `-6` lists IPv4 only, so on a line
+        // whose Gm runs over IPv6 the lost route read as present.
+        let runner = MockCommandRunner::new();
+        runner.set_netns_output(
+            "ims0",
+            &["ip", "route", "show", "default", "dev", "tun23-0"],
+            V4_DEFAULT,
+        );
+        assert!(!has_default_route(
+            &runner,
+            "ims0",
+            "tun23-0",
+            RouteFamily::V6
+        ));
+        assert!(has_default_route(
+            &runner,
+            "ims0",
+            "tun23-0",
+            RouteFamily::V4
+        ));
+    }
+
+    #[test]
+    fn a_missing_ipv4_default_route_is_seen_while_the_ipv6_one_is_present() {
+        let runner = MockCommandRunner::new();
+        runner.set_netns_output(
+            "ims0",
+            &["ip", "-6", "route", "show", "default", "dev", "tun23-0"],
+            V6_DEFAULT,
+        );
+        assert!(!has_default_route(
+            &runner,
+            "ims0",
+            "tun23-0",
+            RouteFamily::V4
+        ));
+        assert!(has_default_route(
+            &runner,
+            "ims0",
+            "tun23-0",
+            RouteFamily::V6
+        ));
+    }
+
+    #[test]
+    fn route_family_follows_the_address() {
+        assert_eq!(RouteFamily::of_addr("10.0.0.1"), Some(RouteFamily::V4));
+        assert_eq!(RouteFamily::of_addr("2001:db8::1"), Some(RouteFamily::V6));
+        assert_eq!(RouteFamily::of_addr("pcscf.example"), None);
+        assert_eq!(RouteFamily::of_addr(""), None);
     }
 
     #[test]

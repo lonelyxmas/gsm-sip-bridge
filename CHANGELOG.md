@@ -83,6 +83,14 @@ across releases.
 
 ### Fixed
 
+- **IPv6 lines repair a lost default route at once.** The supervisor's
+  default-route check looked at IPv4 only, so on a line whose P-CSCF is IPv6
+  a missing IPv6 route went unseen while the IPv4 one stayed: the line waited
+  out ~90 s of unreachable strikes and rebuilt the tunnel, dropping any call.
+  The check now follows the current P-CSCF's family and reinstates the route
+  without touching the tunnel
+  ([#133](https://github.com/selvakn/gsm-sip-bridge/issues/133)).
+
 - **NOTIFYs answered per subscription dialog.** A reg-event `NOTIFY` for a
   subscription a renewal replaced is acknowledged without being acted on, and
   one for no subscription of ours is refused `481` (RFC 6665 §4.4.1); a late
