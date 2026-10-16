@@ -2419,11 +2419,30 @@ pub fn unix_now() -> u64 {
 /// it actually has data for (`RegistrationStatusReply` /
 /// `CallHistoryReply` respectively).
 pub fn query_status(addr: &str) -> BridgeResult<ControlMessage> {
+    query_status_bounded(addr, std::time::Duration::from_secs(3), None)
+}
+
+/// [`query_status`] with a caller-chosen connect timeout and, optionally, a
+/// read timeout.
+///
+/// The container HEALTHCHECK needs the read bound (specs/094, research R3):
+/// it runs under Docker's 5s timeout, and an agent that accepts the
+/// connection but never writes would otherwise block `read_msg` past it.
+/// Docker would then report a bare timeout that names no line. `None` reads
+/// without a limit, which is what `vowifi-status` has always done.
+pub fn query_status_bounded(
+    addr: &str,
+    connect: std::time::Duration,
+    read: Option<std::time::Duration>,
+) -> BridgeResult<ControlMessage> {
     let socket_addr: std::net::SocketAddr = addr
         .parse()
         .map_err(|e| BridgeError::Ims(format!("invalid address {addr}: {e}")))?;
-    let mut stream = TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_secs(3))
+    let mut stream = TcpStream::connect_timeout(&socket_addr, connect)
         .map_err(|e| BridgeError::Ims(format!("connect to {addr} failed: {e}")))?;
+    stream
+        .set_read_timeout(read)
+        .map_err(|e| BridgeError::Ims(format!("set read timeout on {addr}: {e}")))?;
     write_msg(&mut stream, &ControlMessage::StatusQuery).map_err(BridgeError::Ims)?;
     let mut reader = std::io::BufReader::new(stream);
     read_msg(&mut reader).map_err(BridgeError::Ims)
@@ -2432,6 +2451,106 @@ pub fn query_status(addr: &str) -> BridgeResult<ControlMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- specs/094: the bounded status query, against real loopback sockets ----
+
+    /// A one-shot peer on `127.0.0.1:0` that reads the query line, then
+    /// writes `reply` (or nothing, holding the connection open for `hold`).
+    fn status_peer(
+        reply: Option<String>,
+        hold: std::time::Duration,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let peer = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut query = String::new();
+            let _ = reader.read_line(&mut query);
+            let mut stream = stream;
+            match reply {
+                Some(r) => {
+                    let _ = stream.write_all(r.as_bytes());
+                }
+                None => std::thread::sleep(hold),
+            }
+        });
+        (addr, peer)
+    }
+
+    #[test]
+    fn a_bounded_status_query_returns_the_agents_reply() {
+        let reply = ControlMessage::RegistrationStatusReply {
+            state: "Registered".to_string(),
+            registered_at: None,
+            expires_at: None,
+            last_failure: None,
+            can_answer: true,
+            blocked_reason: None,
+            gm_connection: "up".to_string(),
+            rejection_cooldown_until: None,
+            reg_subscription: String::new(),
+            reg_subscription_last_failure: None,
+            pcscf: None,
+        };
+        let line = format!("{}\n", serde_json::to_string(&reply).unwrap());
+        let (addr, peer) = status_peer(Some(line), std::time::Duration::ZERO);
+        let got = query_status_bounded(
+            &addr,
+            std::time::Duration::from_secs(1),
+            Some(std::time::Duration::from_secs(1)),
+        )
+        .unwrap();
+        assert_eq!(got, reply);
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn a_silent_agent_cannot_hold_the_bounded_query_past_its_read_timeout() {
+        let (addr, peer) = status_peer(None, std::time::Duration::from_secs(2));
+        let t0 = std::time::Instant::now();
+        let got = query_status_bounded(
+            &addr,
+            std::time::Duration::from_secs(1),
+            Some(std::time::Duration::from_millis(300)),
+        );
+        assert!(got.is_err(), "{got:?}");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "took {:?}",
+            t0.elapsed()
+        );
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn a_bounded_query_to_a_closed_port_fails_fast() {
+        let addr = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+        let t0 = std::time::Instant::now();
+        let got = query_status_bounded(
+            &addr,
+            std::time::Duration::from_secs(1),
+            Some(std::time::Duration::from_secs(1)),
+        );
+        assert!(got.is_err(), "{got:?}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_bounded_query_rejects_a_garbage_reply() {
+        let (addr, peer) = status_peer(Some("not json\n".to_string()), std::time::Duration::ZERO);
+        let got = query_status_bounded(
+            &addr,
+            std::time::Duration::from_secs(1),
+            Some(std::time::Duration::from_secs(1)),
+        );
+        assert!(got.is_err(), "{got:?}");
+        peer.join().unwrap();
+    }
 
     #[test]
     fn rejection_cooldown_reads_none_when_not_running() {

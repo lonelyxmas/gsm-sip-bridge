@@ -163,6 +163,22 @@ impl HttpProbe {
     }
 }
 
+/// The outcome of [`CommandRunner::agent_status`]: one `StatusQuery` to a
+/// line's IMS agent (specs/094).
+///
+/// Two states, mirroring what the HEALTHCHECK can conclude: the agent said
+/// *something* (and the classifier decides whether it is healthy), or it said
+/// nothing usable in time. A refused or timed-out connect, a read timeout, an
+/// early close and an unparsable reply all collapse into `NoAnswer`, with the
+/// error text kept for the fault message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentStatusProbe {
+    /// One message, read before the timeouts. Any variant; the caller decides.
+    Reply(crate::vowifi::control::ControlMessage),
+    /// No usable answer, and why.
+    NoAnswer(String),
+}
+
 /// The trait every orchestration decision is written against.
 pub trait CommandRunner: Send + Sync {
     /// One-shot command, captures stdout/stderr/status. Replaces a direct
@@ -310,6 +326,19 @@ pub trait CommandRunner: Send + Sync {
     /// Routed through the runner like every other real-world effect, so the
     /// healthcheck's decision logic stays a pure function over the body.
     fn http_get(&self, url: &str) -> HttpProbe;
+
+    /// Ask the IMS agent listening on `addr` (`ip:port`) for its status: one
+    /// `StatusQuery`, the same one `vowifi-status` sends, with a 1s connect
+    /// and a 1s read bound.
+    ///
+    /// Exists for the container HEALTHCHECK (specs/094, research R3), which
+    /// reads the agent's own verdict on its Gm connection instead of opening
+    /// another TCP connection to the P-CSCF. Routed through the runner like
+    /// [`http_get`](Self::http_get), and for the same reason: the agent
+    /// listens on a veth address that exists only inside a running
+    /// deployment, and the healthcheck's decision logic should stay a pure
+    /// function over the answer.
+    fn agent_status(&self, addr: &str) -> AgentStatusProbe;
 
     /// Resolve `host` to its IPv4 addresses via the system resolver
     /// (getaddrinfo, honoring `/etc/resolv.conf`). Replaces the `dig +short A`
@@ -599,6 +628,14 @@ impl CommandRunner for RealCommandRunner {
             return HttpProbe::Unreachable;
         };
         fetch(addr, authority, &path)
+    }
+
+    fn agent_status(&self, addr: &str) -> AgentStatusProbe {
+        let bound = std::time::Duration::from_secs(1);
+        match crate::vowifi::query_status_bounded(addr, bound, Some(bound)) {
+            Ok(msg) => AgentStatusProbe::Reply(msg),
+            Err(e) => AgentStatusProbe::NoAnswer(e.to_string()),
+        }
     }
 
     fn tcp_connect_ok_in_netns(&self, netns: &str, host: &str, port: u16) -> bool {
@@ -1046,6 +1083,11 @@ mod mock {
         /// exercise "the endpoint answered but its body could not be read",
         /// which is a distinct case from either of the other two.
         pub http_responses: Mutex<Map<String, HttpProbe>>,
+        /// Overrides `agent_status`'s outcome for a given `ip:port`; unseeded
+        /// addresses come back `NoAnswer("unseeded")` (no real agent in tests).
+        pub agent_statuses: Mutex<Map<String, AgentStatusProbe>>,
+        /// Every address `agent_status` was asked about, in call order.
+        pub agent_status_queries: Mutex<Vec<String>>,
         /// Argv substrings that make a future `spawn()` create its child
         /// already dead (`is_alive` false from the start) — lets a test
         /// force a deterministic `EstablishOutcome::FatalProcessDied` for a
@@ -1125,6 +1167,19 @@ mod mock {
         /// oldest first. `netns` is `None` for the default-namespace probe.
         pub fn tcp_connect_attempts(&self) -> Vec<(Option<String>, String, u16)> {
             self.tcp_connect_attempts.lock().unwrap().clone()
+        }
+
+        /// Seeds `agent_status(addr)`'s outcome.
+        pub fn set_agent_status(&self, addr: &str, probe: AgentStatusProbe) {
+            self.agent_statuses
+                .lock()
+                .unwrap()
+                .insert(addr.to_string(), probe);
+        }
+
+        /// Every address `agent_status` was asked about so far, oldest first.
+        pub fn agent_status_queries(&self) -> Vec<String> {
+            self.agent_status_queries.lock().unwrap().clone()
         }
 
         pub fn kill_child(&self, handle: &ChildHandle, exit_code: i32) {
@@ -1347,6 +1402,19 @@ mod mock {
                 .get(url)
                 .cloned()
                 .unwrap_or(HttpProbe::Unreachable)
+        }
+
+        fn agent_status(&self, addr: &str) -> AgentStatusProbe {
+            self.agent_status_queries
+                .lock()
+                .unwrap()
+                .push(addr.to_string());
+            self.agent_statuses
+                .lock()
+                .unwrap()
+                .get(addr)
+                .cloned()
+                .unwrap_or_else(|| AgentStatusProbe::NoAnswer("unseeded".into()))
         }
 
         fn tcp_connect_ok_in_netns(&self, netns: &str, host: &str, port: u16) -> bool {

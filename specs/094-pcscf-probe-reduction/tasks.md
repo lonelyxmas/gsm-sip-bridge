@@ -52,21 +52,21 @@ All paths are relative to `gsm-sip-bridge/src/` unless stated otherwise. Before 
 **Goal**: the HEALTHCHECK never connects to a P-CSCF. A line is faulted only on no agent answer or Gm `failed`. The run stays inside 5s.
 **Independent test**: the healthcheck unit tests (one per row of contracts/healthcheck.md), all asserting `tcp_connect_attempts()` is empty, plus the loopback tests of the bounded query.
 
-- [ ] T007 [P] [US2] Bounded status query, tests first, in the `vowifi/mod.rs` tests. Use a real `std::net::TcpListener` on `127.0.0.1:0`; this is integration, not a mock:
+- [X] T007 [P] [US2] Bounded status query, tests first, in the `vowifi/mod.rs` tests. Use a real `std::net::TcpListener` on `127.0.0.1:0`; this is integration, not a mock:
   - (a) A peer that reads the request and writes a `RegistrationStatusReply` line gets that reply back.
   - (b) A peer that accepts and never writes: `query_status_bounded(addr, 1s, Some(300ms))` returns `Err` in under about 1s (assert elapsed < 1s).
   - (c) A port with no listener (bind, take the port, drop the listener) returns `Err` quickly.
   - (d) A peer that writes `not json\n` returns `Err`.
 
   Then implement `pub fn query_status_bounded(addr: &str, connect: Duration, read: Option<Duration>) -> BridgeResult<ControlMessage>`: the same as `query_status`, plus `stream.set_read_timeout(read)` before reading. Make `query_status` call it with `(3s, None)`, so `vowifi-status` behaviour is unchanged. Doc comment: why the HEALTHCHECK needs the read bound (research R3).
-- [ ] T008 [US2] Agent-status seam in `supervise/runner.rs`, after T007:
+- [X] T008 [US2] Agent-status seam in `supervise/runner.rs`, after T007:
   - `pub enum AgentStatusProbe { Reply(crate::vowifi::control::ControlMessage), NoAnswer(String) }` (`Debug, Clone, PartialEq, Eq`), documented like `HttpProbe`.
   - Trait method `fn agent_status(&self, addr: &str) -> AgentStatusProbe;`, with a doc comment that names the `http_get` precedent and why it is routed through the runner (research R3).
   - `RealCommandRunner`: `query_status_bounded(addr, 1s, Some(1s))`, mapping `Ok` to `Reply` and `Err(e)` to `NoAnswer(e.to_string())`.
   - `MockCommandRunner`: an `agent_statuses: Mutex<HashMap<String, AgentStatusProbe>>` seeded by `pub fn set_agent_status(&self, addr: &str, probe: AgentStatusProbe)`. Unseeded addresses return `NoAnswer("unseeded".into())`. Record queried addresses for `pub fn agent_status_queries(&self) -> Vec<String>`.
 
   If `supervise::runner` cannot depend on `vowifi::control` without a cycle, put `AgentStatusProbe` in `vowifi::control` and import it into the runner instead.
-- [ ] T009 [US2] HEALTHCHECK decision, tests first, in the `commands/healthcheck.rs` tests:
+- [X] T009 [US2] HEALTHCHECK decision, tests first, in the `commands/healthcheck.rs` tests:
   1. Change the `line(index)` fixture's `veth_local_addr` to the bare `format!("10.9.{index}.1")`. Real resolutions store a bare IP (`config/mod.rs` default `10.99.0.1`), and the agent address is built from this field. Add a helper `fn agent_addr(index) -> String` returning `format!("10.9.{index}.1:{}", crate::vowifi::AGENT_A_STATUS_PORT)`, and helpers to build `RegistrationStatusReply` with a given `gm_connection` and an optional active P-CSCF (all other fields default/None).
   2. Add one test per verdict row in contracts/healthcheck.md. Each seeds an addressed interface and a non-empty `/tmp/pcscf`, seeds `set_agent_status`, asserts the `Health` verdict and, where relevant, the `Display` string, and asserts `runner.tcp_connect_attempts().is_empty()`:
      - `up` → Healthy
@@ -92,8 +92,8 @@ All paths are relative to `gsm-sip-bridge/src/` unless stated otherwise. Before 
   - Replace `LineFault::PcscfUnreachable` with `AgentNotResponding { addr, reason }` and `GmConnectionFailed { gm_connection, pcscf: Option<String> }`, with doc comments and `Display` exactly as in contracts/healthcheck.md.
   - `fn classify_agent_reply(addr: &str, probe: AgentStatusProbe) -> Option<LineFault>`, using the data-model.md classification table. Use `gm_connection.starts_with("failed")` and `pcscf.as_ref().map(|p| p.active.clone()).filter(|a| !a.is_empty())`.
   - In `check_line`, keep steps 1 and 2. Replace the `tcp_connect_ok_in_netns` block (and its namespace comment) with the agent query on `format!("{}:{}", line.veth_local_addr, crate::vowifi::AGENT_A_STATUS_PORT)`. Remove the now-unused `PCSCF_SIP_PORT` const. Update the module doc's `TCP connect, not ICMP, to the P-CSCF` bullet to describe the agent query and point at #120.
-- [ ] T010 [US2] Concurrency (research R5). Test first: with three lines, where line 1's agent is `NoAnswer` and lines 0 and 2 are `up`, `line_faults` is exactly `[(1, AgentNotResponding …)]`, in line order. Repeat with lines seeded in reverse index order in the resolution and assert the faults keep resolution order. Then, in `evaluate_with_metrics`, run `check_line` per resolved line inside `std::thread::scope` (one spawned thread per line, joined in order, a panic propagated as a panic) instead of the sequential `filter_map`. Add a comment that the per-query 1s+1s bound and the concurrency together keep the run under Docker's 5s timeout for any `max_lines`.
-- [ ] T011 [US2] Check `commands/healthcheck.rs`'s `run()` still prints each fault as `line N: <fault>`. Grep the crate for `PcscfUnreachable`: only `supervise/` (`DegradeReason::PcscfUnreachable`) may remain. Confirm `tcp-probe` (`run_tcp_probe`) is untouched (FR-014). Commit: `feat(healthcheck): ask each line's IMS agent instead of probing the P-CSCF (#120)`.
+- [X] T010 [US2] Concurrency (research R5). Test first: with three lines, where line 1's agent is `NoAnswer` and lines 0 and 2 are `up`, `line_faults` is exactly `[(1, AgentNotResponding …)]`, in line order. Repeat with lines seeded in reverse index order in the resolution and assert the faults keep resolution order. Then, in `evaluate_with_metrics`, run `check_line` per resolved line inside `std::thread::scope` (one spawned thread per line, joined in order, a panic propagated as a panic) instead of the sequential `filter_map`. Add a comment that the per-query 1s+1s bound and the concurrency together keep the run under Docker's 5s timeout for any `max_lines`.
+- [X] T011 [US2] Check `commands/healthcheck.rs`'s `run()` still prints each fault as `line N: <fault>`. Grep the crate for `PcscfUnreachable`: only `supervise/` (`DegradeReason::PcscfUnreachable`) may remain. Confirm `tcp-probe` (`run_tcp_probe`) is untouched (FR-014). Commit: `feat(healthcheck): ask each line's IMS agent instead of probing the P-CSCF (#120)`.
 
 **Checkpoint**: US1 and US2 together give about 120 connects per line per hour (SC-001) and zero from the HEALTHCHECK (SC-002).
 
