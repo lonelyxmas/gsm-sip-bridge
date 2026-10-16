@@ -114,7 +114,7 @@ All paths are relative to `gsm-sip-bridge/src/` unless stated otherwise. Before 
 - [X] T018 Live, Vodafone rig (local host). Build and run the branch with the pinned local test setup in `test/` (memory: local docker tests go in `test/`), default config, and **recreate** the container (memory). Follow quickstart.md "Live" steps 1, 3 and 4: soak through at least one REGISTER refresh and one CHILD_SA rekey with the in-namespace SYN capture running, run the HEALTHCHECK by hand three times and once with the line's agent killed, then 10 minutes with `idle_keepalive = true`. Record SYNs/h, registration continuity, any `dead peer`/`IkeSaLost`, and the HEALTHCHECK exit codes and stderr.
 - [X] T019 Live, Jio Pi (`pi@192.168.100.2`, docker-compose v1, arm64 image via the `arm-build-200` skill, next `jio-gmN` tag; memory: remote Pi Jio deployment). Default config, recreate the container, then about 1h covering at least one REGISTER refresh with the SYN capture (quickstart step 2). Record the same measurements.
 - [X] T020 Write `specs/094-pcscf-probe-reduction/live-verification.md` with T018 and T019 results against SC-001 to SC-005 and SC-004a, using no real numbers or addresses (redact P-CSCF IPs to role names). Mark the spec Status as `Implemented`. Commit: `docs(094): live verification on Vodafone and Jio (#120)`.
-- [ ] T021 Open the PR against `main`, referencing #120 item 1 and stating that the supervisor-probe removal (item 2) is out of scope. The PR body ends with the Claude Code attribution line.
+- [X] T021 Open the PR against `main`, referencing #120 item 1 and stating that the supervisor-probe removal (item 2) is out of scope. The PR body ends with the Claude Code attribution line.
 
 ## Dependencies
 
