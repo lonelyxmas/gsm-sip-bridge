@@ -2,7 +2,7 @@
 
 **Feature Branch**: `094-pcscf-probe-reduction`  
 **Created**: 2026-10-16  
-**Status**: Draft  
+**Status**: Implemented  
 **Input**: User description: "Address issue #120, item 1 ("safe now"): reduce the P-CSCF TCP 5060 probes from three to one per line. (a) The idle-tunnel keepalive thread in orchestrate.rs (which connects to the P-CSCF every 30s and discards the result) must NOT be deleted; instead move it behind a configuration option and disable it by default. (b) Point the Docker HEALTHCHECK (healthcheck.rs) at the agent's status instead of probing the P-CSCF over TCP. The supervisor's steady-state tick probe (line_supervisor.rs via engines.rs pcscf_reachable) stays unchanged — it is the only thing that triggers repair_default_route and PcscfUnreachable rebuilds (single-P-CSCF carriers like Vodafone), and the DPD/NAT-T keepalive behaviour seen in soak run B (supervisor-only probe, 4.5h, clean on Vodafone, zero DPD retransmits) is the target state. Context: soak data in GitHub issue #120 — baseline ~360 connects/line/hour, 96% of idle-tunnel packets; run B removed two thirds of the probes with no regressions."
 
 ## Background
