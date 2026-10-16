@@ -157,7 +157,7 @@ knows to expect and answer it.
 | IKE_SA_INIT gets no/rejected response | ePDG may geoblock non-operator source IPs. Fallback: route ePDG egress over a mobile bearer. |
 | `ping` to P-CSCF gets 100% loss | Expected — the operator filters ICMP over the tunnel. Use the TCP-connect check above instead. |
 | Millions of `Press q to quit...` log lines, high CPU | The dialer's post-connect loop does `select()` on stdin; if stdin is closed/EOF it busy-spins. `entrypoint.sh` feeds it a never-closing pipe (`tail -f /dev/null`) to prevent this — make sure that's still in place if you modify the launch command. |
-| Tunnel drops after minutes/an hour | Keepalive not running — check `KEEPALIVE_INTERVAL` and the keepalive log line. |
+| Tunnel drops after minutes/an hour | The idle-tunnel keepalive is off by default since [#120](https://github.com/selvakn/gsm-sip-bridge/issues/120). If the carrier evicts idle bearers, set `[vowifi].idle_keepalive = true` and recreate the container; the `idle-tunnel keepalive on` startup log line (and `IDLE_KEEPALIVE` in the `config` export) confirms it. |
 
 ### Card/modem-specific fix (`patches/0001-ec200u-at-csim-fixes.patch`)
 

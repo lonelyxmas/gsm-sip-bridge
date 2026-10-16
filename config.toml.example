@@ -348,9 +348,13 @@ control_port = 7050
 wideband = true
 # APN used by the swu engine's dialer. Shared across every line.
 apn = "ims"
-# Idle-tunnel keepalive interval (seconds) — a TCP connect to the P-CSCF's
-# SIP port (operators commonly filter ICMP over the tunnel).
-keepalive_interval_sec = 20
+# Idle-tunnel keepalive: a TCP connect to the P-CSCF's SIP port every
+# keepalive_interval_sec, result discarded. Off by default since #120: the
+# supervisor already probes the P-CSCF every 30s, and the extra traffic keeps
+# strongSwan's DPD and NAT-T keepalives from running. Turn on only if the
+# carrier drops an idle bearer (e.g. #106).
+# idle_keepalive = false
+# keepalive_interval_sec = 30
 # ePDG tunnel engine: "strongswan" (proper IKE rekeying/re-auth/DPD/MOBIKE,
 # netns survives reconnects — the default) or "swu" (the original SWu-IKEv2
 # Python dialer, kept as an explicit fallback until strongswan is proven

@@ -64,6 +64,14 @@ across releases.
 
 ### Changed
 
+- **One P-CSCF probe per VoWiFi line.** The idle-tunnel keepalive is now off
+  by default (`[vowifi].idle_keepalive`, and it honours
+  `keepalive_interval_sec`, default 30). The container HEALTHCHECK reads each
+  line's IMS agent status instead of connecting to the P-CSCF, and reports
+  `IMS agent … not responding` or `Gm connection failed`. About two thirds
+  fewer connects on an idle tunnel
+  ([#120](https://github.com/selvakn/gsm-sip-bridge/issues/120)).
+
 - **Stuck CHILD_SA rekeys are rebuilt before the hard expiry.** A CHILD_SA
   still in place with under 300 s left (a natural rekey replaces it with
   360-720 s left) is rebuilt by the supervisor as `ChildSaRekeyStuck`,

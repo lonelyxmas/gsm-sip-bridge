@@ -19,17 +19,22 @@
 //!   already wrote at startup. Re-scanning USB/AT every 30s on the
 //!   `HEALTHCHECK` interval would race the running agents holding those same
 //!   serial ports open.
-//! - **TCP connect, not ICMP**, to the P-CSCF: operators commonly filter ping.
+//! - **Asks each line's IMS agent, never the P-CSCF.** Once a P-CSCF is
+//!   captured, a line is checked with one `StatusQuery` to its agent's status
+//!   port, the query `vowifi-status` sends. It is faulted only when the agent
+//!   gives no usable answer or reports its Gm connection `failed`. This used to
+//!   be a TCP connect to the P-CSCF's SIP port, one of three per line, and the
+//!   extra traffic kept strongSwan's own DPD and NAT-T from running (#120). The
+//!   line supervisor still probes the P-CSCF and repairs the tunnel.
 
-use super::super::supervise::runner::{CommandRunner, HttpProbe, RealCommandRunner};
+use super::super::supervise::runner::{
+    AgentStatusProbe, CommandRunner, HttpProbe, RealCommandRunner,
+};
 use crate::cli::Cli;
 use crate::config::load_config;
+use crate::vowifi::control::ControlMessage;
 use crate::vowifi::discovery::{LineResolution, LineResolutionEntry};
 use std::process::ExitCode;
-
-/// SIP port on the P-CSCF, the thing a line's tunnel has to be able to reach
-/// for the line to be worth anything.
-const PCSCF_SIP_PORT: u16 = 5060;
 
 /// Why a line is unhealthy. One variant per check the bash version did, so a
 /// failure names itself rather than arriving as a bare exit code.
@@ -38,9 +43,20 @@ pub enum LineFault {
     /// The tunnel interface exists but has no address — the tunnel never came
     /// up, or came up and lost its lease.
     TunnelInterfaceHasNoAddress { iface: String },
-    /// A P-CSCF address was captured, but nothing answers SIP on it through
-    /// this line's namespace.
-    PcscfUnreachable { addr: String },
+    /// The line's IMS agent gave no usable answer to a status query on
+    /// `addr` (`ip:5071`): refused, timed out, closed, sent garbage, or sent
+    /// something other than its status. The agent is the thing answering the
+    /// carrier, so a silent one is a dead line whatever the tunnel says.
+    AgentNotResponding { addr: String, reason: String },
+    /// The agent answered and reports its Gm connection `failed`: its
+    /// keepalives to the P-CSCF went unanswered and the escalated
+    /// re-registration failed too. `reconnecting` is not this; that is the
+    /// agent still working on it. `pcscf` is the P-CSCF it was using, when it
+    /// said.
+    GmConnectionFailed {
+        gm_connection: String,
+        pcscf: Option<String>,
+    },
     /// This line's IMS registration has lapsed, so the network is telling
     /// callers the phone is switched off (specs/039-at-stall-watchdog,
     /// FR-020). Every other probe here can pass while this is true — which is
@@ -54,7 +70,19 @@ impl std::fmt::Display for LineFault {
             LineFault::TunnelInterfaceHasNoAddress { iface } => {
                 write!(f, "tunnel interface {iface} has no address")
             }
-            LineFault::PcscfUnreachable { addr } => write!(f, "P-CSCF {addr} unreachable"),
+            LineFault::AgentNotResponding { addr, reason } => {
+                write!(f, "IMS agent at {addr} not responding: {reason}")
+            }
+            LineFault::GmConnectionFailed {
+                gm_connection,
+                pcscf,
+            } => {
+                write!(f, "IMS agent reports Gm connection {gm_connection}")?;
+                match pcscf {
+                    Some(p) => write!(f, " (P-CSCF {p})"),
+                    None => Ok(()),
+                }
+            }
             LineFault::RegistrationExpired {
                 module,
                 ago_seconds,
@@ -151,22 +179,63 @@ pub fn check_line(
     let Ok(contents) = runner.read_file(std::path::Path::new(&line.pcscf_source_path)) else {
         return None;
     };
-    let addr = contents.trim();
-    if addr.is_empty() {
+    if contents.trim().is_empty() {
         return None;
     }
-    // Probed from inside this line's namespace, never the default one. The
-    // P-CSCF sits at the far end of this line's ePDG tunnel and has no route
-    // to it outside `netns`, so a default-namespace probe reports every
-    // healthy line as unreachable — which is precisely what this container's
-    // HEALTHCHECK did, marking working deployments unhealthy while both lines
-    // were registered and carrying calls.
-    if !runner.tcp_connect_ok_in_netns(&line.netns, addr, PCSCF_SIP_PORT) {
-        return Some(LineFault::PcscfUnreachable {
+    // Ask the agent, not the P-CSCF (#120). The agent already pings the
+    // P-CSCF over its own Gm connection and reports the verdict; the line
+    // supervisor probes the P-CSCF too. A third connect from here only added
+    // traffic that kept strongSwan's DPD and NAT-T keepalives from running.
+    let addr = format!(
+        "{}:{}",
+        line.veth_local_addr,
+        crate::vowifi::AGENT_A_STATUS_PORT
+    );
+    let probe = runner.agent_status(&addr);
+    classify_agent_reply(&addr, probe)
+}
+
+/// Whether an agent's answer to a status query is a fault (specs/094
+/// data-model.md). Only no usable answer, or a Gm connection the agent itself
+/// calls `failed`, is one. Everything else, including `reconnecting`, a lapsed
+/// registration (caught through `/metrics`), being in a call and an older
+/// agent that does not report its Gm connection at all, is not.
+fn classify_agent_reply(addr: &str, probe: AgentStatusProbe) -> Option<LineFault> {
+    let reply = match probe {
+        AgentStatusProbe::NoAnswer(reason) => {
+            return Some(LineFault::AgentNotResponding {
+                addr: addr.to_string(),
+                reason,
+            })
+        }
+        AgentStatusProbe::Reply(reply) => reply,
+    };
+    let ControlMessage::RegistrationStatusReply {
+        gm_connection,
+        pcscf,
+        ..
+    } = reply
+    else {
+        let variant = format!("{reply:?}");
+        let variant = variant
+            .split(|c: char| !c.is_alphanumeric())
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        return Some(LineFault::AgentNotResponding {
             addr: addr.to_string(),
+            reason: format!("unexpected reply: {variant}"),
         });
+    };
+    // `GmConnectionState::render` yields `up`, `reconnecting since …` or
+    // `failed since …`; matching the prefix needs no protocol change.
+    if !gm_connection.starts_with("failed") {
+        return None;
     }
-    None
+    Some(LineFault::GmConnectionFailed {
+        gm_connection,
+        pcscf: pcscf.map(|p| p.active).filter(|a| !a.is_empty()),
+    })
 }
 
 /// `gsm-sip-bridge tcp-probe <host> <port>` — exit 0 iff the connect succeeds.
@@ -296,11 +365,24 @@ pub fn evaluate_with_metrics(
         };
     }
 
-    let mut line_faults: Vec<(u32, LineFault)> = resolution
-        .lines
-        .iter()
-        .filter_map(|l| check_line(runner, l, tunnel_engine).map(|f| (l.index, f)))
-        .collect();
+    // One thread per line, joined in resolution order. Each agent query is
+    // bounded at 1s connect + 1s read, and running the lines side by side
+    // keeps the whole phase near that bound for any `max_lines`, so together
+    // with the 3s `/metrics` fetch the run stays under Docker's 5s HEALTHCHECK
+    // timeout even with every agent hung (research R5).
+    let mut line_faults: Vec<(u32, LineFault)> = std::thread::scope(|scope| {
+        let checks: Vec<_> = resolution
+            .lines
+            .iter()
+            .map(|l| {
+                scope.spawn(move || check_line(runner, l, tunnel_engine).map(|f| (l.index, f)))
+            })
+            .collect();
+        checks
+            .into_iter()
+            .filter_map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+            .collect()
+    });
 
     line_faults.extend(expired);
 
@@ -434,7 +516,8 @@ pub fn run(cli: &Cli) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::supervise::runner::MockCommandRunner;
+    use crate::supervise::runner::{AgentStatusProbe, MockCommandRunner};
+    use crate::vowifi::control::{ControlMessage, PcscfStatusReply};
 
     fn line(index: u32) -> LineResolutionEntry {
         LineResolutionEntry {
@@ -443,8 +526,10 @@ mod tests {
             modem_port: format!("/dev/ttyUSB{index}"),
             netns: format!("ims{index}"),
             control_port: 7100 + index as u16,
-            veth_local_addr: format!("10.9.{index}.1/30"),
-            veth_peer_addr: format!("10.9.{index}.2/30"),
+            // Bare, as real resolutions store it: the agent's status address
+            // is built from this field.
+            veth_local_addr: format!("10.9.{index}.1"),
+            veth_peer_addr: format!("10.9.{index}.2"),
             vpcd_port: 15963 + index as u16,
             strongswan_if_id: 42 + index,
             strongswan_tun_iface: format!("ipsec-{index}"),
@@ -636,6 +721,81 @@ mod tests {
         );
     }
 
+    /// Where line `index`'s IMS agent answers status queries.
+    fn agent_addr(index: u32) -> String {
+        format!("10.9.{index}.1:{}", crate::vowifi::AGENT_A_STATUS_PORT)
+    }
+
+    /// An agent's status reply with the given Gm connection and, optionally,
+    /// active P-CSCF; every other field at its default.
+    fn status_reply(gm_connection: &str, pcscf: Option<&str>) -> ControlMessage {
+        ControlMessage::RegistrationStatusReply {
+            state: "Registered".to_string(),
+            registered_at: None,
+            expires_at: None,
+            last_failure: None,
+            can_answer: true,
+            blocked_reason: None,
+            gm_connection: gm_connection.to_string(),
+            rejection_cooldown_until: None,
+            reg_subscription: String::new(),
+            reg_subscription_last_failure: None,
+            pcscf: pcscf.map(|a| {
+                Box::new(PcscfStatusReply {
+                    active: a.to_string(),
+                    ..Default::default()
+                })
+            }),
+        }
+    }
+
+    /// Line `index` with an addressed tunnel interface and a captured P-CSCF,
+    /// so the check reaches the agent query.
+    fn ready_line(runner: &MockCommandRunner, index: u32) -> LineResolutionEntry {
+        with_addressed_iface(runner, &format!("ims{index}"), &format!("ipsec-{index}"));
+        let mut l = line(index);
+        l.pcscf_source_path = format!("/tmp/pcscf-{index}");
+        runner.set_file(
+            std::path::PathBuf::from(&l.pcscf_source_path),
+            "192.0.2.10\n",
+        );
+        l
+    }
+
+    /// The verdict for one ready line whose agent answers `probe`, asserting
+    /// on the way that the HEALTHCHECK made no TCP connect anywhere.
+    fn verdict_for(probe: AgentStatusProbe) -> Health {
+        let runner = MockCommandRunner::new();
+        let l = ready_line(&runner, 0);
+        runner.set_agent_status(&agent_addr(0), probe);
+        let health = evaluate(
+            &runner,
+            true,
+            true,
+            true,
+            &resolution(vec![l]),
+            "strongswan",
+        );
+        assert!(
+            runner.tcp_connect_attempts().is_empty(),
+            "the HEALTHCHECK must never connect to a P-CSCF: {:?}",
+            runner.tcp_connect_attempts()
+        );
+        assert_eq!(runner.agent_status_queries(), vec![agent_addr(0)]);
+        health
+    }
+
+    /// The single fault a one-line verdict carries.
+    fn only_fault(health: Health) -> LineFault {
+        match health {
+            Health::LinesUnhealthy {
+                mut line_faults,
+                configured_failed,
+            } if line_faults.len() == 1 && configured_failed.is_empty() => line_faults.remove(0).1,
+            other => panic!("expected exactly one line fault, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_dead_metrics_endpoint_is_unhealthy_and_short_circuits_every_line_check() {
         let runner = MockCommandRunner::new();
@@ -652,6 +812,7 @@ mod tests {
         assert_eq!(health, Health::MetricsEndpointDown);
         // Nothing else was probed — no namespace commands were issued at all.
         assert!(runner.run_in_netns_calls.lock().unwrap().is_empty());
+        assert!(runner.agent_status_queries().is_empty());
     }
 
     #[test]
@@ -704,11 +865,13 @@ mod tests {
     #[test]
     fn a_configured_line_not_found_is_unhealthy_alongside_an_otherwise_healthy_resolved_line() {
         let runner = MockCommandRunner::new();
-        with_addressed_iface(&runner, "ims0", "ipsec-0");
-        runner.set_file(std::path::Path::new("/tmp/pcscf"), "10.11.12.13\n");
-        runner.set_tcp_connect_ok_in_netns("ims0", "10.11.12.13", 5060, true);
+        let l0 = ready_line(&runner, 0);
+        runner.set_agent_status(
+            &agent_addr(0),
+            AgentStatusProbe::Reply(status_reply("up", None)),
+        );
 
-        let mut r = resolution(vec![line(0)]);
+        let mut r = resolution(vec![l0]);
         r.failed = vec![
             crate::vowifi::discovery::FailedLine::new("/dev/ttyUSB5", "not_found").configured(true),
         ];
@@ -786,24 +949,42 @@ mod tests {
     #[test]
     fn cs_disabled_does_not_suppress_real_vowifi_line_checks() {
         let runner = MockCommandRunner::new();
-        with_addressed_iface(&runner, "ims0", "ipsec-0");
-        runner.set_file(std::path::Path::new("/tmp/pcscf"), "10.11.12.13\n");
-        runner.set_tcp_connect_ok_in_netns("ims0", "10.11.12.13", 5060, true);
+        let l0 = ready_line(&runner, 0);
+        runner.set_agent_status(
+            &agent_addr(0),
+            AgentStatusProbe::Reply(status_reply("up", None)),
+        );
 
         let health = evaluate(
             &runner,
             true,
             false,
             true,
-            &resolution(vec![line(0)]),
+            &resolution(vec![l0.clone()]),
             "strongswan",
         );
         assert_eq!(health, Health::Healthy);
+
+        // ...and a silent agent is still a fault with CS off.
+        runner.set_agent_status(
+            &agent_addr(0),
+            AgentStatusProbe::NoAnswer("connection refused".to_string()),
+        );
+        let health = evaluate(
+            &runner,
+            true,
+            false,
+            true,
+            &resolution(vec![l0]),
+            "strongswan",
+        );
+        assert!(!health.is_healthy(), "{health:?}");
     }
 
     #[test]
     fn a_line_whose_tunnel_iface_has_no_address_is_unhealthy() {
         let runner = MockCommandRunner::new();
+        runner.set_file(std::path::Path::new("/tmp/pcscf"), "192.0.2.10\n");
         // No `ip addr show` output seeded -> no address.
         let health = evaluate(
             &runner,
@@ -826,55 +1007,139 @@ mod tests {
                 configured_failed: vec![],
             }
         );
+        // The address check comes first; the agent is not asked.
+        assert!(runner.agent_status_queries().is_empty());
+        assert!(runner.tcp_connect_attempts().is_empty());
     }
 
     #[test]
-    fn a_line_with_an_address_and_a_reachable_pcscf_is_healthy() {
-        let runner = MockCommandRunner::new();
-        with_addressed_iface(&runner, "ims0", "ipsec-0");
-        runner.set_file(std::path::Path::new("/tmp/pcscf"), "10.11.12.13\n");
-        runner.set_tcp_connect_ok_in_netns("ims0", "10.11.12.13", 5060, true);
-
-        let health = evaluate(
-            &runner,
-            true,
-            true,
-            true,
-            &resolution(vec![line(0)]),
-            "strongswan",
-        );
-
-        assert_eq!(health, Health::Healthy);
-    }
-
-    #[test]
-    fn a_line_whose_pcscf_does_not_answer_sip_is_unhealthy() {
-        let runner = MockCommandRunner::new();
-        with_addressed_iface(&runner, "ims0", "ipsec-0");
-        runner.set_file(std::path::Path::new("/tmp/pcscf"), "10.11.12.13\n");
-        // No set_tcp_connect_ok -> connect fails.
-
-        let health = evaluate(
-            &runner,
-            true,
-            true,
-            true,
-            &resolution(vec![line(0)]),
-            "strongswan",
-        );
-
+    fn a_line_with_an_address_and_a_responsive_agent_is_healthy() {
         assert_eq!(
-            health,
-            Health::LinesUnhealthy {
-                line_faults: vec![(
-                    0,
-                    LineFault::PcscfUnreachable {
-                        addr: "10.11.12.13".to_string()
-                    }
-                )],
-                configured_failed: vec![],
+            verdict_for(AgentStatusProbe::Reply(status_reply(
+                "up",
+                Some("192.0.2.10")
+            ))),
+            Health::Healthy
+        );
+    }
+
+    #[test]
+    fn a_line_whose_agent_does_not_answer_is_unhealthy() {
+        let fault = only_fault(verdict_for(AgentStatusProbe::NoAnswer(
+            "connection refused".to_string(),
+        )));
+        assert_eq!(
+            fault,
+            LineFault::AgentNotResponding {
+                addr: "10.9.0.1:5071".to_string(),
+                reason: "connection refused".to_string(),
             }
         );
+        assert_eq!(
+            fault.to_string(),
+            "IMS agent at 10.9.0.1:5071 not responding: connection refused"
+        );
+    }
+
+    #[test]
+    fn an_agent_answering_with_something_other_than_its_status_is_unhealthy() {
+        let fault = only_fault(verdict_for(AgentStatusProbe::Reply(
+            ControlMessage::StatusQuery,
+        )));
+        let LineFault::AgentNotResponding { addr, reason } = &fault else {
+            panic!("{fault:?}");
+        };
+        assert_eq!(addr, "10.9.0.1:5071");
+        assert!(reason.starts_with("unexpected reply"), "{reason}");
+        assert!(
+            fault
+                .to_string()
+                .starts_with("IMS agent at 10.9.0.1:5071 not responding: unexpected reply"),
+            "{fault}"
+        );
+    }
+
+    #[test]
+    fn a_failed_gm_connection_is_unhealthy_and_names_the_pcscf() {
+        let fault = only_fault(verdict_for(AgentStatusProbe::Reply(status_reply(
+            "failed since 2026-10-16T00:00:00+00:00",
+            Some("192.0.2.10"),
+        ))));
+        assert_eq!(
+            fault,
+            LineFault::GmConnectionFailed {
+                gm_connection: "failed since 2026-10-16T00:00:00+00:00".to_string(),
+                pcscf: Some("192.0.2.10".to_string()),
+            }
+        );
+        assert_eq!(
+            fault.to_string(),
+            "IMS agent reports Gm connection failed since 2026-10-16T00:00:00+00:00 \
+             (P-CSCF 192.0.2.10)"
+        );
+    }
+
+    #[test]
+    fn a_failed_gm_connection_without_an_active_pcscf_leaves_it_out() {
+        for pcscf in [None, Some("")] {
+            let fault = only_fault(verdict_for(AgentStatusProbe::Reply(status_reply(
+                "failed since 2026-10-16T00:00:00+00:00",
+                pcscf,
+            ))));
+            assert_eq!(
+                fault.to_string(),
+                "IMS agent reports Gm connection failed since 2026-10-16T00:00:00+00:00"
+            );
+        }
+    }
+
+    /// `reconnecting` is the agent already working on it (FR-012); only its
+    /// escalation to `failed` is a fault.
+    #[test]
+    fn a_reconnecting_gm_connection_is_not_a_fault() {
+        assert_eq!(
+            verdict_for(AgentStatusProbe::Reply(status_reply(
+                "reconnecting since 2026-10-16T00:00:00+00:00 (attempt 2)",
+                Some("192.0.2.10"),
+            ))),
+            Health::Healthy
+        );
+    }
+
+    /// An older agent leaves `gm_connection` empty: no claim either way.
+    #[test]
+    fn an_agent_that_does_not_report_its_gm_connection_is_not_faulted_for_it() {
+        assert_eq!(
+            verdict_for(AgentStatusProbe::Reply(status_reply("", None))),
+            Health::Healthy
+        );
+    }
+
+    /// `can_answer` folds in being in a call and the PBX leg, neither of which
+    /// is about the P-CSCF.
+    #[test]
+    fn a_line_in_a_call_is_not_a_fault() {
+        let mut reply = status_reply("up", Some("192.0.2.10"));
+        if let ControlMessage::RegistrationStatusReply {
+            can_answer,
+            blocked_reason,
+            ..
+        } = &mut reply
+        {
+            *can_answer = false;
+            *blocked_reason = Some("busy".to_string());
+        }
+        assert_eq!(verdict_for(AgentStatusProbe::Reply(reply)), Health::Healthy);
+    }
+
+    /// A lapsed registration is caught through `/metrics`, not here.
+    #[test]
+    fn the_registration_state_alone_is_not_a_fault_for_this_check() {
+        let mut reply = status_reply("up", None);
+        if let ControlMessage::RegistrationStatusReply { state, .. } = &mut reply {
+            *state = "Unregistered".to_string();
+        }
+        assert_eq!(verdict_for(AgentStatusProbe::Reply(reply)), Health::Healthy);
     }
 
     /// No P-CSCF captured yet is not a fault — the tunnel is up, the address
@@ -895,6 +1160,8 @@ mod tests {
         );
 
         assert_eq!(health, Health::Healthy);
+        assert!(runner.agent_status_queries().is_empty());
+        assert!(runner.tcp_connect_attempts().is_empty());
     }
 
     /// specs/013-multi-card-vowifi FR-019: *every* line is checked, not only
@@ -902,23 +1169,24 @@ mod tests {
     #[test]
     fn every_line_is_checked_and_faults_are_reported_per_line() {
         let runner = MockCommandRunner::new();
-        // Line 0 healthy, line 1 has no address, line 2 has an unreachable P-CSCF.
-        with_addressed_iface(&runner, "ims0", "ipsec-0");
-        with_addressed_iface(&runner, "ims2", "ipsec-2");
-        runner.set_file(std::path::Path::new("/tmp/pcscf"), "10.11.12.13\n");
-        runner.set_tcp_connect_ok_in_netns("ims2", "10.11.12.13", 5060, false);
-
-        let mut l0 = line(0);
-        l0.pcscf_source_path = "/tmp/pcscf-0".to_string();
-        runner.set_file(std::path::Path::new("/tmp/pcscf-0"), "10.0.0.1\n");
-        runner.set_tcp_connect_ok_in_netns("ims0", "10.0.0.1", 5060, true);
+        // Line 0 healthy, line 1 has no address, line 2's agent is silent.
+        let l0 = ready_line(&runner, 0);
+        let l2 = ready_line(&runner, 2);
+        runner.set_agent_status(
+            &agent_addr(0),
+            AgentStatusProbe::Reply(status_reply("up", None)),
+        );
+        runner.set_agent_status(
+            &agent_addr(2),
+            AgentStatusProbe::NoAnswer("timed out".to_string()),
+        );
 
         let health = evaluate(
             &runner,
             true,
             true,
             true,
-            &resolution(vec![l0, line(1), line(2)]),
+            &resolution(vec![l0, line(1), l2]),
             "strongswan",
         );
 
@@ -934,91 +1202,78 @@ mod tests {
                     ),
                     (
                         2,
-                        LineFault::PcscfUnreachable {
-                            addr: "10.11.12.13".to_string()
+                        LineFault::AgentNotResponding {
+                            addr: agent_addr(2),
+                            reason: "timed out".to_string(),
                         }
                     ),
                 ],
                 configured_failed: vec![],
             }
         );
+        assert!(runner.tcp_connect_attempts().is_empty());
     }
 
-    /// Regression test for a live-found bug: the P-CSCF was probed from the
-    /// *default* namespace. It only has a route inside this line's own ePDG
-    /// tunnel namespace, so the probe could never succeed — every genuinely
-    /// healthy deployment reported unhealthy, while both lines were registered
-    /// with their carriers and able to carry calls.
+    /// specs/094 (#120): the HEALTHCHECK used to be one of three things
+    /// connecting to each line's P-CSCF. It now asks the line's IMS agent
+    /// instead, so a P-CSCF that "answers" proves nothing to it and is never
+    /// even tried.
     ///
-    /// Seeding *only* the default-namespace probe must therefore leave the
-    /// line faulted: if this test passes with `Healthy`, the probe has
-    /// regressed to the wrong namespace.
+    /// This replaces a regression test for a live-found bug: the P-CSCF was
+    /// once probed from the *default* namespace, where it has no route, so
+    /// every genuinely healthy deployment reported unhealthy. With no P-CSCF
+    /// probe left here, that bug has nowhere to come back.
     #[test]
-    fn the_pcscf_is_probed_inside_the_lines_namespace_not_the_default_one() {
+    fn the_healthcheck_never_connects_to_the_pcscf() {
         let runner = MockCommandRunner::new();
-        with_addressed_iface(&runner, "ims0", "ipsec-0");
-        runner.set_file(std::path::Path::new("/tmp/pcscf"), "10.11.12.13\n");
-        // Reachable from the default namespace, and *only* from there.
-        runner.set_tcp_connect_ok("10.11.12.13", 5060, true);
+        let l0 = ready_line(&runner, 0);
+        runner.set_tcp_connect_ok("192.0.2.10", 5060, true);
+        runner.set_tcp_connect_ok_in_netns("ims0", "192.0.2.10", 5060, true);
+        runner.set_agent_status(
+            &agent_addr(0),
+            AgentStatusProbe::Reply(status_reply("up", None)),
+        );
 
         let health = evaluate(
             &runner,
             true,
             true,
             true,
-            &resolution(vec![line(0)]),
+            &resolution(vec![l0.clone()]),
             "strongswan",
         );
+        assert_eq!(health, Health::Healthy);
+        assert!(runner.tcp_connect_attempts().is_empty());
 
-        assert_eq!(
-            health,
-            Health::LinesUnhealthy {
-                line_faults: vec![(
-                    0,
-                    LineFault::PcscfUnreachable {
-                        addr: "10.11.12.13".to_string()
-                    }
-                )],
-                configured_failed: vec![],
-            },
-            "a default-namespace probe must not satisfy this check"
+        // A reachable P-CSCF does not vouch for a silent agent.
+        runner.set_agent_status(
+            &agent_addr(0),
+            AgentStatusProbe::NoAnswer("connection refused".to_string()),
         );
-
-        // ...and seeding it inside the line's namespace does.
-        runner.set_tcp_connect_ok_in_netns("ims0", "10.11.12.13", 5060, true);
-        assert_eq!(
-            evaluate(
-                &runner,
-                true,
-                true,
-                true,
-                &resolution(vec![line(0)]),
-                "strongswan"
-            ),
-            Health::Healthy
+        let health = evaluate(
+            &runner,
+            true,
+            true,
+            true,
+            &resolution(vec![l0]),
+            "strongswan",
         );
+        assert!(!health.is_healthy(), "{health:?}");
+        assert!(runner.tcp_connect_attempts().is_empty());
     }
 
-    /// Each line is probed in its *own* namespace: one line's reachable P-CSCF
-    /// must never vouch for another's, which sharing a namespace argument (or
-    /// dropping it) would silently allow.
+    /// Each line asks its *own* agent: one line's healthy agent must never
+    /// vouch for another's, even when both carriers assigned the same P-CSCF.
     #[test]
-    fn one_lines_reachable_pcscf_does_not_vouch_for_another_line() {
+    fn one_lines_responsive_agent_does_not_vouch_for_another_line() {
         let runner = MockCommandRunner::new();
-        with_addressed_iface(&runner, "ims0", "ipsec-0");
-        with_addressed_iface(&runner, "ims1", "ipsec-1");
-
-        let mut l0 = line(0);
-        l0.pcscf_source_path = "/tmp/pcscf-0".to_string();
-        let mut l1 = line(1);
-        l1.pcscf_source_path = "/tmp/pcscf-1".to_string();
-        // Both lines happen to have been assigned the same P-CSCF address by
-        // their carriers — plausible, and the case where an unscoped probe is
-        // most obviously wrong.
-        runner.set_file(std::path::Path::new("/tmp/pcscf-0"), "10.11.12.13\n");
-        runner.set_file(std::path::Path::new("/tmp/pcscf-1"), "10.11.12.13\n");
-        runner.set_tcp_connect_ok_in_netns("ims0", "10.11.12.13", 5060, true);
-        // ims1 deliberately unseeded -> unreachable through line 1's tunnel.
+        let l0 = ready_line(&runner, 0);
+        let l1 = ready_line(&runner, 1);
+        runner.set_agent_status(
+            &agent_addr(0),
+            AgentStatusProbe::Reply(status_reply("up", None)),
+        );
+        // Line 1's agent deliberately unseeded -> no answer.
 
         let health = evaluate(
             &runner,
@@ -1034,13 +1289,103 @@ mod tests {
             Health::LinesUnhealthy {
                 line_faults: vec![(
                     1,
-                    LineFault::PcscfUnreachable {
-                        addr: "10.11.12.13".to_string()
+                    LineFault::AgentNotResponding {
+                        addr: agent_addr(1),
+                        reason: "unseeded".to_string(),
                     }
                 )],
                 configured_failed: vec![],
             }
         );
+    }
+
+    /// Lines are checked concurrently (research R5), but faults still come
+    /// out in resolution order, whatever order the threads finish in.
+    #[test]
+    fn concurrent_line_checks_report_faults_in_resolution_order() {
+        let runner = MockCommandRunner::new();
+        let lines: Vec<_> = (0..3).map(|i| ready_line(&runner, i)).collect();
+        for i in [0, 2] {
+            runner.set_agent_status(
+                &agent_addr(i),
+                AgentStatusProbe::Reply(status_reply("up", None)),
+            );
+        }
+        runner.set_agent_status(
+            &agent_addr(1),
+            AgentStatusProbe::NoAnswer("timed out".to_string()),
+        );
+        let expected_one = LineFault::AgentNotResponding {
+            addr: agent_addr(1),
+            reason: "timed out".to_string(),
+        };
+        assert_eq!(
+            evaluate(
+                &runner,
+                true,
+                true,
+                true,
+                &resolution(lines.clone()),
+                "strongswan"
+            ),
+            Health::LinesUnhealthy {
+                line_faults: vec![(1, expected_one.clone())],
+                configured_failed: vec![],
+            }
+        );
+
+        // Every line faulted, resolution listed in reverse index order.
+        runner.set_agent_status(
+            &agent_addr(0),
+            AgentStatusProbe::NoAnswer("timed out".to_string()),
+        );
+        runner.set_agent_status(
+            &agent_addr(2),
+            AgentStatusProbe::NoAnswer("timed out".to_string()),
+        );
+        let reversed: Vec<_> = lines.into_iter().rev().collect();
+        let Health::LinesUnhealthy { line_faults, .. } = evaluate(
+            &runner,
+            true,
+            true,
+            true,
+            &resolution(reversed),
+            "strongswan",
+        ) else {
+            panic!("expected faults");
+        };
+        assert_eq!(
+            line_faults.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![2, 1, 0]
+        );
+    }
+
+    /// Each agent query can take up to 2s against a silent agent, and
+    /// Docker kills the HEALTHCHECK at 5s, so line checks must overlap
+    /// rather than run one after another. Every query here waits until all
+    /// four are in flight together; a sequential loop never gets there, so
+    /// each query gives up after its patience runs out and is counted.
+    #[test]
+    fn line_checks_query_every_agent_at_once() {
+        let runner = MockCommandRunner::new();
+        let lines: Vec<_> = (0..4).map(|i| ready_line(&runner, i)).collect();
+        for i in 0..4 {
+            runner.set_agent_status(
+                &agent_addr(i),
+                AgentStatusProbe::Reply(status_reply("up", None)),
+            );
+        }
+        runner.hold_agent_status_until(4, std::time::Duration::from_secs(2));
+
+        let health = evaluate(&runner, true, true, true, &resolution(lines), "strongswan");
+
+        assert_eq!(
+            runner.agent_status_gave_up(),
+            0,
+            "line checks ran one after another instead of all at once"
+        );
+        assert_eq!(runner.agent_status_queries().len(), 4);
+        assert_eq!(health, Health::Healthy);
     }
 
     /// The live-found bug this encodes: hardcoding `tun1` for every engine

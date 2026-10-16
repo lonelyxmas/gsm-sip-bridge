@@ -1,7 +1,7 @@
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan at
-`specs/093-child-sa-rekey-stuck/plan.md`.
+`specs/094-pcscf-probe-reduction/plan.md`.
 <!-- SPECKIT END -->
 
 ## Pre-commit Checklist
