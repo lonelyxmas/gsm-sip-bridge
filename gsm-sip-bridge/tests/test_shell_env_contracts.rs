@@ -147,18 +147,41 @@ fn shell_env_values_are_quoted_against_injection() {
 /// Loads a config through the real parser rather than hand-building an
 /// `AppConfig`, so this also pins the *defaults* the printer emits — the
 /// values a deployment that configures nothing actually gets.
-fn load_minimal_config() -> AppConfig {
-    let mut f = NamedTempFile::new().unwrap();
-    f.write_all(
-        br#"
+const MINIMAL_CONFIG: &str = r#"
 [sip]
 server = "pbx.example.com"
 username = "bridge"
 password = "s3cret"
-"#,
-    )
-    .unwrap();
+"#;
+
+fn load_config_from(toml: &str) -> AppConfig {
+    let mut f = NamedTempFile::new().unwrap();
+    f.write_all(toml.as_bytes()).unwrap();
     gsm_sip_bridge::config::load_config(f.path()).unwrap()
+}
+
+fn load_minimal_config() -> AppConfig {
+    load_config_from(MINIMAL_CONFIG)
+}
+
+/// specs/094: whether the idle-tunnel keepalive is on is visible in the
+/// export, right after the interval it would use.
+#[test]
+fn vowifi_shell_env_reports_the_idle_keepalive_after_its_interval() {
+    let rendered = config_cmd::render_vowifi_shell_env(&load_minimal_config());
+    assert!(
+        rendered.contains("KEEPALIVE_INTERVAL='30'\nIDLE_KEEPALIVE='false'\n"),
+        "{rendered}"
+    );
+
+    let on = load_config_from(&format!(
+        "{MINIMAL_CONFIG}\n[vowifi]\nidle_keepalive = true\n"
+    ));
+    let rendered = config_cmd::render_vowifi_shell_env(&on);
+    assert!(
+        rendered.contains("KEEPALIVE_INTERVAL='30'\nIDLE_KEEPALIVE='true'\n"),
+        "{rendered}"
+    );
 }
 
 #[test]

@@ -26,8 +26,8 @@
 One new line, after `KEEPALIVE_INTERVAL`:
 
 ```text
-KEEPALIVE_INTERVAL=30
-IDLE_KEEPALIVE=false
+KEEPALIVE_INTERVAL='30'
+IDLE_KEEPALIVE='false'
 ```
 
-`IDLE_KEEPALIVE` is `true` or `false`.
+`IDLE_KEEPALIVE` is `true` or `false`, shell-quoted like every other value in the export.

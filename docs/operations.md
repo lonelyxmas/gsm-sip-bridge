@@ -134,6 +134,25 @@ Before this feature, all three reported healthy for the whole outage:
 from a thread independent of the dispatch loop, and the healthcheck only proved
 the metrics port accepted connections.
 
+### What the HEALTHCHECK checks per VoWiFi line
+
+For each resolved line, the container `HEALTHCHECK` checks that the tunnel
+interface has an address. Once the line has captured a P-CSCF, it then asks
+the line's IMS agent for its status on `:5071` (the query `vowifi-status`
+sends, bounded at 1s to connect and 1s to read, all lines at once). The line
+is unhealthy when the agent does not answer, or answers that its Gm connection
+has `failed`. `reconnecting` is not a fault: the agent is still working on it.
+
+The HEALTHCHECK no longer connects to the P-CSCF itself
+([#120](https://github.com/selvakn/gsm-sip-bridge/issues/120)). The line
+supervisor still probes the P-CSCF every 30s and repairs the tunnel when it
+stops answering. The two faults to grep the container's health log for:
+
+```text
+line N: IMS agent at <ip>:5071 not responding: <reason>
+line N: IMS agent reports Gm connection failed since <ts> (P-CSCF <addr>)
+```
+
 ### No `/dev/ttyUSB*` devices
 
 Check `dmesg | grep ttyUSB`. Ensure the `option` and `qcserial` kernel
