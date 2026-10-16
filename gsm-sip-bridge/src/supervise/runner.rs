@@ -1100,6 +1100,9 @@ mod mock {
         /// spawned sibling (e.g. vowifi-usim-bridge, spawned on its own
         /// thread) for handle-ID order.
         pub born_dead_substrings: Mutex<Vec<String>>,
+        /// See [`Self::set_netns_output_after`]: `(trigger key, seeded key,
+        /// output)`, applied when the trigger command runs.
+        netns_effects: Mutex<Vec<(String, String, Output)>>,
         next_id: AtomicU64,
     }
 
@@ -1148,6 +1151,26 @@ mod mock {
             let mut out = empty_output(0);
             out.stdout = stdout.as_bytes().to_vec();
             self.run_outputs.lock().unwrap().insert(key, out);
+        }
+
+        /// Like [`Self::set_netns_output`], but only once `trigger` has run in
+        /// `netns` — for a command whose effect a later read must observe,
+        /// e.g. an `ip route replace` that makes the next `ip route show`
+        /// list the route.
+        pub fn set_netns_output_after(
+            &self,
+            netns: &str,
+            trigger: &[&str],
+            argv: &[&str],
+            stdout: &str,
+        ) {
+            let mut out = empty_output(0);
+            out.stdout = stdout.as_bytes().to_vec();
+            self.netns_effects.lock().unwrap().push((
+                format!("netns:{netns}:{}", trigger.join(" ")),
+                format!("netns:{netns}:{}", argv.join(" ")),
+                out,
+            ));
         }
 
         /// Seeds `tcp_connect_ok(host, port)`'s return value.
@@ -1302,6 +1325,14 @@ mod mock {
                 .lock()
                 .unwrap()
                 .push((netns.to_string(), owned));
+            for (trigger, seeded, out) in self.netns_effects.lock().unwrap().iter() {
+                if *trigger == key {
+                    self.run_outputs
+                        .lock()
+                        .unwrap()
+                        .insert(seeded.clone(), out.clone());
+                }
+            }
             Ok(self
                 .run_outputs
                 .lock()

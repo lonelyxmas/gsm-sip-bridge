@@ -1681,6 +1681,23 @@ mod tests {
             runner
         }
 
+        /// Makes each family's `ip route replace` actually install that
+        /// family's route, so a repair's re-check sees the result.
+        fn replaces_take_effect(runner: &MockCommandRunner) {
+            for (replace, show) in [
+                (
+                    &["ip", "route", "replace", "default", "dev", "tun23"][..],
+                    V4_ROUTE_SHOW,
+                ),
+                (
+                    &["ip", "-6", "route", "replace", "default", "dev", "tun23"][..],
+                    V6_ROUTE_SHOW,
+                ),
+            ] {
+                runner.set_netns_output_after("ims", replace, show, "default scope link \n");
+            }
+        }
+
         fn route_replaces(runner: &MockCommandRunner) -> Vec<Vec<String>> {
             runner
                 .run_in_netns_calls
@@ -1698,10 +1715,25 @@ mod tests {
             // deleted, the old IPv4-only check called it present, and the line
             // waited out 82s of unreachable strikes and rebuilt the tunnel.
             let runner = routes_present(&[V4_ROUTE_SHOW]);
-            strongswan_engine().repair_default_route(&runner, "2001:db8::1");
+            replaces_take_effect(&runner);
+            assert!(
+                strongswan_engine().repair_default_route(&runner, "2001:db8::1"),
+                "a repaired route must be reported, or the supervisor counts a strike \
+                 and eventually rebuilds the tunnel anyway"
+            );
             assert!(route_replaces(&runner)
                 .iter()
                 .any(|c| c == &["ip", "-6", "route", "replace", "default", "dev", "tun23"]));
+        }
+
+        #[test]
+        fn a_repair_that_does_not_bring_the_route_back_is_not_reported() {
+            // `replace` runs but the route never appears (the mock leaves the
+            // listing empty): the supervisor must fall through to counting a
+            // strike rather than claim DefaultRouteMissing was fixed.
+            let runner = routes_present(&[V4_ROUTE_SHOW]);
+            assert!(!strongswan_engine().repair_default_route(&runner, "2001:db8::1"));
+            assert!(!route_replaces(&runner).is_empty());
         }
 
         #[test]
@@ -1721,7 +1753,8 @@ mod tests {
         #[test]
         fn an_ipv4_pcscf_line_repairs_a_lost_ipv4_route() {
             let runner = routes_present(&[V6_ROUTE_SHOW]);
-            strongswan_engine().repair_default_route(&runner, "10.0.0.1");
+            replaces_take_effect(&runner);
+            assert!(strongswan_engine().repair_default_route(&runner, "10.0.0.1"));
             assert!(route_replaces(&runner)
                 .iter()
                 .any(|c| c == &["ip", "route", "replace", "default", "dev", "tun23"]));
@@ -1730,7 +1763,8 @@ mod tests {
         #[test]
         fn an_unparseable_pcscf_requires_both_routes() {
             let runner = routes_present(&[V4_ROUTE_SHOW]);
-            strongswan_engine().repair_default_route(&runner, "pcscf.example");
+            replaces_take_effect(&runner);
+            assert!(strongswan_engine().repair_default_route(&runner, "pcscf.example"));
             assert!(!route_replaces(&runner).is_empty());
 
             let runner = routes_present(&[V4_ROUTE_SHOW, V6_ROUTE_SHOW]);
