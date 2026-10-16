@@ -29,15 +29,21 @@ log() { echo "[ims.updown] $*" >&2; }
 # Reinstall the family's default route through the tunnel.
 #
 # This belongs here, next to the address, because of a kernel behaviour that
-# caused a 6-hour outage on 2026-08-19: removing the *last* address of a family
-# from an interface also deletes that interface's `default dev <iface> scope
-# link` route. So every `down-client` below silently destroys the route, and
+# caused a 6-hour outage on 2026-08-19: removing the *last* IPv4 address from
+# an interface also deletes that interface's IPv4 `default dev <iface> scope
+# link` route. So every IPv4 `down-client` below silently destroys the route, and
 # before this the only thing that ever installed it was `ensure_epdg_interface`
 # at establish time. A transient WAN outage was therefore unrecoverable: the
 # router rebooted, charon tore the CHILD_SA down (`addr del` -> route gone),
 # and when the internet came back the reconnect restored the *address* and
 # nothing restored the route. Every SIP connect then got ENETUNREACH forever,
 # while `swanctl --list-sas` reported a perfectly healthy tunnel.
+#
+# The IPv6 route does *not* go with its last address (measured on kernel 7.0,
+# #133), but other things take it while leaving IPv4's alone: an MTU below
+# 1280, toggling `disable_ipv6`, an explicit `ip -6 route del`. Link down/up
+# and recreating the interface or netns take both. Installing on the up path
+# is right for both families either way.
 #
 # Doing it on the up path makes it event-driven rather than ordering-dependent:
 # whenever an address exists, so does its route, regardless of what the

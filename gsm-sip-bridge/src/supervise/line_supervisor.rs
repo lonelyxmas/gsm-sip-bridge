@@ -240,6 +240,10 @@ pub trait TunnelEngine {
     /// Reinstate this line's default route if it is missing, returning whether
     /// it had to (`true` = it was missing and has now been repaired).
     ///
+    /// "Missing" means missing in `pcscf`'s address family: that is the route
+    /// whose absence makes the P-CSCF unreachable, and the other family's
+    /// route says nothing about it (#133).
+    ///
     /// Separate from [`TunnelEngine::recreate_interface`] because it is the
     /// cheapest possible repair — one `ip route replace`, no disruption —
     /// whereas a rebuild costs a renegotiation and drops any call. A route that
@@ -247,7 +251,7 @@ pub trait TunnelEngine {
     /// structurally perfect and completely unreachable, so it is worth ruling
     /// out before tearing anything down. Always `false` for swu, which manages
     /// its own device and routing through the dialer.
-    fn repair_default_route(&self, runner: &dyn CommandRunner) -> bool;
+    fn repair_default_route(&self, runner: &dyn CommandRunner, pcscf: &str) -> bool;
     /// Fully restarts this line's primary process from scratch (strongswan:
     /// kill, clear log, remove the stale unqualified pidfile, respawn
     /// charon, `swanctl --load-all`, `swanctl --initiate`; swu: respawn the
@@ -656,11 +660,14 @@ pub fn tick_steady_state_with_pool(
         // like this, with every structural check passing.
         //
         // It is also what a rebuild cannot fix. The kernel deletes an
-        // interface's default route when the last address of that family goes,
-        // so the `terminate` below destroys the route `recreate_interface`
+        // interface's IPv4 default route when its last IPv4 address goes, so
+        // the `terminate` below destroys the route `recreate_interface`
         // installs moments earlier. On 2026-08-19 that loop ran 202 times over
         // six hours without ever restoring the data path.
-        if engine.repair_default_route(runner) {
+        //
+        // The current selection's family, because that is the address the line
+        // registers through; a sibling only matters once it has been chosen.
+        if engine.repair_default_route(runner, current_pcscf) {
             tracking.pcscf_unreachable = 0;
             return SteadyOutcome::Recovered {
                 reason: DegradeReason::DefaultRouteMissing,
@@ -951,7 +958,7 @@ mod tests {
             self.call_order.borrow_mut().push("rejection");
             self.rejection.borrow().clone()
         }
-        fn repair_default_route(&self, _runner: &dyn CommandRunner) -> bool {
+        fn repair_default_route(&self, _runner: &dyn CommandRunner, _pcscf: &str) -> bool {
             if !*self.route_missing.borrow() {
                 return false;
             }
