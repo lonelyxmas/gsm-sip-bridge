@@ -8,18 +8,18 @@ All paths are relative to `gsm-sip-bridge/src/` unless stated otherwise. Before 
 
 ## Phase 1: Setup
 
-- [ ] T001 Confirm the branch is `094-pcscf-probe-reduction` on top of `origin/main` and that `make test` is green before any change. Read `supervise/orchestrate.rs` `start_line_tail` (the "Idle-tunnel keepalive" block), `commands/healthcheck.rs` `check_line`/`evaluate_with_metrics`, and `vowifi/mod.rs` `query_status`/`print_status`.
+- [X] T001 Confirm the branch is `094-pcscf-probe-reduction` on top of `origin/main` and that `make test` is green before any change. Read `supervise/orchestrate.rs` `start_line_tail` (the "Idle-tunnel keepalive" block), `commands/healthcheck.rs` `check_line`/`evaluate_with_metrics`, and `vowifi/mod.rs` `query_status`/`print_status`.
 
 ## Phase 2: Foundational (blocks US1 and US2)
 
-- [ ] T002 In `supervise/runner.rs`, give `MockCommandRunner` a recorder: a `tcp_connect_attempts: Mutex<Vec<(Option<String>, String, u16)>>` field (netns, host, port), pushed by both `tcp_connect_ok` (`None`) and `tcp_connect_ok_in_netns` (`Some(netns)`) before they look up the seeded result. Expose it with `pub fn tcp_connect_attempts(&self) -> Vec<(Option<String>, String, u16)>`. Add one test in the runner's mock tests showing both calls are recorded in order. No behaviour change elsewhere. It lands in the US1 commit.
+- [X] T002 In `supervise/runner.rs`, give `MockCommandRunner` a recorder: a `tcp_connect_attempts: Mutex<Vec<(Option<String>, String, u16)>>` field (netns, host, port), pushed by both `tcp_connect_ok` (`None`) and `tcp_connect_ok_in_netns` (`Some(netns)`) before they look up the seeded result. Expose it with `pub fn tcp_connect_attempts(&self) -> Vec<(Option<String>, String, u16)>`. Add one test in the runner's mock tests showing both calls are recorded in order. No behaviour change elsewhere. It lands in the US1 commit.
 
 ## Phase 3: User Story 1: an idle line no longer runs the discard-only keepalive (P1) 🎯 MVP
 
 **Goal**: with default config, `start_line_tail` starts no keepalive loop. With `idle_keepalive = true` it starts today's loop at `keepalive_interval_sec`. The supervisor probe is untouched.
 **Independent test**: the config and orchestrate unit tests below. Live: about 20 SYNs to `:5060` per 10 minutes per line (quickstart).
 
-- [ ] T003 [US1] Config key, tests first. In the `config/mod.rs` tests, next to the existing `assert_eq!(cfg.vowifi.keepalive_interval_sec, 20)` default test:
+- [X] T003 [US1] Config key, tests first. In the `config/mod.rs` tests, next to the existing `assert_eq!(cfg.vowifi.keepalive_interval_sec, 20)` default test:
   - change that assertion to `30`
   - add `assert!(!cfg.vowifi.idle_keepalive)` for an empty `[vowifi]`
   - add a test that `idle_keepalive = true` parses to `true`
@@ -33,7 +33,7 @@ All paths are relative to `gsm-sip-bridge/src/` unless stated otherwise. Before 
   - `config/build.rs`: carry `idle_keepalive: raw.idle_keepalive` into `VowifiConfig`, beside `keepalive_interval_sec`.
 
   Fix any other struct literal of `VowifiConfig`/`RawVowifi` the compiler points at (tests and fixtures).
-- [ ] T004 [US1] Keepalive gate, tests first, in the `supervise/orchestrate.rs` tests module:
+- [X] T004 [US1] Keepalive gate, tests first, in the `supervise/orchestrate.rs` tests module:
   - `idle_keepalive_interval(&cfg)` is `None` for `VowifiConfig::default()`-style config, and `Some(Duration::from_secs(45))` with `idle_keepalive = true, keepalive_interval_sec = 45`.
   - `idle_keepalive_once(&mock, "ims0", "/tmp/pcscf-0")`, with the file seeded `"192.0.2.10\n"`, makes exactly one attempt `(Some("ims0"), "192.0.2.10", 5060)` per `tcp_connect_attempts()`. With the file blank or missing it makes none. The connect's result (seed true or false) changes nothing observable (it returns `()`).
 
@@ -42,8 +42,8 @@ All paths are relative to `gsm-sip-bridge/src/` unless stated otherwise. Before 
   - `fn idle_keepalive_once(runner: &dyn CommandRunner, netns: &str, pcscf_path: &str)`, holding today's loop body verbatim (read file, trim, skip if empty, `tcp_connect_ok_in_netns(netns, addr, line_supervisor::PCSCF_SIP_PORT)`, discard). Move the long comment about the zombie `timeout` processes and the 2026-08-17 outage with it.
   - In `start_line_tail`, replace the hard-coded `Duration::from_secs(30)` block (including the "read by the caller and threaded through would be cleaner" comment) with: `if let Some(interval) = idle_keepalive_interval(&ctx.config.vowifi) { std::thread::spawn(move || loop { idle_keepalive_once(&*runner, &netns, &pcscf_path); runner.sleep(interval); }); }`. Keep `let _ = initial_pcscf;` inside the closure, or drop the binding outside it if clippy objects to it being unused when the gate is off.
   - Update `start_line_tail`'s doc comment ("+ the idle-tunnel keepalive") to say the keepalive is optional, off by default (`[vowifi].idle_keepalive`, #120).
-- [ ] T005 [US1] Startup log per contracts/logs.md. In `supervise/orchestrate.rs` `start_vowifi_subsystem`, before any line starts, log once at `info` with fields `idle_keepalive` and, when on, `interval_sec`, using the exact off and on messages from the contract. If `start_vowifi_subsystem` already has a test harness through `MockCommandRunner`, put the message-choosing logic in a small pure fn (`fn idle_keepalive_log_line(v: &VowifiConfig) -> String`) and unit test both messages. Otherwise test only that fn.
-- [ ] T006 [US1] Grep `supervise/` for any other caller of the old keepalive or reader of `keepalive_interval_sec` (expect none beyond `commands/config.rs`). Confirm `line_supervisor.rs` and `engines.rs` are unchanged in `git diff` (FR-007). Commit: `feat(vowifi): idle-tunnel keepalive behind [vowifi].idle_keepalive, off by default (#120)`.
+- [X] T005 [US1] Startup log per contracts/logs.md. In `supervise/orchestrate.rs` `start_vowifi_subsystem`, before any line starts, log once at `info` with fields `idle_keepalive` and, when on, `interval_sec`, using the exact off and on messages from the contract. If `start_vowifi_subsystem` already has a test harness through `MockCommandRunner`, put the message-choosing logic in a small pure fn (`fn idle_keepalive_log_line(v: &VowifiConfig) -> String`) and unit test both messages. Otherwise test only that fn.
+- [X] T006 [US1] Grep `supervise/` for any other caller of the old keepalive or reader of `keepalive_interval_sec` (expect none beyond `commands/config.rs`). Confirm `line_supervisor.rs` and `engines.rs` are unchanged in `git diff` (FR-007). Commit: `feat(vowifi): idle-tunnel keepalive behind [vowifi].idle_keepalive, off by default (#120)`.
 
 **Checkpoint**: US1 is shippable alone. With the HEALTHCHECK still probing, an idle line drops from about 360 to about 240 connects per hour.
 
@@ -103,8 +103,8 @@ All paths are relative to `gsm-sip-bridge/src/` unless stated otherwise. Before 
 **Independent test**: the export test, plus reading the docs against contracts/config.md.
 
 - [ ] T012 [P] [US3] In `commands/config.rs`, test first: the export contains `IDLE_KEEPALIVE=false` by default and `IDLE_KEEPALIVE=true` when set, on the line after `KEEPALIVE_INTERVAL`. Then add `("IDLE_KEEPALIVE", v.idle_keepalive.to_string())` after the `KEEPALIVE_INTERVAL` entry. If an existing test asserts the full export text, update it, including `KEEPALIVE_INTERVAL=30`.
-- [ ] T013 [P] [US3] `config.toml.example` (repo root): replace the uncommented `keepalive_interval_sec = 20` and its comment with the commented-out block from contracts/config.md (`# idle_keepalive = false`, `# keepalive_interval_sec = 30`, with the #120 note). Check `sample_configs/` and `test/` for configs that set `keepalive_interval_sec`, and leave them as they are; an explicit value stays valid.
-- [ ] T014 [P] [US3] `docs/configuration.md` `[vowifi]` table: add an `idle_keepalive` row (boolean, `false`, with what it does, why it is off since #120 with a link, and when to turn it on: #106-style idle-bearer eviction; it takes effect when the container is recreated). Change the `keepalive_interval_sec` row to default `30`, "Interval for the idle-tunnel keepalive; used only when `idle_keepalive = true`."
+- [X] T013 [P] [US3] `config.toml.example` (repo root): replace the uncommented `keepalive_interval_sec = 20` and its comment with the commented-out block from contracts/config.md (`# idle_keepalive = false`, `# keepalive_interval_sec = 30`, with the #120 note). Check `sample_configs/` and `test/` for configs that set `keepalive_interval_sec`, and leave them as they are; an explicit value stays valid.
+- [X] T014 [P] [US3] `docs/configuration.md` `[vowifi]` table: add an `idle_keepalive` row (boolean, `false`, with what it does, why it is off since #120 with a link, and when to turn it on: #106-style idle-bearer eviction; it takes effect when the container is recreated). Change the `keepalive_interval_sec` row to default `30`, "Interval for the idle-tunnel keepalive; used only when `idle_keepalive = true`."
 - [ ] T015 [P] [US3] `docs/operations.md`: near the existing HEALTHCHECK text, add a short paragraph on what the HEALTHCHECK checks per VoWiFi line. Tunnel interface address, then (once a P-CSCF is captured) the line's IMS agent status on `:5071`: unhealthy on no answer or Gm `failed`, not on `reconnecting`. The P-CSCF is no longer probed by the HEALTHCHECK; the supervisor still probes it and repairs. Include the two new stderr fault strings so an operator can grep for them.
 - [ ] T016 [US3] `CHANGELOG.md` `[Unreleased]`: add a `### Changed` section if it is missing, with one entry (bold only the summary, per memory). Suggested: **One P-CSCF probe per VoWiFi line.** The idle-tunnel keepalive is now off by default (`[vowifi].idle_keepalive`, and it honours `keepalive_interval_sec`, default 30). The container HEALTHCHECK reads each line's IMS agent status instead of connecting to the P-CSCF, and reports `IMS agent … not responding` or `Gm connection failed`. About two thirds fewer connects on an idle tunnel ([#120](https://github.com/selvakn/gsm-sip-bridge/issues/120)). Commit: `docs: idle_keepalive, keepalive_interval_sec and the agent-based HEALTHCHECK (#120)`.
 

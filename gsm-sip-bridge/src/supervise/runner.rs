@@ -1032,6 +1032,11 @@ mod mock {
         /// `"host:port"` key; unseeded keys default to `false` (no
         /// real network in tests).
         pub tcp_connect_results: Mutex<Map<String, bool>>,
+        /// Every `tcp_connect_ok` (`None`) and `tcp_connect_ok_in_netns`
+        /// (`Some(netns)`) call as `(netns, host, port)`, in call order --
+        /// lets a test assert that something did *not* connect anywhere
+        /// (specs/094: the HEALTHCHECK never probes the P-CSCF).
+        pub tcp_connect_attempts: Mutex<Vec<(Option<String>, String, u16)>>,
         /// Overrides `resolve_host`'s return value for a given host;
         /// unseeded hosts resolve to an empty address list (no real DNS in
         /// tests).
@@ -1114,6 +1119,12 @@ mod mock {
                 .lock()
                 .unwrap()
                 .insert(format!("netns:{netns}:{host}:{port}"), ok);
+        }
+
+        /// Every TCP connect probe made so far, as `(netns, host, port)`,
+        /// oldest first. `netns` is `None` for the default-namespace probe.
+        pub fn tcp_connect_attempts(&self) -> Vec<(Option<String>, String, u16)> {
+            self.tcp_connect_attempts.lock().unwrap().clone()
         }
 
         pub fn kill_child(&self, handle: &ChildHandle, exit_code: i32) {
@@ -1317,6 +1328,10 @@ mod mock {
         }
 
         fn tcp_connect_ok(&self, host: &str, port: u16) -> bool {
+            self.tcp_connect_attempts
+                .lock()
+                .unwrap()
+                .push((None, host.to_string(), port));
             self.tcp_connect_results
                 .lock()
                 .unwrap()
@@ -1335,6 +1350,11 @@ mod mock {
         }
 
         fn tcp_connect_ok_in_netns(&self, netns: &str, host: &str, port: u16) -> bool {
+            self.tcp_connect_attempts.lock().unwrap().push((
+                Some(netns.to_string()),
+                host.to_string(),
+                port,
+            ));
             self.tcp_connect_results
                 .lock()
                 .unwrap()
@@ -1400,5 +1420,20 @@ mod mock {
     fn read_file_on_unseeded_path_is_not_found() {
         let runner = MockCommandRunner::new();
         assert!(runner.read_file(Path::new("/tmp/nope.log")).is_err());
+    }
+
+    #[test]
+    fn tcp_connect_probes_are_recorded_in_call_order() {
+        let runner = MockCommandRunner::new();
+        runner.set_tcp_connect_ok("192.0.2.1", 80, true);
+        assert!(runner.tcp_connect_ok("192.0.2.1", 80));
+        assert!(!runner.tcp_connect_ok_in_netns("ims0", "192.0.2.10", 5060));
+        assert_eq!(
+            runner.tcp_connect_attempts(),
+            vec![
+                (None, "192.0.2.1".to_string(), 80),
+                (Some("ims0".to_string()), "192.0.2.10".to_string(), 5060),
+            ]
+        );
     }
 }

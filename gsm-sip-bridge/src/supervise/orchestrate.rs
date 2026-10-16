@@ -216,6 +216,21 @@ fn start_vowifi_subsystem(
 
     check_pcsc_engine_compatibility(vowifi_lines, &config.vowifi.tunnel_engine)?;
 
+    // Once per run, before any line starts (specs/094 contracts/logs.md).
+    match idle_keepalive_interval(&config.vowifi) {
+        None => tracing::info!(
+            idle_keepalive = false,
+            "{}",
+            idle_keepalive_log_line(&config.vowifi)
+        ),
+        Some(interval) => tracing::info!(
+            idle_keepalive = true,
+            interval_sec = interval.as_secs(),
+            "{}",
+            idle_keepalive_log_line(&config.vowifi)
+        ),
+    }
+
     // Note: the swu-on-slim payload check is NOT here — it is an image
     // property, not a line-table one, so `run` performs it before discovery
     // (see the `swu_payload_available` guard there). Sitting behind line
@@ -2443,10 +2458,11 @@ fn clear_line_gm_state(runner: &dyn CommandRunner, idx: u32, netns: &str) -> (us
 }
 
 /// Veth pair + this line's vowifi-ims-agent (with per-incident USIM
-/// auto-recovery) + the idle-tunnel keepalive — 1:1 port of
-/// `start_line_tail` and its keepalive sibling. Both supervision loops run
-/// on their own background threads and this function returns immediately,
-/// matching the bash original backgrounding both with `&`.
+/// auto-recovery) + the optional idle-tunnel keepalive (off by default,
+/// `[vowifi].idle_keepalive`, #120) — 1:1 port of `start_line_tail` and its
+/// keepalive sibling. Both supervision loops run on their own background
+/// threads and this function returns immediately, matching the bash original
+/// backgrounding both with `&`.
 fn start_line_tail(
     ctx: &LineStartup,
     idx: u32,
@@ -2673,58 +2689,75 @@ fn start_line_tail(
         });
     }
 
-    // Idle-tunnel keepalive (TCP connect, not ICMP — operators filter ICMP
-    // over the tunnel). Re-reads the P-CSCF source file every cycle so it
-    // keeps pinging the right address after the steady-state loop refreshes
-    // it.
-    {
+    // Idle-tunnel keepalive, opt-in since #120 (`[vowifi].idle_keepalive`).
+    // Re-reads the P-CSCF source file every cycle so it keeps pinging the
+    // right address after the steady-state loop refreshes it.
+    let _ = initial_pcscf; // each cycle re-reads the file anyway
+    if let Some(interval) = idle_keepalive_interval(&ctx.config.vowifi) {
         let runner = Arc::clone(runner);
         let netns = netns.to_string();
         let pcscf_path = line.pcscf_source_path.clone();
-        let interval = Duration::from_secs(
-            /* [vowifi].keepalive_interval_sec, read by the caller and
-            threaded through would be cleaner, but this loop only needs a
-            reasonable default matching the original script's own $KEEPALIVE_INTERVAL
-            fallback */
-            30,
-        );
-        std::thread::spawn(move || {
-            let _ = initial_pcscf; // first cycle re-reads the file anyway
-            loop {
-                let pcscf_now = runner.read_file(Path::new(&pcscf_path)).unwrap_or_default();
-                let pcscf_now = pcscf_now.trim();
-                if !pcscf_now.is_empty() {
-                    // Uses the runner's own probe rather than shelling out to
-                    // `timeout 3 bash -c '>/dev/tcp/...'`
-                    // (specs/039-at-stall-watchdog, FR-028). That shell form
-                    // left the inner `timeout` process orphaned on every cycle,
-                    // reparented to this process as PID 1, and never reaped:
-                    // 462 zombies had accumulated in 3.8 hours, which at ~120
-                    // an hour eventually exhausts the process table and takes
-                    // out something entirely unrelated. This has the same 3s
-                    // connect timeout, waits for its child properly, and does
-                    // not interpolate a file's contents into a shell command.
-                    // The result is deliberately discarded *here*: this loop's
-                    // job is to put traffic on the tunnel so the bearer's NAT
-                    // mapping stays alive, not to decide anything.
-                    //
-                    // It used to be the only thing in the whole system that
-                    // probed reachability, and dropping the answer is what let
-                    // the 2026-08-17 outage run for 8 hours: this probe failed
-                    // roughly 960 consecutive times and told nobody. The
-                    // decision now lives in `line_supervisor::tick_steady_state`
-                    // (`DegradeReason::PcscfUnreachable`), which has the engine
-                    // handle needed to actually repair the tunnel.
-                    let _ = runner.tcp_connect_ok_in_netns(
-                        &netns,
-                        pcscf_now,
-                        line_supervisor::PCSCF_SIP_PORT,
-                    );
-                }
-                runner.sleep(interval);
-            }
+        std::thread::spawn(move || loop {
+            idle_keepalive_once(runner.as_ref(), &netns, &pcscf_path);
+            runner.sleep(interval);
         });
     }
+}
+
+/// How often each line's idle-tunnel keepalive runs, or `None` when it is
+/// off — the default since #120. The line supervisor already probes the
+/// P-CSCF every 30s, and a second stream of connects on an idle tunnel keeps
+/// strongSwan's own DPD and NAT-T keepalives from ever running. Kept as an
+/// escape hatch for a carrier that drops an idle bearer (#106).
+fn idle_keepalive_interval(v: &crate::config::VowifiConfig) -> Option<Duration> {
+    v.idle_keepalive
+        .then(|| Duration::from_secs(v.keepalive_interval_sec))
+}
+
+/// The startup line saying whether the idle-tunnel keepalive is on
+/// (specs/094 contracts/logs.md).
+fn idle_keepalive_log_line(v: &crate::config::VowifiConfig) -> String {
+    match idle_keepalive_interval(v) {
+        None => "idle-tunnel keepalive off ([vowifi].idle_keepalive = false); \
+                 P-CSCF reachability is probed by the line supervisor only"
+            .to_string(),
+        Some(interval) => format!(
+            "idle-tunnel keepalive on: TCP connect to each line's P-CSCF :{} every {}s \
+             ([vowifi].idle_keepalive = true)",
+            line_supervisor::PCSCF_SIP_PORT,
+            interval.as_secs()
+        ),
+    }
+}
+
+/// One idle-tunnel keepalive cycle (TCP connect, not ICMP — operators filter
+/// ICMP over the tunnel): if the line has a P-CSCF, connect to its SIP port
+/// from inside the line's namespace and discard the result.
+fn idle_keepalive_once(runner: &dyn CommandRunner, netns: &str, pcscf_path: &str) {
+    let pcscf_now = runner.read_file(Path::new(pcscf_path)).unwrap_or_default();
+    let pcscf_now = pcscf_now.trim();
+    if pcscf_now.is_empty() {
+        return;
+    }
+    // Uses the runner's own probe rather than shelling out to
+    // `timeout 3 bash -c '>/dev/tcp/...'` (specs/039-at-stall-watchdog,
+    // FR-028). That shell form left the inner `timeout` process orphaned on
+    // every cycle, reparented to this process as PID 1, and never reaped: 462
+    // zombies had accumulated in 3.8 hours, which at ~120 an hour eventually
+    // exhausts the process table and takes out something entirely unrelated.
+    // This has the same 3s connect timeout, waits for its child properly, and
+    // does not interpolate a file's contents into a shell command. The result
+    // is deliberately discarded *here*: this loop's job is to put traffic on
+    // the tunnel so the bearer's NAT mapping stays alive, not to decide
+    // anything.
+    //
+    // It used to be the only thing in the whole system that probed
+    // reachability, and dropping the answer is what let the 2026-08-17 outage
+    // run for 8 hours: this probe failed roughly 960 consecutive times and
+    // told nobody. The decision now lives in
+    // `line_supervisor::tick_steady_state` (`DegradeReason::PcscfUnreachable`),
+    // which has the engine handle needed to actually repair the tunnel.
+    let _ = runner.tcp_connect_ok_in_netns(netns, pcscf_now, line_supervisor::PCSCF_SIP_PORT);
 }
 
 fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &str, mnc: &str) {
@@ -2910,6 +2943,67 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- specs/094: the idle-tunnel keepalive is opt-in ----
+
+    #[test]
+    fn the_idle_keepalive_is_off_by_default() {
+        let v = crate::config::VowifiConfig::default();
+        assert_eq!(idle_keepalive_interval(&v), None);
+    }
+
+    #[test]
+    fn the_idle_keepalive_runs_at_the_configured_interval_when_on() {
+        let v = crate::config::VowifiConfig {
+            idle_keepalive: true,
+            keepalive_interval_sec: 45,
+            ..Default::default()
+        };
+        assert_eq!(idle_keepalive_interval(&v), Some(Duration::from_secs(45)));
+    }
+
+    #[test]
+    fn one_keepalive_cycle_makes_one_connect_inside_the_namespace() {
+        for answers in [true, false] {
+            let runner = crate::supervise::runner::MockCommandRunner::new();
+            runner.set_file("/tmp/pcscf-0", "192.0.2.10\n");
+            runner.set_tcp_connect_ok_in_netns("ims0", "192.0.2.10", 5060, answers);
+            idle_keepalive_once(&runner, "ims0", "/tmp/pcscf-0");
+            assert_eq!(
+                runner.tcp_connect_attempts(),
+                vec![(Some("ims0".to_string()), "192.0.2.10".to_string(), 5060)]
+            );
+        }
+    }
+
+    #[test]
+    fn a_keepalive_cycle_without_a_pcscf_connects_nowhere() {
+        let runner = crate::supervise::runner::MockCommandRunner::new();
+        idle_keepalive_once(&runner, "ims0", "/tmp/pcscf-0");
+        runner.set_file("/tmp/pcscf-0", "  \n");
+        idle_keepalive_once(&runner, "ims0", "/tmp/pcscf-0");
+        assert!(runner.tcp_connect_attempts().is_empty());
+    }
+
+    #[test]
+    fn the_startup_log_line_says_whether_the_keepalive_is_on() {
+        let off = crate::config::VowifiConfig::default();
+        assert_eq!(
+            idle_keepalive_log_line(&off),
+            "idle-tunnel keepalive off ([vowifi].idle_keepalive = false); \
+             P-CSCF reachability is probed by the line supervisor only"
+        );
+        let on = crate::config::VowifiConfig {
+            idle_keepalive: true,
+            keepalive_interval_sec: 30,
+            ..Default::default()
+        };
+        assert_eq!(
+            idle_keepalive_log_line(&on),
+            "idle-tunnel keepalive on: TCP connect to each line's P-CSCF :5060 every 30s \
+             ([vowifi].idle_keepalive = true)"
+        );
+    }
 
     #[test]
     fn ignored_pcscf_lines_log_each_set_once_even_with_nothing_admitted() {

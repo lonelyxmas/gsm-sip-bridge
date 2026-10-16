@@ -418,6 +418,9 @@ section! {
         pub epdg_fqdn: String,
         pub epdg_ip: Option<String>,
         pub src_addr: Option<String>,
+        /// Whether the idle-tunnel keepalive runs. See
+        /// `VowifiConfig::idle_keepalive`.
+        pub idle_keepalive: bool,
         pub keepalive_interval_sec: u64,
         /// How long a reg-event `rejected` holds registration off. See
         /// `VowifiConfig::reg_rejected_cooldown_sec`.
@@ -458,7 +461,8 @@ impl Default for RawVowifi {
             epdg_fqdn: String::new(),
             epdg_ip: None,
             src_addr: None,
-            keepalive_interval_sec: 20,
+            idle_keepalive: false,
+            keepalive_interval_sec: 30,
             reg_rejected_cooldown_sec: crate::config::DEFAULT_REG_REJECTED_COOLDOWN_SEC,
             tunnel_engine: "strongswan".to_string(),
             tunnel_address_family: "dual".to_string(),

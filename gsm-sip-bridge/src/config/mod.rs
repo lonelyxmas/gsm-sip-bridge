@@ -945,9 +945,17 @@ pub struct VowifiConfig {
     /// the kernel/charon pick one via routing to the ePDG. `None` (the
     /// default) means auto-select.
     pub src_addr: Option<String>,
+    /// Whether each line runs the idle-tunnel keepalive (a TCP connect to
+    /// the P-CSCF's SIP port every `keepalive_interval_sec`, result
+    /// discarded). Off by default since #120: the line supervisor already
+    /// probes the P-CSCF every 30s, and the extra traffic keeps strongSwan's
+    /// own DPD and NAT-T keepalives from running. Turn on only for a carrier
+    /// that drops an idle bearer (#106).
+    pub idle_keepalive: bool,
     /// Idle-tunnel keepalive interval (seconds) — a TCP connect to the
     /// P-CSCF's SIP port, since operators commonly filter ICMP over the
-    /// tunnel (confirmed on Vodafone India).
+    /// tunnel (confirmed on Vodafone India). Only applies when
+    /// `idle_keepalive` is on; range-checked either way.
     pub keepalive_interval_sec: u64,
     /// Name of the veth interface end in the container's default netns
     /// (Agent B's side). Derived per line, not a `[vowifi]` TOML key.
@@ -1093,7 +1101,8 @@ impl Default for VowifiConfig {
             epdg_fqdn: String::new(),
             epdg_ip: None,
             src_addr: None,
-            keepalive_interval_sec: 20,
+            idle_keepalive: false,
+            keepalive_interval_sec: 30,
             veth_sip_iface: "veth-sip".to_string(),
             veth_ims_iface: "veth-ims".to_string(),
             tunnel_engine: "strongswan".to_string(),
@@ -2223,13 +2232,60 @@ password = "pass"
         assert_eq!(cfg.vowifi.strongswan_if_id, 23);
         assert_eq!(cfg.vowifi.netns, "ims");
         assert_eq!(cfg.vowifi.apn, "ims");
-        assert_eq!(cfg.vowifi.keepalive_interval_sec, 20);
+        assert_eq!(cfg.vowifi.keepalive_interval_sec, 30);
         assert_eq!(cfg.vowifi.vpcd_host, "127.0.0.1");
         assert_eq!(cfg.vowifi.vpcd_port, 15963);
         assert_eq!(cfg.vowifi.epdg_ip, None);
         assert_eq!(cfg.vowifi.src_addr, None);
         assert_eq!(cfg.vowifi.imsi_override, None);
         assert_eq!(cfg.vowifi.imei_override, None);
+    }
+
+    #[test]
+    fn vowifi_idle_keepalive_is_off_by_default() {
+        // #120: the supervisor already probes the P-CSCF; the extra traffic
+        // suppresses strongSwan's own DPD/NAT-T keepalives.
+        let cfg = parse(&format!("{MINIMAL_TOML}\n[vowifi]\n"));
+        assert!(!cfg.vowifi.idle_keepalive);
+    }
+
+    #[test]
+    fn vowifi_idle_keepalive_can_be_turned_on() {
+        let cfg = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nidle_keepalive = true\n"
+        ));
+        assert!(cfg.vowifi.idle_keepalive);
+    }
+
+    #[test]
+    fn vowifi_idle_keepalive_rejects_a_non_boolean() {
+        let err = try_parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nidle_keepalive = \"yes\"\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("idle_keepalive"), "{err}");
+    }
+
+    #[test]
+    fn vowifi_idle_keepalive_is_not_a_per_line_key() {
+        // Per deployment only: under a line entry it is an unknown key.
+        let err = try_parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\n[[vowifi.line]]\nmodem_serial = \"ABC123\"\nidle_keepalive = true\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("idle_keepalive"), "{err}");
+    }
+
+    #[test]
+    fn vowifi_keepalive_interval_is_range_checked_even_with_the_keepalive_off() {
+        let err = try_parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\nkeepalive_interval_sec = 0\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("vowifi.keepalive_interval_sec"), "{err}");
     }
 
     #[test]
