@@ -26,12 +26,12 @@ None: the setting and the classification are independent.
 
 **Goal**: [contracts/config.md](contracts/config.md). **Independent test**: config and render unit tests; the rendered connection differs only in `dpd_delay`.
 
-- [ ] T002 [US2] Tests first in `config/mod.rs` `mod tests`: default 120; explicit `300`; `0` accepted; `9`, `3601`, `-1`, `"120"` rejected with `vowifi.dpd_delay_sec` in the error; not a per-line key.
-- [ ] T003 [US2] Add `dpd_delay_sec: u64` to `RawVowifi` (`config/raw.rs`, default 120) and `VowifiConfig` (`config/mod.rs`, doc comment per contract), validate in `build_vowifi` (`config/build.rs`): `0` or `10..=3600`, error `vowifi.dpd_delay_sec must be 0 or between 10 and 3600 (got N)`.
-- [ ] T004 [P] [US2] Export `DPD_DELAY_SEC` in `commands/config.rs` beside `IDLE_KEEPALIVE`; extend its test if the export list is asserted.
-- [ ] T005 [US2] Tests first in `supervise/render.rs`: `@DPD_DELAY@` renders `120s` and `0s`; then add `dpd_delay_sec: u64` to `SwanctlEpdgParams` and the substitution. Replace `dpd_delay = 30s` with `dpd_delay = @DPD_DELAY@` in `docker/strongswan/swanctl-epdg.conf.template`, updating its comment (#120 finding 2, R1/R2). Update every `SwanctlEpdgParams` construction (`supervise/orchestrate.rs`, `commands/discover.rs`, render tests) and accept the snapshot change (`dpd_delay = 120s`) after checking it is the only diff.
-- [ ] T006 [US2] Startup log in `supervise/orchestrate.rs` (strongSwan and swu wording per contract), once per deployment, next to the idle-keepalive line. Test via the existing startup-log test seam if one exists; otherwise a small pure `dpd_startup_line(engine, secs) -> String` with a unit test.
-- [ ] T007 [US2] `make format lint test`; commit `feat(vowifi): [vowifi].dpd_delay_sec, default 120s like a handset (#120)`.
+- [X] T002 [US2] Tests first in `config/mod.rs` `mod tests`: default 120; explicit `300`; `0` accepted; `9`, `3601`, `-1`, `"120"` rejected with `vowifi.dpd_delay_sec` in the error; not a per-line key.
+- [X] T003 [US2] Add `dpd_delay_sec: u64` to `RawVowifi` (`config/raw.rs`, default 120) and `VowifiConfig` (`config/mod.rs`, doc comment per contract), validate in `build_vowifi` (`config/build.rs`): `0` or `10..=3600`, error `vowifi.dpd_delay_sec must be 0 or between 10 and 3600 (got N)`.
+- [X] T004 [P] [US2] Export `DPD_DELAY_SEC` in `commands/config.rs` beside `IDLE_KEEPALIVE`; extend its test if the export list is asserted.
+- [X] T005 [US2] Tests first in `supervise/render.rs`: `@DPD_DELAY@` renders `120s` and `0s`; then add `dpd_delay_sec: u64` to `SwanctlEpdgParams` and the substitution. Replace `dpd_delay = 30s` with `dpd_delay = @DPD_DELAY@` in `docker/strongswan/swanctl-epdg.conf.template`, updating its comment (#120 finding 2, R1/R2). Update every `SwanctlEpdgParams` construction (`supervise/orchestrate.rs`, `commands/discover.rs`, render tests) and accept the snapshot change (`dpd_delay = 120s`) after checking it is the only diff.
+- [X] T006 [US2] Startup log in `supervise/orchestrate.rs` (strongSwan and swu wording per contract), once per deployment, next to the idle-keepalive line. Test via the existing startup-log test seam if one exists; otherwise a small pure `dpd_startup_line(engine, secs) -> String` with a unit test.
+- [X] T007 [US2] `make format lint test`; commit `feat(vowifi): [vowifi].dpd_delay_sec, default 120s like a handset (#120)`.
 
 ## Phase 4: User Story 3 — classify false vs real dead peers (P2, code)
 

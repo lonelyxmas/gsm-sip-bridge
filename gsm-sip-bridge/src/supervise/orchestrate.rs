@@ -230,6 +230,12 @@ fn start_vowifi_subsystem(
             idle_keepalive_log_line(&config.vowifi)
         ),
     }
+    // Also once per run (specs/098 contracts/config.md).
+    tracing::info!(
+        dpd_delay_sec = config.vowifi.dpd_delay_sec,
+        "{}",
+        dpd_log_line(&config.vowifi)
+    );
 
     // Note: the swu-on-slim payload check is NOT here — it is an image
     // property, not a line-table one, so `run` performs it before discovery
@@ -1548,6 +1554,7 @@ pub(super) fn establish_line_tunnel(
         updown_script: &updown_path,
         src_addr: src_addr.as_deref(),
         address_family,
+        dpd_delay_sec: config.vowifi.dpd_delay_sec,
     };
     let swanctl_epdg = super::render::render_swanctl_epdg(&epdg_template, &params);
     let _ = runner.write_file(
@@ -2824,6 +2831,18 @@ fn idle_keepalive_log_line(v: &crate::config::VowifiConfig) -> String {
     }
 }
 
+/// The startup line naming the DPD delay every strongSwan line renders, or
+/// saying it is ignored on swu (specs/098 FR-006).
+fn dpd_log_line(v: &crate::config::VowifiConfig) -> String {
+    match (v.tunnel_engine.as_str(), v.dpd_delay_sec) {
+        ("strongswan", 0) => "strongSwan DPD off ([vowifi].dpd_delay_sec = 0)".to_string(),
+        ("strongswan", secs) => {
+            format!("strongSwan DPD: dpd_delay = {secs}s ([vowifi].dpd_delay_sec)")
+        }
+        _ => "[vowifi].dpd_delay_sec ignored: the swu engine has no DPD setting".to_string(),
+    }
+}
+
 /// One idle-tunnel keepalive cycle (TCP connect, not ICMP — operators filter
 /// ICMP over the tunnel): if the line has a P-CSCF, connect to its SIP port
 /// from inside the line's namespace and discard the result.
@@ -3116,6 +3135,31 @@ mod tests {
             idle_keepalive_log_line(&on),
             "idle-tunnel keepalive on: TCP connect to each line's P-CSCF :5060 every 30s \
              ([vowifi].idle_keepalive = true)"
+        );
+    }
+
+    #[test]
+    fn the_startup_dpd_line_names_the_delay_or_says_it_is_ignored() {
+        let default = crate::config::VowifiConfig::default();
+        assert_eq!(
+            dpd_log_line(&default),
+            "strongSwan DPD: dpd_delay = 120s ([vowifi].dpd_delay_sec)"
+        );
+        let off = crate::config::VowifiConfig {
+            dpd_delay_sec: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            dpd_log_line(&off),
+            "strongSwan DPD off ([vowifi].dpd_delay_sec = 0)"
+        );
+        let swu = crate::config::VowifiConfig {
+            tunnel_engine: "swu".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            dpd_log_line(&swu),
+            "[vowifi].dpd_delay_sec ignored: the swu engine has no DPD setting"
         );
     }
 

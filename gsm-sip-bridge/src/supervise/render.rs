@@ -130,6 +130,9 @@ pub struct SwanctlEpdgParams<'a> {
     /// `@VIPS@` and `@REMOTE_TS@`. `Dual` renders what every line did
     /// before the setting existed.
     pub address_family: TunnelAddressFamily,
+    /// `[vowifi].dpd_delay_sec`: supplies `@DPD_DELAY@` as `<N>s`, where `0s`
+    /// turns charon-initiated DPD off (specs/098).
+    pub dpd_delay_sec: u64,
 }
 
 /// Renders the per-line ePDG `swanctl.conf` connection block by substituting
@@ -148,7 +151,8 @@ pub fn render_swanctl_epdg(template: &str, params: &SwanctlEpdgParams<'_>) -> St
         .replace("@IF_ID@", params.if_id)
         .replace("@UPDOWN@", params.updown_script)
         .replace("@VIPS@", params.address_family.vips())
-        .replace("@REMOTE_TS@", params.address_family.remote_ts());
+        .replace("@REMOTE_TS@", params.address_family.remote_ts())
+        .replace("@DPD_DELAY@", &format!("{}s", params.dpd_delay_sec));
 
     rendered = match params.src_addr {
         Some(addr) => rendered.replace("@SRC_ADDR@", addr),
@@ -300,6 +304,7 @@ connections {
             updown_script: "/etc/strongswan.d/ims-updown-1.sh",
             src_addr: None,
             address_family: TunnelAddressFamily::Dual,
+            dpd_delay_sec: 120,
         };
         let rendered = render_swanctl_epdg(EPDG_TEMPLATE, &params);
         assert!(
@@ -329,6 +334,7 @@ connections {
             updown_script: "/etc/strongswan.d/ims-updown-0.sh",
             src_addr: Some("192.168.1.50"),
             address_family: TunnelAddressFamily::Dual,
+            dpd_delay_sec: 120,
         };
         let rendered = render_swanctl_epdg(EPDG_TEMPLATE, &params);
         insta::assert_snapshot!(rendered);
@@ -361,6 +367,7 @@ after
             updown_script: "1",
             src_addr: None,
             address_family: TunnelAddressFamily::Dual,
+            dpd_delay_sec: 120,
         };
         let rendered = render_swanctl_epdg(template, &params);
         assert!(rendered.contains("optional; entrypoint deletes the local_addrs line"));
@@ -383,6 +390,7 @@ after
             updown_script: "/etc/strongswan.d/ims-updown-0.sh",
             src_addr: None,
             address_family: TunnelAddressFamily::Dual,
+            dpd_delay_sec: 120,
         };
         let rendered = render_swanctl_epdg(EPDG_TEMPLATE, &params);
         insta::assert_snapshot!(rendered);
@@ -416,6 +424,38 @@ after
             updown_script: "/etc/strongswan.d/ims-updown-0.sh",
             src_addr: None,
             address_family: TunnelAddressFamily::Dual,
+            // The value the template hard-coded before specs/098, so the
+            // baseline below stays the pre-092 render byte for byte.
+            dpd_delay_sec: 30,
+        }
+    }
+
+    #[test]
+    fn the_dpd_delay_changes_only_the_dpd_delay_line() {
+        // specs/098 FR-005: the setting reaches `dpd_delay` and nothing else.
+        let render = |secs| {
+            strip_comments(&render_swanctl_epdg(
+                REAL_EPDG_TEMPLATE,
+                &SwanctlEpdgParams {
+                    dpd_delay_sec: secs,
+                    ..real_template_params()
+                },
+            ))
+        };
+        for (secs, line) in [(120, "dpd_delay = 120s"), (0, "dpd_delay = 0s")] {
+            let rendered = render(secs);
+            let baseline = render(30);
+            let diff: Vec<(&str, &str)> = baseline
+                .lines()
+                .zip(rendered.lines())
+                .filter(|(a, b)| a != b)
+                .collect();
+            assert_eq!(baseline.lines().count(), rendered.lines().count());
+            assert_eq!(
+                diff,
+                vec![("        dpd_delay = 30s", &*format!("        {line}"))]
+            );
+            assert!(!rendered.contains("@DPD_DELAY@"));
         }
     }
 

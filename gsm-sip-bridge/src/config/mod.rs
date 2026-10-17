@@ -21,6 +21,9 @@ pub const DEFAULT_CONTROL_SOCKET: &str = "/tmp/gsm-sip-bridge.sock";
 /// (`reg_rejected_cooldown_sec`, specs/089 FR-010).
 pub const DEFAULT_REG_REJECTED_COOLDOWN_SEC: u64 = 1800;
 
+/// Default `[vowifi].dpd_delay_sec`: a handset's DPD timer (specs/098 R1).
+pub const DEFAULT_DPD_DELAY_SEC: u64 = 120;
+
 fn default_reg_rejected_cooldown_sec() -> u64 {
     DEFAULT_REG_REJECTED_COOLDOWN_SEC
 }
@@ -981,6 +984,15 @@ pub struct VowifiConfig {
     /// tunnel (confirmed on Vodafone India). Only applies when
     /// `idle_keepalive` is on; range-checked either way.
     pub keepalive_interval_sec: u64,
+    /// Seconds without anything received from the ePDG before charon sends a
+    /// DPD request on a strongSwan line; `0` turns charon-initiated DPD off
+    /// (the line still answers the ePDG's own). Rendered as each connection's
+    /// `dpd_delay`. 120 by default, the Android IWLAN default (specs/098 R1),
+    /// where it was a hard-coded 30s: with the supervisor's P-CSCF probe gone,
+    /// 30s DPD let one ignored request tear down a working tunnel (#120
+    /// finding 2). No effect while that probe runs, since its traffic keeps
+    /// DPD from ever firing. `0` or 10–3600.
+    pub dpd_delay_sec: u64,
     /// Name of the veth interface end in the container's default netns
     /// (Agent B's side). Derived per line, not a `[vowifi]` TOML key.
     pub veth_sip_iface: String,
@@ -1127,6 +1139,7 @@ impl Default for VowifiConfig {
             src_addr: None,
             idle_keepalive: false,
             keepalive_interval_sec: 30,
+            dpd_delay_sec: DEFAULT_DPD_DELAY_SEC,
             veth_sip_iface: "veth-sip".to_string(),
             veth_ims_iface: "veth-ims".to_string(),
             tunnel_engine: "strongswan".to_string(),
@@ -2300,6 +2313,49 @@ password = "pass"
         .unwrap_err()
         .to_string();
         assert!(err.contains("idle_keepalive"), "{err}");
+    }
+
+    #[test]
+    fn vowifi_dpd_delay_defaults_to_a_handsets_120s() {
+        // specs/098 R1: Android's IWLAN `KEY_DPD_TIMER_SEC_INT` default.
+        let cfg = parse(&format!("{MINIMAL_TOML}\n[vowifi]\n"));
+        assert_eq!(cfg.vowifi.dpd_delay_sec, 120);
+    }
+
+    #[test]
+    fn vowifi_dpd_delay_accepts_zero_and_the_range_ends() {
+        for secs in [0, 10, 300, 3600] {
+            let cfg = parse(&format!(
+                "{MINIMAL_TOML}\n[vowifi]\ndpd_delay_sec = {secs}\n"
+            ));
+            assert_eq!(cfg.vowifi.dpd_delay_sec, secs);
+        }
+    }
+
+    #[test]
+    fn vowifi_dpd_delay_rejects_values_outside_zero_or_10_to_3600() {
+        for bad in ["1", "9", "3601", "-1", "\"120\""] {
+            let err = try_parse(&format!(
+                "{MINIMAL_TOML}\n[vowifi]\ndpd_delay_sec = {bad}\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("dpd_delay_sec"), "{bad}: {err}");
+        }
+        let err = try_parse(&format!("{MINIMAL_TOML}\n[vowifi]\ndpd_delay_sec = 5\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("0 or between 10 and 3600"), "{err}");
+    }
+
+    #[test]
+    fn vowifi_dpd_delay_is_not_a_per_line_key() {
+        let err = try_parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\n[[vowifi.line]]\nmodem_serial = \"ABC123\"\ndpd_delay_sec = 60\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("dpd_delay_sec"), "{err}");
     }
 
     #[test]

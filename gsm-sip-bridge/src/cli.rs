@@ -319,6 +319,10 @@ pub enum RenderAsset {
         /// same as `dual`.
         #[arg(long, default_value = "dual")]
         address_family: crate::config::TunnelAddressFamily,
+        /// charon's `dpd_delay` in seconds, `0` for off (specs/098). Without
+        /// the flag, the `[vowifi].dpd_delay_sec` default.
+        #[arg(long, default_value_t = crate::config::DEFAULT_DPD_DELAY_SEC)]
+        dpd_delay_sec: u64,
     },
     /// This line's strongSwan updown wrapper (sets NETNS/STRONGSWAN_TUN_IFACE,
     /// execs the shared ims.updown script).
