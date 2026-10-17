@@ -62,10 +62,10 @@ Paths are relative to `gsm-sip-bridge/src/` unless stated otherwise. Before ever
 
 ## Phase 5: Live verification (spec Clarification Q2; [quickstart.md](quickstart.md))
 
-- [ ] T013 Vodafone rig (local, `test/`): build the branch image and recreate the container. Do the route delete (SC-001, SC-002, SC-007), then about 30 minutes of idle (SC-006).
-- [ ] T014 Jio Pi: build arm64 via `arm-build-200`, load it onto the Pi, back up the compose file, recreate the container. Do the route delete and the 30 minutes of idle.
-- [ ] T015 Vodafone rig: a forced-probe throwaway build on a scratch branch that is never pushed. Delete the route and expect a repair within one tick (SC-003). Then redeploy the real branch image.
-- [ ] T016 Write `specs/096-per-tick-route-check/live-verification.md`, with P-CSCF addresses redacted, and mark the tasks done. Commit: `docs(096): live verification on Vodafone and Jio (#120)`.
+- [X] T013 Vodafone rig (local, `test/`): build the branch image and recreate the container. Do the route delete (SC-001, SC-002, SC-007), then about 30 minutes of idle (SC-006).
+- [X] T014 Jio Pi: build arm64 via `arm-build-200`, load it onto the Pi, back up the compose file, recreate the container. Do the route delete and the 30 minutes of idle.
+- [X] T015 Vodafone rig: a forced-probe throwaway build on a scratch branch that is never pushed. Delete the route and expect a repair within one tick (SC-003). Then redeploy the real branch image.
+- [X] T016 Write `specs/096-per-tick-route-check/live-verification.md`, with P-CSCF addresses redacted, and mark the tasks done. Commit: `docs(096): live verification on Vodafone and Jio (#120)`.
 
 ## Dependencies
 
