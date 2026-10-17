@@ -19,7 +19,7 @@ Produced by `engines::inbound_esp(sas_output, conn_name) -> Option<InboundEsp>`;
 
 | Field | Type | Set | Cleared |
 |---|---|---|---|
-| `inbound` | `Option<(Instant, InboundEsp)>` | every tick whose health is `Ok` and the engine reported a snapshot | process restart / `ViciBroken` / `TunVanished` (stale across a respawn) |
+| `inbound` | `Option<(Instant, InboundEsp)>` | every tick whose health is `Ok` and the engine reported a snapshot | every other tick (process died, any structural fault, `IkeSaMissing`) |
 | `dead_peer` | `Option<DeadPeerClassification>` | the tick that returns `Recovered{IkeSaLost}` with cause `DeadPeer` | start of every tick |
 
 ## `DeadPeerClassification`
@@ -33,7 +33,7 @@ Produced by `engines::inbound_esp(sas_output, conn_name) -> Option<InboundEsp>`;
 
 ## Wire: `DeadPeerVerdict`
 
-`snake_case`: `"false"`, `"real"`, `"unknown"`. Closed enum; `as_str` gives the metric label.
+`control::protocol::DeadPeerVerdict`, re-exported by `line_supervisor`. `snake_case`: `"false"`, `"real"`, `"unknown"`. Closed enum; `as_str` gives the metric label.
 
 ## State transitions
 

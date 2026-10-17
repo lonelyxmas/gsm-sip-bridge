@@ -136,6 +136,35 @@ impl std::fmt::Display for IkeSaLossCause {
     }
 }
 
+/// Whether a dead-peer IKE_SA loss happened while the ePDG was demonstrably
+/// alive (specs/098 FR-008), judged by the line supervisor from inbound ESP.
+/// Closed: it is a metric label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeadPeerVerdict {
+    /// Inbound ESP arrived while charon was retransmitting: the ePDG ignored
+    /// an IKE request on a working tunnel (#120 finding 2).
+    False,
+    /// Nothing arrived after the first unanswered request could have gone out.
+    Real,
+    /// No snapshot, or one that cannot place the last inbound packet on either
+    /// side of the window.
+    Unknown,
+}
+
+impl DeadPeerVerdict {
+    pub const ALL: [Self; 3] = [Self::False, Self::Real, Self::Unknown];
+
+    /// The wire and metric label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::False => "false",
+            Self::Real => "real",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Why the line supervisor recovered a strongSwan VoWiFi line on a steady-state
 /// tick (specs/096). Mirrors `supervise::line_supervisor::DegradeReason`
 /// one-to-one without depending on it, the same layering `CallStatus` and
@@ -335,6 +364,10 @@ pub enum ObservedEvent {
         /// saw *after* this time (specs/097, Greptile PR #137).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rebuilt_at_unix: Option<u64>,
+        /// The verdict on a dead-peer `IkeSaLost` (specs/098); `None`, and
+        /// absent on the wire, for every other recovery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dead_peer: Option<DeadPeerVerdict>,
     },
 }
 
@@ -601,11 +634,40 @@ mod tests {
             reason: TunnelRecoveryReason::DefaultRouteMissing,
             pcscfs: Vec::new(),
             rebuilt_at_unix: None,
+            dead_peer: None,
         };
         assert_eq!(
             serde_json::to_string(&event).unwrap(),
             r#"{"event":"tunnel_recovered","reason":"default_route_missing"}"#
         );
+    }
+
+    #[test]
+    fn a_dead_peer_recovery_carries_its_verdict_and_old_payloads_still_parse() {
+        let json = r#"{"event":"tunnel_recovered","reason":"ike_sa_lost","dead_peer":"false"}"#;
+        let event = ObservedEvent::TunnelRecovered {
+            reason: TunnelRecoveryReason::IkeSaLost,
+            pcscfs: Vec::new(),
+            rebuilt_at_unix: None,
+            dead_peer: Some(DeadPeerVerdict::False),
+        };
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
+        assert_eq!(serde_json::from_str::<ObservedEvent>(json).unwrap(), event);
+        let old: ObservedEvent =
+            serde_json::from_str(r#"{"event":"tunnel_recovered","reason":"ike_sa_lost"}"#).unwrap();
+        assert!(matches!(
+            old,
+            ObservedEvent::TunnelRecovered {
+                dead_peer: None,
+                ..
+            }
+        ));
+        for v in DeadPeerVerdict::ALL {
+            assert_eq!(
+                serde_json::to_string(&v).unwrap(),
+                format!("\"{}\"", v.as_str())
+            );
+        }
     }
 
     #[test]
@@ -615,6 +677,7 @@ mod tests {
             reason: TunnelRecoveryReason::PcscfPoolExhausted,
             pcscfs: vec!["10.0.0.11".into()],
             rebuilt_at_unix: Some(1_790_000_000),
+            dead_peer: None,
         };
         assert_eq!(serde_json::to_string(&event).unwrap(), json);
         let back: ObservedEvent = serde_json::from_str(json).unwrap();
@@ -629,6 +692,7 @@ mod tests {
                 reason: TunnelRecoveryReason::PcscfUnreachable,
                 pcscfs: Vec::new(),
                 rebuilt_at_unix: None,
+                dead_peer: None,
             }
         );
     }

@@ -29,10 +29,11 @@
 - **Decision**: use the last-use time, not counter deltas.
   - A counter delta needs a snapshot from before the window starts, and the CHILD_SA can be rekeyed in between, resetting the counters. The last-use time needs only the latest snapshot.
   - Over **all** of the connection's listed CHILD_SAs (the minimum age), so a rekey's old and new SAs are both looked at (spec edge case).
-- **Snapshot**: on every structurally healthy tick, the supervisor stores `(S = now, L = S − min age)`, with `L = None` when no SA has received anything. Packets (summed) are kept for the log line.
+- **Snapshot**: on every structurally healthy tick, the supervisor stores `(S = now, L = S − min age)`, with `L = None` when no SA has received anything. Every other tick drops it. Packets (summed) are kept for the log line.
 - **Rule**: let `T` be the tick that sees the IKE_SA gone with cause `DeadPeer`, and `G = DPD_GIVE_UP_WINDOW`. charon gave up somewhere in `(S, T]`, so the first unanswered request went out at `t0 ∈ (S − G, T − G]`.
   - **false** if `L > T − G`: inbound ESP arrived after the latest possible `t0`, i.e. while charon was retransmitting.
-  - **real** if `L ≤ S − G`, or `L = None`: nothing arrived after the earliest possible `t0`.
+  - **real** if `L ≤ S − G`: nothing arrived after the earliest possible `t0`.
+  - `L = None` (no listed SA has received anything) is **unknown**, not real: a CHILD_SA rekeyed moments before the snapshot shows the same, and a really dead peer cannot have completed that rekey, so its SA would still carry a last-use age. (Changed from the first draft during implementation.)
   - **unknown** otherwise (the band in between), or with no snapshot at all (supervisor restarted, structural fault in the preceding ticks).
 - **Why it separates cleanly at the default**: charon only sends DPD after `dpd_delay` of silence, so for a really dead peer `L ≤ t0 − dpd_delay ≤ T − G − dpd_delay`, well under `S − G` when `dpd_delay` (120s) exceeds the 30s tick. For run C's false teardown the agent's `OPTIONS` is answered every 120s, so at least one inbound packet lands inside the ≥135s of the window that precedes `S`.
 - **Alternatives**:
@@ -41,7 +42,7 @@
 
 ## R5. Where the verdict travels
 
-- **Decision**: a `dead_peer: Option<DeadPeerVerdict>` field on `SteadyTracking`, set by the tick only when it returns `Recovered{IkeSaLost}` with cause `DeadPeer` and cleared at the start of every tick, the same pattern as `pool_exhausted` (specs/097). The orchestrator logs it and puts it on the existing `TunnelRecovered` event as an optional `dead_peer` field, skipped on the wire when `None`, so every other event keeps the shape specs 096/097 shipped.
+- **Decision**: one `DeadPeerVerdict` enum, defined in `control::protocol` (it is a wire and metric label) and re-exported by `line_supervisor`. A `dead_peer: Option<DeadPeerClassification>` field on `SteadyTracking`, set by the tick only when it returns `Recovered{IkeSaLost}` with cause `DeadPeer` and cleared at the start of every tick, the same pattern as `pool_exhausted` (specs/097). The orchestrator logs it and puts it on the existing `TunnelRecovered` event as an optional `dead_peer` field, skipped on the wire when `None`, so every other event keeps the shape specs 096/097 shipped.
 - **Metric**: a new counter `gsm_sip_bridge_vowifi_dead_peer_losses_total{module, verdict}`, verdict ∈ `false`, `real`, `unknown`, counted in ingest from the event. An event, not a total, so a supervisor restart cannot rewind it (FR-009), as for `tunnel_recoveries_total`.
 - **Alternatives**: a new field on `SteadyOutcome::Recovered`. Rejected: ~40 test constructions change for a value only one branch sets.
 - No alert (Clarification Q2).

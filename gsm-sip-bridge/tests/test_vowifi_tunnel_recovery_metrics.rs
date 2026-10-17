@@ -6,7 +6,7 @@
 // `supervise::orchestrate`'s strongSwan steady loop uses.
 
 use gsm_sip_bridge::control::protocol::{
-    AgentKind, AgentState, ObservedEvent, TunnelRecoveryReason,
+    AgentKind, AgentState, DeadPeerVerdict, ObservedEvent, TunnelRecoveryReason,
 };
 use gsm_sip_bridge::control::server::start_control_server;
 use gsm_sip_bridge::metrics;
@@ -33,6 +33,21 @@ fn recoveries(module_id: &str, reason: TunnelRecoveryReason) -> f64 {
         .get()
 }
 
+fn dead_peer_losses(module_id: &str, verdict: DeadPeerVerdict) -> f64 {
+    metrics::VOWIFI_DEAD_PEER_LOSSES_TOTAL
+        .with_label_values(&[module_id, verdict.as_str()])
+        .get()
+}
+
+fn lost(verdict: DeadPeerVerdict) -> ObservedEvent {
+    ObservedEvent::TunnelRecovered {
+        reason: TunnelRecoveryReason::IkeSaLost,
+        pcscfs: Vec::new(),
+        rebuilt_at_unix: None,
+        dead_peer: Some(verdict),
+    }
+}
+
 fn tunnel_state() -> AgentState {
     AgentState {
         child_sa_up: Some(true),
@@ -46,6 +61,7 @@ fn recovered(reason: TunnelRecoveryReason) -> ObservedEvent {
         reason,
         pcscfs: Vec::new(),
         rebuilt_at_unix: None,
+        dead_peer: None,
     }
 }
 
@@ -113,6 +129,51 @@ async fn supervisor_recoveries_are_counted_per_reason_and_never_rewind() {
     )
     .await;
     assert_eq!(recoveries(module, PcscfUnreachable), 1.0);
+
+    let _ = shutdown_tx.send(true);
+    handle.abort();
+}
+
+/// specs/098 US3: a dead-peer loss is counted by verdict, through the same
+/// reporter -> socket -> registry path, and still counts as a recovery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dead_peer_losses_are_counted_by_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir
+        .path()
+        .join("dead-peer-test.sock")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = start_control_server(&socket_path, cmd_tx, shutdown_rx).await;
+
+    let module = "test-dead-peer";
+    let reporter = Reporter::spawn(
+        socket_path.clone(),
+        AgentKind::Supervisor,
+        module.to_string(),
+        Duration::from_millis(50),
+    );
+    reporter.report(
+        tunnel_state(),
+        vec![
+            lost(DeadPeerVerdict::False),
+            lost(DeadPeerVerdict::Real),
+            recovered(TunnelRecoveryReason::IkeSaLost),
+        ],
+    );
+    wait_for(
+        || recoveries(module, TunnelRecoveryReason::IkeSaLost) == 3.0,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(dead_peer_losses(module, DeadPeerVerdict::False), 1.0);
+    assert_eq!(dead_peer_losses(module, DeadPeerVerdict::Real), 1.0);
+    // A loss with no verdict (carrier DELETE, unknown cause) counts nowhere.
+    assert_eq!(dead_peer_losses(module, DeadPeerVerdict::Unknown), 0.0);
 
     let _ = shutdown_tx.send(true);
     handle.abort();

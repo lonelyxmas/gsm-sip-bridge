@@ -1657,6 +1657,7 @@ pub(super) fn establish_line_tunnel(
         // priming capture comes through here too; its line is a VoWiFi line
         // and carries the same `[vowifi]`-derived family.
         address_family,
+        last_inbound: Default::default(),
     };
     {
         // Greptile P1 (round 3, same design gap): the RwLock guard added for
@@ -1817,6 +1818,7 @@ fn start_vowifi_line_strongswan(
         shared: Arc::clone(ctx.shared_charon),
         max_establish_attempts: None,
         address_family: line.config.tunnel_address_family,
+        last_inbound: Default::default(),
     };
 
     let mut current_pool = engine.latest_pcscf_pool(runner.as_ref());
@@ -2001,11 +2003,15 @@ fn start_vowifi_line_strongswan(
                         )
                     );
                 }
+                if let Some(classification) = tracking.dead_peer {
+                    println!("{}", dead_peer_detail(idx, &classification));
+                }
                 send_tunnel(
                     signal,
                     vec![tunnel_recovered_event(
                         reason,
                         &tracking.pool_exhausted,
+                        tracking.dead_peer.map(|c| c.verdict),
                         SystemTime::now(),
                     )],
                 );
@@ -2412,10 +2418,12 @@ struct TunnelSignal {
 
 /// The event that counts one steady-state recovery of a line (specs/096),
 /// carrying, when the reason was an exhausted pool, the P-CSCFs and when the
-/// rebuild was issued (`now`), for the daemon's alert episode (specs/097).
+/// rebuild was issued (`now`), for the daemon's alert episode (specs/097), and,
+/// for a dead-peer loss, the supervisor's verdict on it (specs/098).
 fn tunnel_recovered_event(
     reason: line_supervisor::DegradeReason,
     exhausted: &[line_supervisor::ExhaustedMember],
+    dead_peer: Option<line_supervisor::DeadPeerVerdict>,
     now: SystemTime,
 ) -> crate::control::protocol::ObservedEvent {
     crate::control::protocol::ObservedEvent::TunnelRecovered {
@@ -2425,6 +2433,34 @@ fn tunnel_recovered_event(
             now.duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs())
         }),
+        dead_peer,
+    }
+}
+
+/// The verdict on a dead-peer loss and the inbound ESP it rests on, for the
+/// log (specs/098 contracts/dead-peer.md).
+fn dead_peer_detail(idx: u32, c: &line_supervisor::DeadPeerClassification) -> String {
+    let verdict = c.verdict.as_str();
+    let window = line_supervisor::DPD_GIVE_UP_WINDOW.as_secs();
+    match (c.snapshot_age, c.last_in_before_loss, c.packets) {
+        (None, _, _) => {
+            format!(
+                "[supervise] line {idx}: dead peer verdict: {verdict} (no inbound ESP snapshot)"
+            )
+        }
+        (Some(snap), None, packets) => format!(
+            "[supervise] line {idx}: dead peer verdict: {verdict} (no inbound ESP on any listed \
+             CHILD_SA, {} packets, snapshot {}s old; charon retransmits for {window}s)",
+            packets.unwrap_or(0),
+            snap.as_secs()
+        ),
+        (Some(snap), Some(before), packets) => format!(
+            "[supervise] line {idx}: dead peer verdict: {verdict} (inbound ESP {}s before the \
+             loss, {} packets, snapshot {}s old; charon retransmits for {window}s)",
+            before.as_secs(),
+            packets.unwrap_or(0),
+            snap.as_secs()
+        ),
     }
 }
 
@@ -4109,6 +4145,7 @@ mod tests {
             let event = tunnel_recovered_event(
                 line_supervisor::DegradeReason::DefaultRouteMissing,
                 &[],
+                None,
                 SystemTime::now(),
             );
             assert_eq!(
@@ -4117,7 +4154,49 @@ mod tests {
                     reason: TunnelRecoveryReason::DefaultRouteMissing,
                     pcscfs: Vec::new(),
                     rebuilt_at_unix: None,
+                    dead_peer: None,
                 }
+            );
+        }
+
+        #[test]
+        fn a_dead_peer_loss_carries_its_verdict_and_says_why() {
+            use crate::control::protocol::{DeadPeerVerdict, ObservedEvent, TunnelRecoveryReason};
+            let event = tunnel_recovered_event(
+                line_supervisor::DegradeReason::IkeSaLost,
+                &[],
+                Some(DeadPeerVerdict::False),
+                SystemTime::now(),
+            );
+            assert_eq!(
+                event,
+                ObservedEvent::TunnelRecovered {
+                    reason: TunnelRecoveryReason::IkeSaLost,
+                    pcscfs: Vec::new(),
+                    rebuilt_at_unix: None,
+                    dead_peer: Some(DeadPeerVerdict::False),
+                }
+            );
+            let c = line_supervisor::DeadPeerClassification {
+                verdict: DeadPeerVerdict::False,
+                snapshot_age: Some(Duration::from_secs(12)),
+                last_in_before_loss: Some(Duration::from_secs(42)),
+                packets: Some(1834),
+            };
+            assert_eq!(
+                dead_peer_detail(0, &c),
+                "[supervise] line 0: dead peer verdict: false (inbound ESP 42s before the loss, \
+                 1834 packets, snapshot 12s old; charon retransmits for 165s)"
+            );
+            let none = line_supervisor::DeadPeerClassification {
+                verdict: DeadPeerVerdict::Unknown,
+                snapshot_age: None,
+                last_in_before_loss: None,
+                packets: None,
+            };
+            assert_eq!(
+                dead_peer_detail(1, &none),
+                "[supervise] line 1: dead peer verdict: unknown (no inbound ESP snapshot)"
             );
         }
 
@@ -4133,6 +4212,7 @@ mod tests {
             let event = tunnel_recovered_event(
                 line_supervisor::DegradeReason::PcscfPoolExhausted,
                 &members,
+                None,
                 std::time::UNIX_EPOCH + Duration::from_secs(1_790_000_400),
             );
             assert_eq!(
@@ -4141,6 +4221,7 @@ mod tests {
                     reason: TunnelRecoveryReason::PcscfPoolExhausted,
                     pcscfs: vec!["10.0.0.11".into()],
                     rebuilt_at_unix: Some(1_790_000_400),
+                    dead_peer: None,
                 }
             );
             let detail = pool_exhausted_detail(

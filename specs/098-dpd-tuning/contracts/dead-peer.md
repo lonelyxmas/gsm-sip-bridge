@@ -7,7 +7,7 @@
 | Condition | Verdict |
 |---|---|
 | no snapshot | `unknown` |
-| `L` is `None` (nothing ever received on the listed SAs) | `real` |
+| `L` is `None` (no listed SA has received anything, e.g. a CHILD_SA rekeyed moments earlier) | `unknown` |
 | `L > T − G` | `false` |
 | `L ≤ S − G` | `real` |
 | otherwise | `unknown` |
@@ -17,11 +17,11 @@ Applied only when the cause is `DeadPeer`. `CarrierDelete`, `Unknown` and every 
 ## Log line (strongSwan loop)
 
 ```text
-[supervise] line 0: recovered from IkeSaLost (cause: dead_peer)
+[supervise] line 0: recovered from IkeSaLost (cause: dead-peer timeout)
 [supervise] line 0: dead peer verdict: false (inbound ESP 42s before the loss, 1834 packets, snapshot 12s old; charon retransmits for 165s)
 ```
 
-`unknown` with no snapshot: `dead peer verdict: unknown (no inbound ESP snapshot)`.
+`unknown` with no snapshot: `dead peer verdict: unknown (no inbound ESP snapshot)`; with no inbound use on any listed SA: `dead peer verdict: unknown (no inbound ESP on any listed CHILD_SA, 0 packets, snapshot 12s old; …)`.
 
 ## Wire
 
