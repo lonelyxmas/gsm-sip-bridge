@@ -57,6 +57,7 @@ async fn pool_exhausted_rebuilds_are_counted_under_their_own_reason() {
     let rebuild = || ObservedEvent::TunnelRecovered {
         reason: TunnelRecoveryReason::PcscfPoolExhausted,
         pcscfs: vec!["2001:db8::11".to_string()],
+        rebuilt_at_unix: Some(1_790_000_000),
     };
     let state = AgentState {
         child_sa_up: Some(true),

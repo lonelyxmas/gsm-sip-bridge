@@ -20,8 +20,8 @@ The change has four parts.
 
 **4. Alert.** A new `pcscf_pool_exhausted` Discord category, `[alerts.pcscf_pool_exhausted]`, is enabled by default with a 300s threshold. Its episode is tracked on the supervisor's ingest record:
 - **Start:** the first `TunnelRecovered{PcscfPoolExhausted}` starts the episode.
-- **Each further rebuild:** bumps the rebuild count, keeps the addresses for the alert text, and notes which IMS-agent reporter epoch was live at that moment.
-- **End:** a `registered = true` report from an IMS-agent process with a different epoch, i.e. one started after the latest rebuild, ends the episode.
+- **Each further rebuild:** bumps the rebuild count, keeps the addresses for the alert text, and records when the supervisor issued it (carried on the event).
+- **End:** a `registered = true` report from an IMS agent the daemon first saw after the latest rebuild ends the episode.
 - **Decision:** the existing `decide_transition` and `record_alert_outcome` handle the threshold, the one-shot failure, suppression and the all-clear.
 
 ## Technical Context

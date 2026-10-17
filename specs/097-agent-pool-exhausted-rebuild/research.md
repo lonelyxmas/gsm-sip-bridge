@@ -38,11 +38,13 @@
   - `pool_exhausted_since: Option<Instant>`
   - `pool_exhausted_alert_phase: AlertPhase`
   - `pool_exhausted_rebuilds: u32`
-  - `pool_exhausted_stale_ims_epoch: Option<u64>`
+  - `pool_exhausted_rebuilt_at_unix: Option<u64>`
+  - plus a frozen `generation` and an `ended` flag for a `Failure` still in flight
 
   The address list lives in a small side map keyed by module id, used only for the alert text, because `AgentRecord` is `Copy` and a `Vec` would break that.
-- **Rationale**: the daemon is the only place that sees both signals. The supervisor reports the rebuilds, and the IMS agent reports `registered`. The supervisor heartbeats its record every report interval, so the threshold is evaluated without a timer. Using `decide_transition` and `record_alert_outcome` unchanged gives the same Pending, Alerted and all-clear semantics as `gm_connection_lost`.
-- **Ending the episode**: the IMS agent's reporter epoch is random per process start. At every exhaustion rebuild, the epoch of the IMS record live at that moment is noted as stale. A `registered = Some(true)` report from any other epoch ends the episode. The pre-rebuild agent can still heartbeat `registered = true` while it is being replaced, but only a process started after the latest rebuild can end the episode.
+- **Rationale**: the daemon is the only place that sees both signals. The supervisor reports the rebuilds, and the IMS agent reports `registered`. The supervisor heartbeats its record every report interval, so the threshold is evaluated without a timer. `decide_transition` gives the threshold, suppression and all-clear. The outcome callback matches on a generation frozen at the `Failure` decision, as the folded tunnel alert does. That way an episode that ends while its notice is still in flight still gets its all-clear, and the phase is freed. Matching on the live episode start, which the registration clears, would leave the phase `Pending` for good (Greptile PR #137).
+- **Ending the episode**: the IMS agent's reporter epoch is random per process start, and the daemon records when it first saw each epoch. The rebuild event carries the time the supervisor issued it (`rebuilt_at_unix`). A `registered = Some(true)` report from an agent first seen after the latest rebuild ends the episode. The pre-rebuild agent can still heartbeat `registered = true` while it is being replaced, but it was first seen before the rebuild, so it never ends the episode.
+  - The time comes with the event, not from its arrival. Both reporters queue behind an unreachable daemon and flush in either order. An earlier version noted the epoch live when the rebuild *report arrived*, so a late report could stamp the replacement as stale and leave the episode open for ever (Greptile PR #137).
 - **Alternatives**:
   - Track the episode in the supervisor. Rejected: the supervisor cannot see registration.
   - End on any `registered = true`. Rejected: the stale heartbeat would end every episode at once.

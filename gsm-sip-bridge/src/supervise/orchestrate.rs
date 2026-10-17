@@ -1996,7 +1996,11 @@ fn start_vowifi_line_strongswan(
                 }
                 send_tunnel(
                     signal,
-                    vec![tunnel_recovered_event(reason, &tracking.pool_exhausted)],
+                    vec![tunnel_recovered_event(
+                        reason,
+                        &tracking.pool_exhausted,
+                        SystemTime::now(),
+                    )],
                 );
                 if let Some(new_handle) = engine.shared.current_handle() {
                     let mut st = started.lock().unwrap();
@@ -2400,14 +2404,20 @@ struct TunnelSignal {
 }
 
 /// The event that counts one steady-state recovery of a line (specs/096),
-/// carrying the exhausted P-CSCFs when that was the reason (specs/097).
+/// carrying, when the reason was an exhausted pool, the P-CSCFs and when the
+/// rebuild was issued (`now`), for the daemon's alert episode (specs/097).
 fn tunnel_recovered_event(
     reason: line_supervisor::DegradeReason,
     exhausted: &[line_supervisor::ExhaustedMember],
+    now: SystemTime,
 ) -> crate::control::protocol::ObservedEvent {
     crate::control::protocol::ObservedEvent::TunnelRecovered {
         reason: reason.into(),
         pcscfs: exhausted.iter().map(|m| m.addr.clone()).collect(),
+        rebuilt_at_unix: (!exhausted.is_empty()).then(|| {
+            now.duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs())
+        }),
     }
 }
 
@@ -4052,13 +4062,17 @@ mod tests {
         #[test]
         fn a_recovery_is_reported_as_a_counted_event_with_its_reason() {
             use crate::control::protocol::{ObservedEvent, TunnelRecoveryReason};
-            let event =
-                tunnel_recovered_event(line_supervisor::DegradeReason::DefaultRouteMissing, &[]);
+            let event = tunnel_recovered_event(
+                line_supervisor::DegradeReason::DefaultRouteMissing,
+                &[],
+                SystemTime::now(),
+            );
             assert_eq!(
                 event,
                 ObservedEvent::TunnelRecovered {
                     reason: TunnelRecoveryReason::DefaultRouteMissing,
                     pcscfs: Vec::new(),
+                    rebuilt_at_unix: None,
                 }
             );
         }
@@ -4075,12 +4089,14 @@ mod tests {
             let event = tunnel_recovered_event(
                 line_supervisor::DegradeReason::PcscfPoolExhausted,
                 &members,
+                std::time::UNIX_EPOCH + Duration::from_secs(1_790_000_400),
             );
             assert_eq!(
                 event,
                 ObservedEvent::TunnelRecovered {
                     reason: TunnelRecoveryReason::PcscfPoolExhausted,
                     pcscfs: vec!["10.0.0.11".into()],
+                    rebuilt_at_unix: Some(1_790_000_400),
                 }
             );
             let detail = pool_exhausted_detail(

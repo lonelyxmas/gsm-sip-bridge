@@ -131,6 +131,11 @@ struct AgentRecord {
     registration_expires_at: Option<u64>,
     /// specs/097. Supervisor records only: the open pool-exhaustion episode.
     pool_exhausted: PoolExhaustion,
+    /// When the daemon first saw a report from this record's current `epoch`
+    /// (unix seconds): roughly when that agent process started. A
+    /// pool-exhaustion episode ends only on a registration from an agent first
+    /// seen after the rebuild (specs/097).
+    epoch_first_seen_unix: Option<u64>,
 }
 
 /// One line's pool-exhaustion episode (specs/097 data-model.md): from its first
@@ -145,10 +150,17 @@ struct PoolExhaustion {
     phase: AlertPhase,
     /// Rebuilds reported in the open episode.
     rebuilds: u32,
-    /// The IMS agent's reporter epoch at the latest rebuild. That process is
-    /// being replaced: its `registered = true` heartbeats describe the old
-    /// tunnel, so only another epoch's can end the episode (research R5).
-    stale_ims_epoch: Option<u64>,
+    /// When the supervisor issued the latest rebuild (unix seconds, from the
+    /// event itself). The agent it replaced kept heartbeating
+    /// `registered = true`; only an agent first seen after this time can end
+    /// the episode, whatever order the two reports arrive in (research R5).
+    rebuilt_at_unix: Option<u64>,
+    /// The episode start a `Failure` was decided against, frozen so its
+    /// delivery callback still matches after the episode has ended.
+    generation: Option<Instant>,
+    /// The episode ended while that `Failure` was still being sent: the
+    /// callback owes the operator an all-clear (as [`FoldedTunnel::ended`]).
+    ended: bool,
 }
 
 impl Default for PoolExhaustion {
@@ -157,7 +169,36 @@ impl Default for PoolExhaustion {
             since: None,
             phase: AlertPhase::Idle,
             rebuilds: 0,
-            stale_ims_epoch: None,
+            rebuilt_at_unix: None,
+            generation: None,
+            ended: false,
+        }
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Ends `episode` for a registration from an agent first seen at
+/// `agent_first_seen`, unless that agent predates the latest rebuild.
+fn end_pool_exhaustion_if_replaced(episode: &mut PoolExhaustion, agent_first_seen: Option<u64>) {
+    if episode.since.is_none() {
+        return;
+    }
+    let replaced = match (episode.rebuilt_at_unix, agent_first_seen) {
+        (Some(rebuilt), Some(seen)) => seen > rebuilt,
+        // No rebuild time to compare against: any registration ends it.
+        (None, _) => true,
+        (Some(_), None) => false,
+    };
+    if replaced {
+        episode.since = None;
+        // A `Failure` still in flight is owed an all-clear by its callback.
+        if episode.phase == AlertPhase::Pending {
+            episode.ended = true;
         }
     }
 }
@@ -244,6 +285,11 @@ fn apply_report_with(
     let mut gm_connection_unhealthy_since = existing.and_then(|r| r.gm_connection_unhealthy_since);
     let mut registration_expires_at = existing.and_then(|r| r.registration_expires_at);
     let mut pool_exhausted = existing.map_or_else(PoolExhaustion::default, |r| r.pool_exhausted);
+    // A new epoch is a new agent process; its first report dates it.
+    let epoch_first_seen_unix = match existing {
+        Some(r) if r.last_applied.0 == report.epoch => r.epoch_first_seen_unix,
+        _ => Some(now_unix()),
+    };
     // (category, transition, generation) to dispatch once the lock is
     // released. `generation` is the `*_unhealthy_since` value this
     // particular transition was decided against — threaded through to
@@ -266,17 +312,12 @@ fn apply_report_with(
         );
 
         if report.agent == AgentKind::Supervisor {
-            let ims_epoch = guard
-                .get(&(AgentKind::Ims, module_id.to_string()))
-                .map(|r| r.last_applied.0);
-            note_pool_exhausted_rebuilds(&mut pool_exhausted, module_id, &report.events, ims_epoch);
+            note_pool_exhausted_rebuilds(&mut pool_exhausted, module_id, &report.events);
         } else if report.agent == AgentKind::Ims && report.state.registered == Some(true) {
             // The line registered: that ends its supervisor's episode, unless
-            // this is the agent the latest rebuild is replacing.
+            // this agent predates the latest rebuild.
             if let Some(sup) = guard.get_mut(&(AgentKind::Supervisor, module_id.to_string())) {
-                if sup.pool_exhausted.stale_ims_epoch != Some(report.epoch) {
-                    sup.pool_exhausted.since = None;
-                }
+                end_pool_exhaustion_if_replaced(&mut sup.pool_exhausted, epoch_first_seen_unix);
             }
         }
 
@@ -421,12 +462,20 @@ fn apply_report_with(
                     Duration::from_secs(cfg.pcscf_pool_exhausted_thresholds.unhealthy_sec);
                 match decide_transition(pool_exhausted.since, &mut pool_exhausted.phase, threshold)
                 {
-                    Transition::Event(kind) => pending_transitions.push((
-                        key.clone(),
-                        AlertCategory::PcscfPoolExhausted,
-                        kind,
-                        pool_exhausted.since,
-                    )),
+                    Transition::Event(kind) => {
+                        if kind == CriticalEventKind::Failure {
+                            pool_exhausted.generation = pool_exhausted.since;
+                            pool_exhausted.ended = false;
+                        } else {
+                            pool_exhausted.generation = None;
+                        }
+                        pending_transitions.push((
+                            key.clone(),
+                            AlertCategory::PcscfPoolExhausted,
+                            kind,
+                            pool_exhausted.generation,
+                        ))
+                    }
                     Transition::Suppressed => {
                         crate::alerts::record_suppressed(AlertCategory::PcscfPoolExhausted)
                     }
@@ -458,6 +507,7 @@ fn apply_report_with(
             gm_connection_alert_phase,
             registration_expires_at,
             pool_exhausted,
+            epoch_first_seen_unix,
         },
     );
     drop(guard);
@@ -466,18 +516,16 @@ fn apply_report_with(
 
 /// Opens or extends a line's pool-exhaustion episode for each
 /// `PcscfPoolExhausted` recovery in a supervisor report (specs/097).
-/// `ims_epoch` is the line's IMS agent as it stands, which that rebuild is
-/// about to replace.
 fn note_pool_exhausted_rebuilds(
     episode: &mut PoolExhaustion,
     module_id: &str,
     events: &[ObservedEvent],
-    ims_epoch: Option<u64>,
 ) {
     for event in events {
         let ObservedEvent::TunnelRecovered {
             reason: TunnelRecoveryReason::PcscfPoolExhausted,
             pcscfs,
+            rebuilt_at_unix,
         } = event
         else {
             continue;
@@ -487,7 +535,7 @@ fn note_pool_exhausted_rebuilds(
             episode.rebuilds = 0;
         }
         episode.rebuilds = episode.rebuilds.saturating_add(1);
-        episode.stale_ims_epoch = ims_epoch;
+        episode.rebuilt_at_unix = *rebuilt_at_unix;
         pool_exhausted_pcscfs()
             .lock()
             .unwrap()
@@ -832,6 +880,17 @@ fn build_alert(
 /// Completes a late all-clear started by [`record_alert_outcome`]: frees the
 /// phase so any outage that began meanwhile is decided fresh.
 fn finish_late_all_clear(key: &(AgentKind, String), category: AlertCategory) {
+    if category == AlertCategory::PcscfPoolExhausted {
+        let mut guard = liveness().lock().unwrap();
+        if let Some(e) = guard.get_mut(key).map(|r| &mut r.pool_exhausted) {
+            if e.phase == AlertPhase::Pending && e.ended {
+                e.phase = AlertPhase::Idle;
+                e.generation = None;
+                e.ended = false;
+            }
+        }
+        return;
+    }
     if category != AlertCategory::TunnelFailure {
         return;
     }
@@ -864,6 +923,9 @@ fn record_alert_outcome(
     let Some(record) = guard.get_mut(key) else {
         return false;
     };
+    if category == AlertCategory::PcscfPoolExhausted {
+        return record_pool_exhausted_outcome(&mut record.pool_exhausted, generation, success);
+    }
     let mut ended = None;
     let (phase, unhealthy_since) = match category {
         AlertCategory::RegistrationLoss => (
@@ -883,10 +945,6 @@ fn record_alert_outcome(
         AlertCategory::GmConnectionLost => (
             &mut record.gm_connection_alert_phase,
             record.gm_connection_unhealthy_since,
-        ),
-        AlertCategory::PcscfPoolExhausted => (
-            &mut record.pool_exhausted.phase,
-            record.pool_exhausted.since,
         ),
         _ => return false,
     };
@@ -910,6 +968,37 @@ fn record_alert_outcome(
         }
     }
     *phase = if success {
+        AlertPhase::Alerted
+    } else {
+        AlertPhase::Idle
+    };
+    false
+}
+
+/// [`record_alert_outcome`] for a pool-exhaustion `Failure`, matched on its
+/// frozen generation rather than the live episode start, which the line
+/// registering clears (Greptile PR #137). Returns true when the episode ended
+/// while the notice was in flight and it landed: the caller then owes the
+/// all-clear, and [`finish_late_all_clear`] frees the phase after sending it.
+fn record_pool_exhausted_outcome(
+    e: &mut PoolExhaustion,
+    generation: Instant,
+    success: bool,
+) -> bool {
+    if e.phase != AlertPhase::Pending || e.generation != Some(generation) {
+        return false;
+    }
+    if e.ended {
+        if success {
+            return true;
+        }
+        // Never delivered, so nothing to clear: decide afresh.
+        e.phase = AlertPhase::Idle;
+        e.generation = None;
+        e.ended = false;
+        return false;
+    }
+    e.phase = if success {
         AlertPhase::Alerted
     } else {
         AlertPhase::Idle
@@ -1720,6 +1809,7 @@ mod tests {
                 gm_connection_alert_phase: AlertPhase::Idle,
                 registration_expires_at: None,
                 pool_exhausted: PoolExhaustion::default(),
+                epoch_first_seen_unix: None,
             },
         );
         generation
@@ -1927,6 +2017,7 @@ mod tests {
                     gm_connection_alert_phase: AlertPhase::Idle,
                     registration_expires_at: None,
                     pool_exhausted: PoolExhaustion::default(),
+                    epoch_first_seen_unix: None,
                 },
             );
         }
@@ -1957,10 +2048,12 @@ mod tests {
 
     // --- specs/097: the pool-exhaustion episode -----------------------------
 
-    fn exhausted(addr: &str) -> ObservedEvent {
+    /// A rebuild the supervisor issued `ago` seconds before now.
+    fn exhausted(addr: &str, ago: u64) -> ObservedEvent {
         ObservedEvent::TunnelRecovered {
             reason: TunnelRecoveryReason::PcscfPoolExhausted,
             pcscfs: vec![addr.to_string()],
+            rebuilt_at_unix: Some(now_unix() - ago),
         }
     }
 
@@ -2006,6 +2099,13 @@ mod tests {
         );
     }
 
+    /// Makes the line's current IMS agent look `secs` older to the daemon.
+    fn age_ims_agent(m: &str, secs: u64) {
+        let mut guard = liveness().lock().unwrap();
+        let r = guard.get_mut(&(AgentKind::Ims, m.to_string())).unwrap();
+        r.epoch_first_seen_unix = r.epoch_first_seen_unix.map(|t| t - secs);
+    }
+
     fn pool_events(t: &[PendingTransition]) -> Vec<CriticalEventKind> {
         t.iter()
             .filter(|(_, c, _, _)| *c == AlertCategory::PcscfPoolExhausted)
@@ -2025,41 +2125,44 @@ mod tests {
         r.pool_exhausted.since = Some(Instant::now() - Duration::from_secs(secs));
     }
 
+    /// Opens an episode on `m` and takes it past the threshold, returning the
+    /// `Failure`'s generation with the send still in flight (`Pending`).
+    fn episode_alerting(cfg: &AlertsConfig, m: &str) -> Instant {
+        ims_report(cfg, m, 100, 1, true);
+        age_ims_agent(m, 1000);
+        sup_report(cfg, m, 1, vec![exhausted("10.0.0.11", 500)]);
+        backdate_episode(m, 301);
+        let t = sup_report(cfg, m, 2, vec![]);
+        assert_eq!(pool_events(&t), vec![CriticalEventKind::Failure]);
+        t[0].3.unwrap()
+    }
+
     #[test]
     fn a_long_exhaustion_alerts_once_and_all_clears_once_the_line_registers() {
         let m = "test-pool-exhausted-episode";
         let cfg = AlertsConfig::default();
-        ims_report(&cfg, m, 100, 1, true);
-        // The first rebuild opens the episode; nothing is due yet.
-        assert!(pool_events(&sup_report(&cfg, m, 1, vec![exhausted("10.0.0.11")])).is_empty());
+        let key = (AgentKind::Supervisor, m.to_string());
+        let generation = episode_alerting(&cfg, m);
         assert_eq!(episode(m).rebuilds, 1);
-        assert_eq!(episode(m).stale_ims_epoch, Some(100));
-
-        // Past the threshold: exactly one Failure.
-        backdate_episode(m, 301);
-        let t = sup_report(&cfg, m, 2, vec![]);
-        assert_eq!(pool_events(&t), vec![CriticalEventKind::Failure]);
-        let generation = t[0].3.unwrap();
-        record_alert_outcome(
-            &(AgentKind::Supervisor, m.to_string()),
+        assert!(!record_alert_outcome(
+            &key,
             AlertCategory::PcscfPoolExhausted,
             generation,
-            true,
-        );
+            true
+        ));
+        assert_eq!(episode(m).phase, AlertPhase::Alerted);
 
         // More rebuilds in the same episode count, but never alert again.
-        ims_report(&cfg, m, 200, 1, false);
         for seq in 3..6 {
-            let t = sup_report(&cfg, m, seq, vec![exhausted("10.0.0.11")]);
+            let t = sup_report(&cfg, m, seq, vec![exhausted("10.0.0.11", 400)]);
             assert!(pool_events(&t).is_empty());
         }
         assert_eq!(episode(m).rebuilds, 4);
-        assert_eq!(episode(m).stale_ims_epoch, Some(200));
 
         // The agent being replaced still heartbeats `registered`: not the end.
-        ims_report(&cfg, m, 200, 2, true);
+        ims_report(&cfg, m, 100, 2, true);
         assert!(episode(m).since.is_some());
-        // A new agent's registration is.
+        // An agent first seen after the latest rebuild registering is.
         ims_report(&cfg, m, 300, 1, true);
         assert_eq!(episode(m).since, None);
         assert_eq!(
@@ -2070,11 +2173,78 @@ mod tests {
     }
 
     #[test]
+    fn a_rebuild_report_that_arrives_after_the_replacement_registered_still_ends() {
+        // Greptile PR #137: both reporters queue behind an unreachable daemon
+        // and flush in either order. The replacement's registration lands
+        // first; the rebuild report, carrying its own time, lands after.
+        let m = "test-pool-exhausted-late-report";
+        let cfg = AlertsConfig::default();
+        ims_report(&cfg, m, 100, 1, true);
+        age_ims_agent(m, 1000);
+        ims_report(&cfg, m, 200, 1, true); // the replacement, already up
+        sup_report(&cfg, m, 1, vec![exhausted("10.0.0.11", 5)]);
+        assert!(episode(m).since.is_some(), "the rebuild did happen");
+        // Its next heartbeat is from an agent first seen after the rebuild.
+        ims_report(&cfg, m, 200, 2, true);
+        assert_eq!(episode(m).since, None);
+    }
+
+    #[test]
+    fn an_episode_that_ends_while_its_alert_is_in_flight_still_all_clears() {
+        // Greptile PR #137: the line registering mid-send used to leave the
+        // phase `Pending` forever, silencing every later alert for the line.
+        let m = "test-pool-exhausted-ended-in-flight";
+        let cfg = AlertsConfig::default();
+        let key = (AgentKind::Supervisor, m.to_string());
+        let generation = episode_alerting(&cfg, m);
+        ims_report(&cfg, m, 300, 1, true);
+        assert_eq!(episode(m).since, None);
+        assert!(episode(m).ended);
+        // The notice landed: the all-clear is owed, then the phase is freed.
+        assert!(record_alert_outcome(
+            &key,
+            AlertCategory::PcscfPoolExhausted,
+            generation,
+            true
+        ));
+        finish_late_all_clear(&key, AlertCategory::PcscfPoolExhausted);
+        assert_eq!(episode(m).phase, AlertPhase::Idle);
+        // And a later episode alerts again.
+        sup_report(&cfg, m, 3, vec![exhausted("10.0.0.11", 1)]);
+        backdate_episode(m, 301);
+        assert_eq!(
+            pool_events(&sup_report(&cfg, m, 4, vec![])),
+            vec![CriticalEventKind::Failure]
+        );
+    }
+
+    #[test]
+    fn an_undelivered_alert_for_an_ended_episode_is_simply_dropped() {
+        let m = "test-pool-exhausted-ended-undelivered";
+        let cfg = AlertsConfig::default();
+        let key = (AgentKind::Supervisor, m.to_string());
+        let generation = episode_alerting(&cfg, m);
+        ims_report(&cfg, m, 300, 1, true);
+        assert!(!record_alert_outcome(
+            &key,
+            AlertCategory::PcscfPoolExhausted,
+            generation,
+            false
+        ));
+        let e = episode(m);
+        assert_eq!(
+            (e.phase, e.ended, e.generation),
+            (AlertPhase::Idle, false, None)
+        );
+        assert!(pool_events(&sup_report(&cfg, m, 3, vec![])).is_empty());
+    }
+
+    #[test]
     fn a_short_exhaustion_never_alerts() {
         let m = "test-pool-exhausted-short";
         let cfg = AlertsConfig::default();
         ims_report(&cfg, m, 100, 1, false);
-        sup_report(&cfg, m, 1, vec![exhausted("10.0.0.11")]);
+        sup_report(&cfg, m, 1, vec![exhausted("10.0.0.11", 10)]);
         ims_report(&cfg, m, 101, 1, true);
         assert_eq!(episode(m).since, None);
         for seq in 2..4 {
@@ -2083,11 +2253,11 @@ mod tests {
     }
 
     #[test]
-    fn a_line_that_never_reported_an_agent_ends_on_any_registration() {
+    fn a_line_that_never_reported_an_agent_ends_on_its_first_registration() {
         let m = "test-pool-exhausted-no-agent";
         let cfg = AlertsConfig::default();
-        sup_report(&cfg, m, 1, vec![exhausted("2001:db8::1")]);
-        assert_eq!(episode(m).stale_ims_epoch, None);
+        sup_report(&cfg, m, 1, vec![exhausted("2001:db8::1", 10)]);
+        assert!(episode(m).since.is_some());
         ims_report(&cfg, m, 5, 1, true);
         assert_eq!(episode(m).since, None);
     }
@@ -2102,6 +2272,7 @@ mod tests {
             .map(|reason| ObservedEvent::TunnelRecovered {
                 reason,
                 pcscfs: Vec::new(),
+                rebuilt_at_unix: None,
             })
             .collect();
         sup_report(&cfg, m, 1, events);

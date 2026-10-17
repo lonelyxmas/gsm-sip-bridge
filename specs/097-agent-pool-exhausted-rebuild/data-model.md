@@ -43,7 +43,9 @@ Otherwise the result is `None`. Members are compared as parsed `IpAddr`, so `200
 
 ## Wire event (supervisor → daemon)
 
-`ObservedEvent::TunnelRecovered { reason, pcscfs }`, where `pcscfs: Vec<String>` is `#[serde(default, skip_serializing_if = "Vec::is_empty")]`. It is non-empty only for `PcscfPoolExhausted`, and every other reason keeps its existing wire shape.
+`ObservedEvent::TunnelRecovered { reason, pcscfs, rebuilt_at_unix }`. Both new fields are filled only for `PcscfPoolExhausted`; every other reason keeps its existing wire shape.
+- `pcscfs: Vec<String>` is `#[serde(default, skip_serializing_if = "Vec::is_empty")]`.
+- `rebuilt_at_unix: Option<u64>` is `#[serde(default, skip_serializing_if = "Option::is_none")]`.
 
 ## Alert episode (daemon, on the supervisor's `AgentRecord`)
 
@@ -52,7 +54,10 @@ Otherwise the result is `None`. Members are compared as parsed `IpAddr`, so `200
 | `pool_exhausted_since` | `Option<Instant>` | Set by the first `PcscfPoolExhausted` event; `None` once the episode ends. |
 | `pool_exhausted_alert_phase` | `AlertPhase` | As for every other category. |
 | `pool_exhausted_rebuilds` | u32 | Incremented by each event in the episode. |
-| `pool_exhausted_stale_ims_epoch` | `Option<u64>` | The IMS agent reporter epoch live at the latest rebuild. |
+| `pool_exhausted_rebuilt_at_unix` | `Option<u64>` | When the latest rebuild was issued, from the event. |
+| `pool_exhausted_generation` / `_ended` | `Option<Instant>` / bool | The `Failure` in flight, and whether its episode has already ended. |
+
+On every record, `epoch_first_seen_unix` records when the daemon first saw the record's current epoch.
 
 Side map `module_id → Vec<String>`: the latest event's `pcscfs`, used for the alert text.
 
@@ -60,10 +65,11 @@ State transitions:
 
 ```text
 Idle (since=None)
-  -- TunnelRecovered{PcscfPoolExhausted} --> Open(since=now, rebuilds=1, stale=current IMS epoch)
+  -- TunnelRecovered{PcscfPoolExhausted, rebuilt_at} --> Open(since=now, rebuilds=1, rebuilt_at)
 Open
-  -- another such event --> Open(rebuilds+1, stale=current IMS epoch)
-  -- IMS report registered=true, epoch != stale --> Idle (since=None)
+  -- another such event --> Open(rebuilds+1, rebuilt_at)
+  -- IMS report registered=true from an agent first seen after rebuilt_at --> Idle (since=None)
+     (if a Failure is still Pending: ended=true, and its callback sends the all-clear)
 decide_transition(since, phase, unhealthy_sec) on every supervisor report:
   since older than threshold, Idle phase -> Failure alert (Pending -> Alerted)
   since=None, Alerted -> Recovered alert

@@ -45,6 +45,7 @@ fn recovered(reason: TunnelRecoveryReason) -> ObservedEvent {
     ObservedEvent::TunnelRecovered {
         reason,
         pcscfs: Vec::new(),
+        rebuilt_at_unix: None,
     }
 }
 

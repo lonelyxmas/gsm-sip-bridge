@@ -146,7 +146,7 @@ Fixtures use synthetic addresses only (`10.0.0.x`, `192.0.2.x`, `2001:db8::x`).
   - **Other reasons:** `TunnelRecovered` with any other reason never starts an episode.
   - **Disabled:** with `enabled = false`, nothing is sent.
 - [X] T017 [US4] Implement in `metrics/ingest.rs`:
-  - **Record fields:** add `pool_exhausted_since`, `pool_exhausted_alert_phase`, `pool_exhausted_rebuilds` and `pool_exhausted_stale_ims_epoch` to `AgentRecord`.
+  - **Record fields:** add `pool_exhausted_since`, `pool_exhausted_alert_phase`, `pool_exhausted_rebuilds` and `pool_exhausted_rebuilt_at_unix` (plus a frozen generation and `ended`, after Greptile PR #137) to `AgentRecord`, and `epoch_first_seen_unix` to every record.
   - **Side map:** `module_id → Vec<String>`.
   - **Supervisor reports:** episode start and continue happen while the events are processed.
   - **IMS reports:** episode end is decided under the same lock, on the supervisor's record.

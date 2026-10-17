@@ -327,6 +327,14 @@ pub enum ObservedEvent {
         /// those keep the shape spec 096 shipped.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pcscfs: Vec<String>,
+        /// When the supervisor issued a `PcscfPoolExhausted` rebuild, in unix
+        /// seconds; `None` for every other reason. Carried rather than taken
+        /// from the report's arrival, because a report can queue behind an
+        /// unreachable daemon and land after the replacement agent's own: the
+        /// daemon ends the episode on a registration from an agent it first
+        /// saw *after* this time (specs/097, Greptile PR #137).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rebuilt_at_unix: Option<u64>,
     },
 }
 
@@ -592,6 +600,7 @@ mod tests {
         let event = ObservedEvent::TunnelRecovered {
             reason: TunnelRecoveryReason::DefaultRouteMissing,
             pcscfs: Vec::new(),
+            rebuilt_at_unix: None,
         };
         assert_eq!(
             serde_json::to_string(&event).unwrap(),
@@ -601,10 +610,11 @@ mod tests {
 
     #[test]
     fn a_pool_exhausted_recovery_carries_its_pcscfs() {
-        let json = r#"{"event":"tunnel_recovered","reason":"pcscf_pool_exhausted","pcscfs":["10.0.0.11"]}"#;
+        let json = r#"{"event":"tunnel_recovered","reason":"pcscf_pool_exhausted","pcscfs":["10.0.0.11"],"rebuilt_at_unix":1790000000}"#;
         let event = ObservedEvent::TunnelRecovered {
             reason: TunnelRecoveryReason::PcscfPoolExhausted,
             pcscfs: vec!["10.0.0.11".into()],
+            rebuilt_at_unix: Some(1_790_000_000),
         };
         assert_eq!(serde_json::to_string(&event).unwrap(), json);
         let back: ObservedEvent = serde_json::from_str(json).unwrap();
@@ -618,6 +628,7 @@ mod tests {
             ObservedEvent::TunnelRecovered {
                 reason: TunnelRecoveryReason::PcscfUnreachable,
                 pcscfs: Vec::new(),
+                rebuilt_at_unix: None,
             }
         );
     }

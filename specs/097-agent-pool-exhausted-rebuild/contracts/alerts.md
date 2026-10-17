@@ -18,8 +18,8 @@ This is a `RawUnhealthyCategory`, like `gm_connection_lost`. It has the same six
 ## Episode
 
 - **Start**: the first `TunnelRecovered{reason: pcscf_pool_exhausted}` from a line's supervisor.
-- **Continue**: each further such event increments the rebuild count, replaces the address list, and marks the IMS agent's current reporter epoch as stale.
-- **End**: an IMS agent report for the same module with `registered = true`, from a reporter epoch other than the stale one.
+- **Continue**: each further such event increments the rebuild count, replaces the address list, and records the event's `rebuilt_at_unix`.
+- **End**: an IMS agent report for the same module with `registered = true`, from an agent the daemon first saw after the latest `rebuilt_at_unix`. If a `Failure` is still being sent, its callback sends the all-clear.
 
 ## Messages
 
@@ -39,7 +39,7 @@ Phone number and instance come from the existing identity map (spec 034).
 ## Wire
 
 ```json
-{"event":"tunnel_recovered","reason":"pcscf_pool_exhausted","pcscfs":["10.0.0.11"]}
+{"event":"tunnel_recovered","reason":"pcscf_pool_exhausted","pcscfs":["10.0.0.11"],"rebuilt_at_unix":1790000000}
 ```
 
-Every other reason serializes as before, with no `pcscfs` key.
+Every other reason serializes as before, with neither key.
