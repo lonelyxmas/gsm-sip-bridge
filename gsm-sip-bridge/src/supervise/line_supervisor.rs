@@ -8,7 +8,8 @@
 
 use super::runner::CommandRunner;
 use crate::control::protocol::IkeSaLossCause;
-use std::time::Duration;
+use crate::ims::pcscf_files::PoolState;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Mirrors the current establish-time loop's `attempt`/`stuck_without_pcscf`
 /// locals and the steady-state loop's tracked P-CSCF.
@@ -87,6 +88,19 @@ pub enum DegradeReason {
     /// rebuild provably cannot fix it. The line's IMS agent is still restarted
     /// ([`recovery_restarts_agent`]), so a call in progress is dropped.
     DefaultRouteMissing,
+    /// The line's IMS agent has marked every P-CSCF in the pool unavailable
+    /// since the tunnel was last negotiated, so it has nowhere left to fail
+    /// over to (specs/097, #120 finding 4).
+    ///
+    /// The agent finds a dead P-CSCF on its own -- three unanswered Gm
+    /// keepalives, a REGISTER that times out -- and moves to a sibling. On a
+    /// carrier that advertises one P-CSCF (Vodafone IN) there is no sibling,
+    /// and only a new negotiation brings a new address. Without this, a line
+    /// whose only P-CSCF died stayed down until someone restarted it: in the
+    /// #120 probes-off soak it never recovered. The same remedy as
+    /// [`Self::PcscfUnreachable`], decided from the agent's own verdict instead
+    /// of a TCP probe of the unprotected port.
+    PcscfPoolExhausted,
 }
 
 /// The wire label for a recovery (specs/096). Exhaustive on purpose, with no
@@ -105,6 +119,7 @@ impl From<DegradeReason> for crate::control::protocol::TunnelRecoveryReason {
             DegradeReason::PcscfChanged => Self::PcscfChanged,
             DegradeReason::PcscfUnreachable => Self::PcscfUnreachable,
             DegradeReason::DefaultRouteMissing => Self::DefaultRouteMissing,
+            DegradeReason::PcscfPoolExhausted => Self::PcscfPoolExhausted,
         }
     }
 }
@@ -383,7 +398,7 @@ pub enum SteadyOutcome {
 /// Per-line state the steady-state loop carries between ticks. Owned by the
 /// loop (not the engine) so [`tick_steady_state`] stays a pure decision over
 /// its inputs.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SteadyTracking {
     /// The pool member that answered while the selection did not, on the last
     /// tick (specs/091 R9); `None` when the selection answered or nothing did.
@@ -402,6 +417,17 @@ pub struct SteadyTracking {
     pub rekey_stuck_deferral_logged: Option<u32>,
     /// The CHILD_SA whose missing `expires in` was logged (FR-011).
     pub lifetime_missing_logged: Option<u32>,
+    /// When the supervisor last let an agent start on a freshly negotiated
+    /// P-CSCF (specs/097 research R3). Only a mark set at or after it counts
+    /// towards exhaustion; `None` disables the check. Set by the caller, which
+    /// is the one that restarts the agent.
+    pub negotiated_at: Option<SystemTime>,
+    /// The members a `PcscfPoolExhausted` rebuild was decided on, for the
+    /// caller's log line and report. Empty after every other tick.
+    pub pool_exhausted: Vec<ExhaustedMember>,
+    /// Whether the current exhaustion's deferral for a call has been logged,
+    /// so it is said once rather than every tick (specs/097 FR-007).
+    pub pool_exhausted_deferral_logged: bool,
 }
 
 impl SteadyTracking {
@@ -501,6 +527,93 @@ impl RebuildWindow {
     }
 }
 
+/// One pool member the agent has given up on, as the exhaustion check saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExhaustedMember {
+    pub addr: String,
+    pub cause: String,
+    pub until_unix: u64,
+    pub marked_at_unix: u64,
+}
+
+/// The one mark cause that never counts: a `503` whose `Retry-After` asked
+/// for a pause is the P-CSCF managing its load, not failing (specs/097).
+const RETRY_AFTER_CAUSE: &str = "retry-after";
+
+fn unix_secs(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Whether the agent has given up on every P-CSCF this line was given since
+/// `negotiated_at`, and if so on what grounds (specs/097 FR-003).
+///
+/// The members are the supervisor's `pool`, or its single selection when it
+/// knows no pool. Each must carry a mark in the agent's `state` that has not
+/// ended, was set at or after `negotiated_at` (so a mark that outlived the
+/// rebuild it caused does not cause another), and is not `retry-after`.
+/// Anything missing -- no state file, no baseline, no members, an address that
+/// does not parse -- is "not exhausted": an unknown never rebuilds a tunnel.
+pub fn exhausted_pool(
+    pool: &[String],
+    current: &str,
+    state: Option<&PoolState>,
+    negotiated_at: Option<SystemTime>,
+    now: SystemTime,
+) -> Option<Vec<ExhaustedMember>> {
+    let state = state?;
+    let baseline = unix_secs(negotiated_at?);
+    let now = unix_secs(now);
+    let members: Vec<&str> = match (pool.is_empty(), current.is_empty()) {
+        (false, _) => pool.iter().map(String::as_str).collect(),
+        (true, false) => vec![current],
+        (true, true) => return None,
+    };
+    members
+        .into_iter()
+        .map(|member| {
+            // Parsed, so `2001:db8::1` and `2001:0db8::1` are one address.
+            let addr: std::net::IpAddr = member.parse().ok()?;
+            let mark = state.marks.iter().find(|m| m.addr == addr)?;
+            let counts = mark.until_unix > now
+                && mark.marked_at_unix >= baseline
+                && mark.cause != RETRY_AFTER_CAUSE;
+            counts.then(|| ExhaustedMember {
+                addr: member.to_string(),
+                cause: mark.cause.clone(),
+                until_unix: mark.until_unix,
+                marked_at_unix: mark.marked_at_unix,
+            })
+        })
+        .collect()
+}
+
+/// The rebuild both reachability verdicts end in, the probe's
+/// (`PcscfUnreachable`) and the agent's (`PcscfPoolExhausted`): recreate the
+/// interface, and only if that worked, terminate and re-initiate.
+///
+/// The same remedy as `TunVanished`, and for the same underlying reason: there
+/// is no working data path. A terminate+reinitiate that lands on an interface
+/// with no route just churns the carrier and negotiates another SA that
+/// carries nothing, which is precisely the state this recovers from.
+fn rebuild_tunnel(
+    engine: &dyn TunnelEngine,
+    runner: &dyn CommandRunner,
+    reason: DegradeReason,
+) -> SteadyOutcome {
+    if !engine.recreate_interface(runner) {
+        return SteadyOutcome::Recovered {
+            reason: DegradeReason::TunUnavailable,
+            ike_sa_loss_cause: None,
+        };
+    }
+    engine.terminate(runner);
+    engine.reinitiate(runner);
+    SteadyOutcome::Recovered {
+        reason,
+        ike_sa_loss_cause: None,
+    }
+}
+
 /// Advances the steady-state state machine by one tick. 1:1 port of both
 /// engines' steady-state supervisor loop bodies (see module docs) — the
 /// order of checks matches the bash exactly: process-alive first, then
@@ -521,6 +634,7 @@ pub fn tick_steady_state(
         tracking,
         poll_interval,
         &|| false,
+        &|| None,
     )
 }
 
@@ -534,6 +648,11 @@ pub fn tick_steady_state(
 /// other members are probed only when the selection fails, so a healthy line
 /// costs what it always did. With every member dead the rebuild still happens,
 /// and it is the spec's "rediscovery": the new negotiation brings a new pool.
+///
+/// `call_active` and `agent_pool` are what the line's IMS agent says about
+/// itself (its call count, its P-CSCF marks), read by the caller from files
+/// beside `/tmp/pcscf-N` so this stays a decision over inputs.
+#[allow(clippy::too_many_arguments)]
 pub fn tick_steady_state_with_pool(
     engine: &dyn TunnelEngine,
     runner: &dyn CommandRunner,
@@ -542,7 +661,9 @@ pub fn tick_steady_state_with_pool(
     tracking: &mut SteadyTracking,
     poll_interval: Duration,
     call_active: &dyn Fn() -> bool,
+    agent_pool: &dyn Fn() -> Option<PoolState>,
 ) -> SteadyOutcome {
+    tracking.pool_exhausted.clear();
     if !engine.is_process_alive(runner) {
         // A respawned charon starts a fresh connection that gets its own first
         // retry, so a miss counted against the old one must not carry over.
@@ -691,6 +812,55 @@ pub fn tick_steady_state_with_pool(
         };
     }
 
+    // Has the line's IMS agent given up on every P-CSCF it was given? It is
+    // the one that actually signals through them, over the protected Gm
+    // ports, so when it says they are all dead it wins over the probe below,
+    // which only knocks on the unprotected one (specs/097 FR-005). And it
+    // answers the case the probe cannot help with once it is gone: a carrier
+    // with a single P-CSCF, where the agent has no sibling to fail over to and
+    // only a new negotiation brings a new address (#120 finding 4).
+    //
+    // One tick is enough. A mark is already a debounced verdict -- three dead
+    // keepalives, or a REGISTER that timed out -- and waiting longer only
+    // lengthens an outage on a line that is already deaf.
+    let exhausted = exhausted_pool(
+        current_pool,
+        current_pcscf,
+        agent_pool().as_ref(),
+        tracking.negotiated_at,
+        SystemTime::now(),
+    );
+    match exhausted {
+        Some(members) if !call_active() => {
+            tracking.pool_exhausted_deferral_logged = false;
+            tracking.pcscf_unreachable = 0;
+            let outcome = rebuild_tunnel(engine, runner, DegradeReason::PcscfPoolExhausted);
+            if matches!(
+                outcome,
+                SteadyOutcome::Recovered {
+                    reason: DegradeReason::PcscfPoolExhausted,
+                    ..
+                }
+            ) {
+                tracking.pool_exhausted = members;
+            }
+            return outcome;
+        }
+        // Held for a call, however long it lasts (clarification Q1): media can
+        // still be flowing with signalling dead, and the agent holds back its
+        // own re-registration during a call for the same reason.
+        Some(_) => {
+            if !tracking.pool_exhausted_deferral_logged {
+                tracking.pool_exhausted_deferral_logged = true;
+                println!(
+                    "{} every P-CSCF is marked unavailable; deferring the tunnel rebuild while a call is active",
+                    engine.log_prefix()
+                );
+            }
+        }
+        None => tracking.pool_exhausted_deferral_logged = false,
+    }
+
     let selection_reachable = engine.pcscf_reachable(runner, current_pcscf);
     let sibling = if selection_reachable {
         None
@@ -712,24 +882,7 @@ pub fn tick_steady_state_with_pool(
         // ~90s of real time rather than the same number of ticks.
         if tracking.pcscf_unreachable >= pcscf_unreachable_strikes(poll_interval) {
             tracking.pcscf_unreachable = 0;
-            // The same remedy as `TunVanished`, and for the same underlying
-            // reason: there is no working data path. `recreate_interface` runs
-            // first and the rebuild is conditional on it, exactly as there —
-            // a terminate+reinitiate that lands on an interface with no route
-            // just churns the carrier and negotiates another SA that carries
-            // nothing, which is precisely the state this recovers from.
-            if !engine.recreate_interface(runner) {
-                return SteadyOutcome::Recovered {
-                    reason: DegradeReason::TunUnavailable,
-                    ike_sa_loss_cause: None,
-                };
-            }
-            engine.terminate(runner);
-            engine.reinitiate(runner);
-            return SteadyOutcome::Recovered {
-                reason: DegradeReason::PcscfUnreachable,
-                ike_sa_loss_cause: None,
-            };
+            return rebuild_tunnel(engine, runner, DegradeReason::PcscfUnreachable);
         }
     }
 
@@ -1287,6 +1440,7 @@ mod tests {
                 &mut tracking,
                 STEADY_STATE_POLL_INTERVAL,
                 &|| false,
+                &|| None,
             );
             assert_eq!(outcome, SteadyOutcome::StillUp);
         }
@@ -1316,6 +1470,7 @@ mod tests {
                 &mut tracking,
                 STEADY_STATE_POLL_INTERVAL,
                 &|| false,
+                &|| None,
             );
         }
         assert_eq!(
@@ -1339,6 +1494,7 @@ mod tests {
             &mut SteadyTracking::default(),
             STEADY_STATE_POLL_INTERVAL,
             &|| false,
+            &|| None,
         );
         assert_eq!(*engine.probed.borrow(), pool(&["10.0.0.10"]));
     }
@@ -1533,6 +1689,7 @@ mod tests {
             DegradeReason::PcscfChanged,
             DegradeReason::PcscfUnreachable,
             DegradeReason::DefaultRouteMissing,
+            DegradeReason::PcscfPoolExhausted,
         ];
         assert_eq!(reasons.len(), TunnelRecoveryReason::ALL.len());
         for reason in reasons {
@@ -1898,10 +2055,428 @@ mod tests {
             DegradeReason::ChildSaRekeyStuck,
             DegradeReason::IkeSaLost,
             DegradeReason::PcscfUnreachable,
+            DegradeReason::PcscfPoolExhausted,
         ] {
             assert!(recovery_restarts_agent(r), "{r:?}");
             assert!(recovery_renegotiates(r), "{r:?}");
         }
+    }
+
+    // --- specs/097: the agent's verdict on its P-CSCF pool ----------------
+
+    use crate::ims::pcscf_files::{PoolState, PoolStateMark, POOL_STATE_VERSION};
+
+    /// A wall-clock instant comfortably in the past, so `now()` is after it.
+    fn at(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// A mark the agent set at `marked_at` that ends an hour after now.
+    fn agent_mark(addr: &str, cause: &str, marked_at: SystemTime) -> PoolStateMark {
+        PoolStateMark {
+            addr: addr.parse().unwrap(),
+            until_unix: unix_secs(SystemTime::now()) + 3600,
+            failures: 1,
+            cause: cause.into(),
+            marked_at_unix: unix_secs(marked_at),
+        }
+    }
+
+    fn state(marks: Vec<PoolStateMark>) -> PoolState {
+        PoolState {
+            version: POOL_STATE_VERSION,
+            last_registered: None,
+            marks,
+        }
+    }
+
+    const BASELINE: u64 = 1_790_000_000;
+
+    #[test]
+    fn exhausted_pool_needs_every_member_freshly_marked() {
+        let base = Some(at(BASELINE));
+        let now = SystemTime::now();
+        let fresh = |a: &str| agent_mark(a, "gm-keepalive", at(BASELINE + 10));
+        let one = state(vec![fresh("10.0.0.11")]);
+        let got = exhausted_pool(&pool(&["10.0.0.11"]), "10.0.0.11", Some(&one), base, now)
+            .expect("a single freshly marked P-CSCF is an exhausted pool");
+        assert_eq!(got[0].addr, "10.0.0.11");
+        assert_eq!(got[0].cause, "gm-keepalive");
+
+        // Nothing known means nothing to act on.
+        assert_eq!(
+            exhausted_pool(&pool(&["10.0.0.11"]), "", None, base, now),
+            None
+        );
+        assert_eq!(
+            exhausted_pool(&pool(&["10.0.0.11"]), "", Some(&one), None, now),
+            None
+        );
+        assert_eq!(exhausted_pool(&[], "", Some(&one), base, now), None);
+        // A pool address that does not parse cannot be judged.
+        assert_eq!(
+            exhausted_pool(&pool(&["bogus"]), "", Some(&one), base, now),
+            None
+        );
+    }
+
+    #[test]
+    fn a_mark_counts_only_if_fresh_unexpired_and_not_retry_after() {
+        let base = Some(at(BASELINE));
+        let now = SystemTime::now();
+        let p = pool(&["10.0.0.11"]);
+        let check = |m: PoolStateMark| exhausted_pool(&p, "", Some(&state(vec![m])), base, now);
+
+        // Set before the negotiation: it outlived the rebuild it caused.
+        assert_eq!(
+            check(agent_mark("10.0.0.11", "transport", at(BASELINE - 1))),
+            None
+        );
+        // From a file written before the marking time existed.
+        let mut old = agent_mark("10.0.0.11", "transport", at(BASELINE + 1));
+        old.marked_at_unix = 0;
+        assert_eq!(check(old), None);
+        // Expired: the agent itself would try the address again.
+        let mut expired = agent_mark("10.0.0.11", "transport", at(BASELINE + 1));
+        expired.until_unix = unix_secs(now) - 1;
+        assert_eq!(check(expired), None);
+        // A requested pause is not a failure.
+        assert_eq!(
+            check(agent_mark("10.0.0.11", "retry-after", at(BASELINE + 1))),
+            None
+        );
+        // Set in the very second of the negotiation still counts.
+        assert!(check(agent_mark("10.0.0.11", "transport", at(BASELINE))).is_some());
+        for cause in [
+            "gm-keepalive",
+            "register-timeout",
+            "transport",
+            "endpoint-failure:subscribe-timeout",
+        ] {
+            assert!(
+                check(agent_mark("10.0.0.11", cause, at(BASELINE + 1))).is_some(),
+                "{cause}"
+            );
+        }
+    }
+
+    #[test]
+    fn exhausted_pool_falls_back_to_the_selection_and_matches_addresses_not_text() {
+        let base = Some(at(BASELINE));
+        let now = SystemTime::now();
+        let v6 = state(vec![agent_mark(
+            "2001:db8::1",
+            "transport",
+            at(BASELINE + 1),
+        )]);
+        // No pool published: the selection alone.
+        assert!(exhausted_pool(&[], "2001:0db8::1", Some(&v6), base, now).is_some());
+        assert!(exhausted_pool(&pool(&["2001:0db8:0::1"]), "", Some(&v6), base, now).is_some());
+        // A mark on an address this line was never given is irrelevant.
+        let stray = state(vec![agent_mark("10.0.9.9", "transport", at(BASELINE + 1))]);
+        assert_eq!(
+            exhausted_pool(&pool(&["10.0.0.11"]), "", Some(&stray), base, now),
+            None
+        );
+    }
+
+    /// One strongswan-cadence tick of a line whose agent reports `agent`.
+    fn pool_tick(
+        engine: &FakeEngine,
+        current_pool: &[String],
+        tracking: &mut SteadyTracking,
+        in_call: bool,
+        agent: &PoolState,
+    ) -> SteadyOutcome {
+        super::tick_steady_state_with_pool(
+            engine,
+            &MockCommandRunner::new(),
+            &current_pool[0],
+            current_pool,
+            tracking,
+            STEADY_STATE_POLL_INTERVAL,
+            &|| in_call,
+            &|| Some(agent.clone()),
+        )
+    }
+
+    fn negotiated() -> SteadyTracking {
+        SteadyTracking {
+            negotiated_at: Some(at(BASELINE)),
+            ..Default::default()
+        }
+    }
+
+    const POOL_EXHAUSTED: SteadyOutcome = SteadyOutcome::Recovered {
+        reason: DegradeReason::PcscfPoolExhausted,
+        ike_sa_loss_cause: None,
+    };
+
+    #[test]
+    fn a_single_exhausted_pcscf_rebuilds_the_tunnel() {
+        // #120 finding 4: Vodafone's only P-CSCF dead, the tunnel fine.
+        let engine = FakeEngine::default();
+        let mut tracking = negotiated();
+        let agent = state(vec![agent_mark(
+            "10.0.0.11",
+            "gm-keepalive",
+            at(BASELINE + 5),
+        )]);
+        let outcome = pool_tick(&engine, &pool(&["10.0.0.11"]), &mut tracking, false, &agent);
+        assert_eq!(outcome, POOL_EXHAUSTED);
+        assert_eq!(
+            *engine.call_order.borrow(),
+            vec!["recreate_interface", "terminate", "reinitiate"]
+        );
+        assert_eq!(tracking.pool_exhausted.len(), 1);
+        assert_eq!(tracking.pool_exhausted[0].addr, "10.0.0.11");
+    }
+
+    #[test]
+    fn the_agent_verdict_wins_over_a_passing_probe() {
+        // The probe knocks on the unprotected port; the agent signals over the
+        // protected one. When the agent says the P-CSCF is dead, it is.
+        let engine = FakeEngine {
+            pcscf_reachable: RefCell::new(true),
+            ..Default::default()
+        };
+        let agent = state(vec![agent_mark(
+            "10.0.0.11",
+            "register-timeout",
+            at(BASELINE + 5),
+        )]);
+        let outcome = pool_tick(
+            &engine,
+            &pool(&["10.0.0.11"]),
+            &mut negotiated(),
+            false,
+            &agent,
+        );
+        assert_eq!(outcome, POOL_EXHAUSTED);
+        assert!(
+            engine.probed.borrow().is_empty(),
+            "decided before the probe"
+        );
+    }
+
+    #[test]
+    fn a_missing_route_is_repaired_before_the_pool_is_judged() {
+        let engine = FakeEngine {
+            route_missing: RefCell::new(true),
+            ..Default::default()
+        };
+        let agent = state(vec![agent_mark("10.0.0.11", "transport", at(BASELINE + 5))]);
+        let outcome = pool_tick(
+            &engine,
+            &pool(&["10.0.0.11"]),
+            &mut negotiated(),
+            false,
+            &agent,
+        );
+        assert_eq!(
+            outcome,
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::DefaultRouteMissing,
+                ike_sa_loss_cause: None,
+            }
+        );
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn an_exhausted_pool_whose_interface_cannot_be_recreated_is_tun_unavailable() {
+        let engine = FakeEngine {
+            recreate_ok: false,
+            ..Default::default()
+        };
+        let mut tracking = negotiated();
+        let agent = state(vec![agent_mark("10.0.0.11", "transport", at(BASELINE + 5))]);
+        let outcome = pool_tick(&engine, &pool(&["10.0.0.11"]), &mut tracking, false, &agent);
+        assert_eq!(
+            outcome,
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::TunUnavailable,
+                ike_sa_loss_cause: None,
+            }
+        );
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+        assert!(tracking.pool_exhausted.is_empty(), "no rebuild was done");
+    }
+
+    #[test]
+    fn the_exhaustion_rebuild_resets_the_unreachable_strikes() {
+        let engine = FakeEngine::default();
+        let mut tracking = negotiated();
+        tracking.pcscf_unreachable = 2;
+        let agent = state(vec![agent_mark("10.0.0.11", "transport", at(BASELINE + 5))]);
+        pool_tick(&engine, &pool(&["10.0.0.11"]), &mut tracking, false, &agent);
+        assert_eq!(tracking.pcscf_unreachable, 0);
+    }
+
+    #[test]
+    fn stale_marks_from_before_the_negotiation_never_rebuild() {
+        let engine = FakeEngine::default();
+        let mut tracking = negotiated();
+        let agent = state(vec![agent_mark(
+            "10.0.0.11",
+            "transport",
+            at(BASELINE - 60),
+        )]);
+        let outcome = pool_tick(&engine, &pool(&["10.0.0.11"]), &mut tracking, false, &agent);
+        assert_eq!(outcome, SteadyOutcome::StillUp);
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn an_exhausted_pool_waits_for_the_call_to_end() {
+        // Clarification Q1: no cap, rebuild on the first tick after the call.
+        let engine = FakeEngine::default();
+        let mut tracking = negotiated();
+        let p = pool(&["10.0.0.11"]);
+        let agent = state(vec![agent_mark("10.0.0.11", "transport", at(BASELINE + 5))]);
+        for _ in 0..3 {
+            assert_eq!(
+                pool_tick(&engine, &p, &mut tracking, true, &agent),
+                SteadyOutcome::StillUp
+            );
+            assert!(tracking.pool_exhausted_deferral_logged);
+        }
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+        assert_eq!(
+            pool_tick(&engine, &p, &mut tracking, false, &agent),
+            POOL_EXHAUSTED
+        );
+        assert!(!tracking.pool_exhausted_deferral_logged);
+    }
+
+    #[test]
+    fn the_deferral_note_clears_when_the_pool_recovers() {
+        let engine = FakeEngine::default();
+        let mut tracking = negotiated();
+        let p = pool(&["10.0.0.11"]);
+        let dead = state(vec![agent_mark("10.0.0.11", "transport", at(BASELINE + 5))]);
+        pool_tick(&engine, &p, &mut tracking, true, &dead);
+        assert!(tracking.pool_exhausted_deferral_logged);
+        pool_tick(&engine, &p, &mut tracking, true, &state(vec![]));
+        assert!(!tracking.pool_exhausted_deferral_logged);
+    }
+
+    // US2: a carrier with several P-CSCFs keeps failing over inside the agent.
+
+    #[test]
+    fn a_partly_marked_pool_never_rebuilds() {
+        let p = pool(&["10.0.0.11", "10.0.0.12", "10.0.0.13", "10.0.0.14"]);
+        for marked in 1..p.len() {
+            for probe_answers in [true, false] {
+                let engine = FakeEngine {
+                    pcscf_reachable: RefCell::new(probe_answers),
+                    ..Default::default()
+                };
+                let agent = state(
+                    p[..marked]
+                        .iter()
+                        .map(|a| agent_mark(a, "gm-keepalive", at(BASELINE + 5)))
+                        .collect(),
+                );
+                let outcome = pool_tick(&engine, &p, &mut negotiated(), false, &agent);
+                assert_ne!(outcome, POOL_EXHAUSTED, "{marked} of 4 marked");
+            }
+        }
+    }
+
+    #[test]
+    fn a_wholly_marked_pool_rebuilds() {
+        let p = pool(&["10.0.0.11", "10.0.0.12", "10.0.0.13", "10.0.0.14"]);
+        let engine = FakeEngine::default();
+        let agent = state(
+            p.iter()
+                .map(|a| agent_mark(a, "register-timeout", at(BASELINE + 5)))
+                .collect(),
+        );
+        let mut tracking = negotiated();
+        assert_eq!(
+            pool_tick(&engine, &p, &mut tracking, false, &agent),
+            POOL_EXHAUSTED
+        );
+        assert_eq!(tracking.pool_exhausted.len(), 4);
+    }
+
+    #[test]
+    fn a_member_cleared_by_a_registration_counts_as_unmarked() {
+        // `on_registered` removes the mark; the state then simply lacks it.
+        let p = pool(&["10.0.0.11", "10.0.0.12"]);
+        let engine = FakeEngine::default();
+        let agent = state(vec![agent_mark("10.0.0.11", "transport", at(BASELINE + 5))]);
+        let outcome = pool_tick(&engine, &p, &mut negotiated(), false, &agent);
+        assert_eq!(outcome, SteadyOutcome::StillUp);
+    }
+
+    // US3: everything else in the tick comes first, as before.
+
+    #[test]
+    fn structural_faults_and_pcscf_changes_skip_the_exhaustion_check() {
+        let agent = state(vec![agent_mark("10.0.0.11", "transport", at(BASELINE + 5))]);
+        let p = pool(&["10.0.0.11"]);
+        for health in [
+            SteadyStateHealth::ViciBroken,
+            SteadyStateHealth::TunVanished,
+            SteadyStateHealth::IkeSaMissing,
+            SteadyStateHealth::ChildSaMissing,
+        ] {
+            let engine = FakeEngine {
+                health: RefCell::new(health),
+                ..Default::default()
+            };
+            let outcome = pool_tick(&engine, &p, &mut negotiated(), false, &agent);
+            assert_ne!(outcome, POOL_EXHAUSTED, "{health:?}");
+        }
+        let dead = FakeEngine {
+            alive: RefCell::new(false),
+            ..Default::default()
+        };
+        let outcome = pool_tick(&dead, &p, &mut negotiated(), false, &agent);
+        assert_ne!(outcome, POOL_EXHAUSTED);
+        let moved = FakeEngine {
+            pcscf: RefCell::new(Some("10.0.0.99".into())),
+            ..Default::default()
+        };
+        assert_eq!(
+            pool_tick(&moved, &p, &mut negotiated(), false, &agent),
+            SteadyOutcome::PcscfChanged {
+                new_pcscf: "10.0.0.99".into()
+            }
+        );
+    }
+
+    #[test]
+    fn no_pool_state_leaves_the_tick_as_it_was() {
+        let p = pool(&["10.0.0.11"]);
+        let engine = FakeEngine::default();
+        let mut tracking = negotiated();
+        let outcome = super::tick_steady_state_with_pool(
+            &engine,
+            &MockCommandRunner::new(),
+            "10.0.0.11",
+            &p,
+            &mut tracking,
+            STEADY_STATE_POLL_INTERVAL,
+            &|| false,
+            &|| None,
+        );
+        assert_eq!(outcome, SteadyOutcome::StillUp);
+        assert_eq!(*engine.probed.borrow(), vec!["10.0.0.11".to_string()]);
+    }
+
+    #[test]
+    fn the_exhausted_members_describe_only_the_tick_that_rebuilt() {
+        let engine = FakeEngine::default();
+        let mut tracking = negotiated();
+        let p = pool(&["10.0.0.11"]);
+        let agent = state(vec![agent_mark("10.0.0.11", "transport", at(BASELINE + 5))]);
+        pool_tick(&engine, &p, &mut tracking, false, &agent);
+        assert!(!tracking.pool_exhausted.is_empty());
+        pool_tick(&engine, &p, &mut tracking, false, &state(vec![]));
+        assert!(tracking.pool_exhausted.is_empty());
     }
 
     #[test]
@@ -2161,6 +2736,7 @@ mod tests {
             DegradeReason::ChildSaStuck,
             DegradeReason::ChildSaRekeyStuck,
             DegradeReason::IkeSaLost,
+            DegradeReason::PcscfPoolExhausted,
         ] {
             match reason {
                 DegradeReason::ProcessDied
@@ -2177,6 +2753,8 @@ mod tests {
                 // A rebuilt tunnel means a new data path, which the agent has
                 // to re-register over -- so it must be restarted.
                 | DegradeReason::PcscfUnreachable
+                // The same rebuild, decided from the agent's own verdict.
+                | DegradeReason::PcscfPoolExhausted
                 // Restarted despite the repair itself being non-disruptive:
                 // with no route there was no data path, so the agent's
                 // registration and any call over it were already dead. Nothing
@@ -2227,6 +2805,7 @@ mod tests {
             tracking,
             STEADY_STATE_POLL_INTERVAL,
             call_active,
+            &|| None,
         )
     }
 

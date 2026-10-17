@@ -156,10 +156,13 @@ pub enum TunnelRecoveryReason {
     PcscfChanged,
     PcscfUnreachable,
     DefaultRouteMissing,
+    /// The agent marked every P-CSCF in the pool since the last negotiation
+    /// (specs/097).
+    PcscfPoolExhausted,
 }
 
 impl TunnelRecoveryReason {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::ProcessDied,
         Self::ViciBroken,
         Self::TunVanished,
@@ -171,6 +174,7 @@ impl TunnelRecoveryReason {
         Self::PcscfChanged,
         Self::PcscfUnreachable,
         Self::DefaultRouteMissing,
+        Self::PcscfPoolExhausted,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -186,6 +190,7 @@ impl TunnelRecoveryReason {
             Self::PcscfChanged => "pcscf_changed",
             Self::PcscfUnreachable => "pcscf_unreachable",
             Self::DefaultRouteMissing => "default_route_missing",
+            Self::PcscfPoolExhausted => "pcscf_pool_exhausted",
         }
     }
 }
@@ -259,7 +264,7 @@ pub struct AgentState {
 /// a closed Rust enum rather than a free string — the mechanism that keeps
 /// metric label cardinality bounded regardless of what an agent observes
 /// (FR-014).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum ObservedEvent {
     CallCompleted {
@@ -316,6 +321,12 @@ pub enum ObservedEvent {
     /// counted as flapping -- shows up somewhere other than the logs.
     TunnelRecovered {
         reason: TunnelRecoveryReason,
+        /// The P-CSCFs the agent had given up on, for a
+        /// `PcscfPoolExhausted` recovery (specs/097): the daemon's alert names
+        /// them. Empty, and absent on the wire, for every other reason, so
+        /// those keep the shape spec 096 shipped.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pcscfs: Vec<String>,
     },
 }
 
@@ -580,10 +591,34 @@ mod tests {
     fn tunnel_recovered_event_wire_shape() {
         let event = ObservedEvent::TunnelRecovered {
             reason: TunnelRecoveryReason::DefaultRouteMissing,
+            pcscfs: Vec::new(),
         };
         assert_eq!(
             serde_json::to_string(&event).unwrap(),
             r#"{"event":"tunnel_recovered","reason":"default_route_missing"}"#
+        );
+    }
+
+    #[test]
+    fn a_pool_exhausted_recovery_carries_its_pcscfs() {
+        let json = r#"{"event":"tunnel_recovered","reason":"pcscf_pool_exhausted","pcscfs":["10.0.0.11"]}"#;
+        let event = ObservedEvent::TunnelRecovered {
+            reason: TunnelRecoveryReason::PcscfPoolExhausted,
+            pcscfs: vec!["10.0.0.11".into()],
+        };
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
+        let back: ObservedEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(back, event);
+        // A spec-096 sender's event, with no `pcscfs`, still decodes.
+        let old: ObservedEvent =
+            serde_json::from_str(r#"{"event":"tunnel_recovered","reason":"pcscf_unreachable"}"#)
+                .unwrap();
+        assert_eq!(
+            old,
+            ObservedEvent::TunnelRecovered {
+                reason: TunnelRecoveryReason::PcscfUnreachable,
+                pcscfs: Vec::new(),
+            }
         );
     }
 
