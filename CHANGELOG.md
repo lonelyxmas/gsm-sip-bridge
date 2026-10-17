@@ -10,6 +10,23 @@ across releases.
 
 ### Added
 
+- **`[vowifi].dpd_delay_sec`.** How long charon waits with nothing from the
+  ePDG before sending a dead-peer-detection request on a strongSwan line;
+  `0` turns it off. It was a fixed 30s and now defaults to 120s, the Android
+  IWLAN default. With nothing else arriving between the agent's 120s
+  keepalives, 30s DPD gave the ePDG an exchange every 30s to ignore, and on
+  both Vodafone and Jio one ignored request tore down a working tunnel. No
+  effect while the supervisor's P-CSCF probe runs, because its traffic keeps
+  DPD from firing. Applies when the container is recreated
+  ([#120](https://github.com/selvakn/gsm-sip-bridge/issues/120)).
+
+- **Dead-peer loss counter.** `gsm_sip_bridge_vowifi_dead_peer_losses_total`
+  counts IKE_SA losses to an unresponsive ePDG by `verdict`: `false` when
+  inbound ESP was still arriving while charon retransmitted, `real` when it
+  was not, `unknown` when the supervisor could not tell. The supervisor logs
+  the verdict and its evidence
+  ([#120](https://github.com/selvakn/gsm-sip-bridge/issues/120)).
+
 - **Rebuild on an exhausted P-CSCF pool.** When a VoWiFi line's IMS agent has
   marked every P-CSCF it was given unavailable since the tunnel was last
   negotiated, the supervisor rebuilds the tunnel to get a new one

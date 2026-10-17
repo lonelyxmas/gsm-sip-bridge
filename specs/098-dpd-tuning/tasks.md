@@ -49,8 +49,8 @@ None: the setting and the classification are independent.
 
 ## Phase 5: Polish (docs)
 
-- [ ] T017 [P] `docs/configuration.md` `[vowifi]` row for `dpd_delay_sec` (default, `0`, range, recreate-to-apply, no effect while the probe runs); `config.toml.example` commented entry; `docs/observability.md` the new counter; `docs/operations.md` how to read a `false` verdict; `CHANGELOG.md` under Unreleased (bold summary only). `tests/test_config_docs.rs` must pass.
-- [ ] T018 `make format lint test`; commit `docs: dpd_delay_sec and the dead-peer loss counter (#120)`.
+- [X] T017 [P] `docs/configuration.md` `[vowifi]` row for `dpd_delay_sec` (default, `0`, range, recreate-to-apply, no effect while the probe runs); `config.toml.example` commented entry; `docs/observability.md` the new counter; `docs/operations.md` how to read a `false` verdict; `CHANGELOG.md` under Unreleased (bold summary only). `tests/test_config_docs.rs` must pass.
+- [X] T018 `make format lint test`; commit `docs: dpd_delay_sec and the dead-peer loss counter (#120)`.
 
 ## Phase 6: User Story 1 — reproduce and explain the ignored DPD (P1, live)
 
