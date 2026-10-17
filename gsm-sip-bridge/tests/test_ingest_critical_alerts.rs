@@ -104,12 +104,19 @@ async fn failed_delivery_is_retried_then_succeeds_then_recovers() {
             // specs/028: enabled and threshold 0 so the gm-connection phase
             // below fires on the first unhealthy report, same as registration.
             gm_connection_lost: enabled(Some(&webhook)),
+            // specs/097: not exercised here; the episode is unit-tested in
+            // `metrics::ingest` with an injected config.
+            pcscf_pool_exhausted: CategoryAlertConfig {
+                enabled: false,
+                webhook_url_override: None,
+            },
             module_lifecycle_thresholds: ModuleLifecycleThresholds {
                 at_worker_unresponsive_sec: 60,
             },
             tunnel_failure_thresholds: TunnelFailureThresholds { unhealthy_sec: 300 },
             registration_loss_thresholds: RegistrationLossThresholds { unhealthy_sec: 0 },
             gm_connection_lost_thresholds: GmConnectionLostThresholds { unhealthy_sec: 0 },
+            pcscf_pool_exhausted_thresholds: Default::default(),
         },
         DiscordClient::new(Secret::new(String::new()), "test-instance".to_string()).unwrap(),
         std::collections::HashMap::new(),

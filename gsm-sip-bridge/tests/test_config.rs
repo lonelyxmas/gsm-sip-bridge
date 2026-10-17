@@ -191,6 +191,12 @@ discord_webhook_url = "env:TEST_ALERTS_LEGACY_WEBHOOK"
     assert_eq!(cfg.alerts.tunnel_failure_thresholds.unhealthy_sec, 300);
     assert_eq!(cfg.alerts.registration_loss_thresholds.unhealthy_sec, 300);
     assert_eq!(cfg.alerts.gm_connection_lost_thresholds.unhealthy_sec, 300);
+    // specs/097: also enabled by default, at the same 300s.
+    assert!(cfg.alerts.pcscf_pool_exhausted.enabled);
+    assert_eq!(
+        cfg.alerts.pcscf_pool_exhausted_thresholds.unhealthy_sec,
+        300
+    );
 }
 
 /// An explicit `[alerts.sms]` table wins over the legacy `[sms]` keys.
@@ -340,6 +346,57 @@ unhealthy_sec = 99999
     );
     // 99999 is out of the 30..=3600 range, so it falls back to the default.
     assert_eq!(cfg.alerts.gm_connection_lost_thresholds.unhealthy_sec, 300);
+}
+
+/// specs/097: `[alerts.pcscf_pool_exhausted]` parses all three keys, is not
+/// reported as an unknown section, and an in-range threshold is kept while an
+/// out-of-range one falls back to 300s.
+#[test]
+fn test_alerts_pcscf_pool_exhausted_enable_threshold_and_range() {
+    std::env::set_var("TEST_ALERTS_PPE_PASSWORD", "p");
+
+    let config = r#"
+[sip]
+server = "127.0.0.1"
+username = "user"
+password = "env:TEST_ALERTS_PPE_PASSWORD"
+
+[alerts.pcscf_pool_exhausted]
+enabled = false
+discord_webhook_url = "https://discord.com/api/webhooks/pcscf-pool-exhausted"
+unhealthy_sec = 600
+"#;
+
+    let root: toml::Value = toml::from_str(config).unwrap();
+    let unknown = gsm_sip_bridge::config::raw::collect_unknown_keys(&root);
+    assert!(
+        !unknown.iter().any(|k| k.contains("pcscf_pool_exhausted")),
+        "{unknown:?}"
+    );
+
+    let f = write_config(config);
+    let cfg = load_config(f.path()).unwrap();
+    assert!(!cfg.alerts.pcscf_pool_exhausted.enabled);
+    assert_eq!(
+        cfg.alerts
+            .pcscf_pool_exhausted
+            .webhook_url_override
+            .as_ref()
+            .map(|s| s.expose_secret().as_str()),
+        Some("https://discord.com/api/webhooks/pcscf-pool-exhausted")
+    );
+    assert_eq!(
+        cfg.alerts.pcscf_pool_exhausted_thresholds.unhealthy_sec,
+        600
+    );
+
+    let out_of_range = config.replace("unhealthy_sec = 600", "unhealthy_sec = 5");
+    let f = write_config(&out_of_range);
+    let cfg = load_config(f.path()).unwrap();
+    assert_eq!(
+        cfg.alerts.pcscf_pool_exhausted_thresholds.unhealthy_sec,
+        300
+    );
 }
 
 /// An out-of-range threshold falls back to the default rather than failing

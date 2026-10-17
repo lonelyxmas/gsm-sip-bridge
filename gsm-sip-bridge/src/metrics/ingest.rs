@@ -14,7 +14,7 @@ use crate::alerts::{AlertCategory, AlertOutcome, CriticalEvent, CriticalEventKin
 use crate::config::AlertsConfig;
 use crate::control::protocol::{
     AgentKind, AgentReport, AgentState, CallStatus, IkeSaLossCause, ObservedEvent, QualitySource,
-    SmsOutcome,
+    SmsOutcome, TunnelRecoveryReason,
 };
 use crate::metrics;
 use std::collections::HashMap;
@@ -129,6 +129,44 @@ struct AgentRecord {
     /// computed fresh at every scrape without the agent reporting per second.
     /// `None` until an agent reports one.
     registration_expires_at: Option<u64>,
+    /// specs/097. Supervisor records only: the open pool-exhaustion episode.
+    pool_exhausted: PoolExhaustion,
+}
+
+/// One line's pool-exhaustion episode (specs/097 data-model.md): from its first
+/// `PcscfPoolExhausted` rebuild until an IMS agent started after the latest one
+/// registers. The addresses for the alert text live in
+/// [`pool_exhausted_pcscfs`], since this record is `Copy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PoolExhaustion {
+    /// When the first rebuild of the open episode was reported; `None` when no
+    /// episode is open. The alert's unhealthy-since.
+    since: Option<Instant>,
+    phase: AlertPhase,
+    /// Rebuilds reported in the open episode.
+    rebuilds: u32,
+    /// The IMS agent's reporter epoch at the latest rebuild. That process is
+    /// being replaced: its `registered = true` heartbeats describe the old
+    /// tunnel, so only another epoch's can end the episode (research R5).
+    stale_ims_epoch: Option<u64>,
+}
+
+impl Default for PoolExhaustion {
+    fn default() -> Self {
+        Self {
+            since: None,
+            phase: AlertPhase::Idle,
+            rebuilds: 0,
+            stale_ims_epoch: None,
+        }
+    }
+}
+
+/// `module_id ->` the P-CSCFs the latest `PcscfPoolExhausted` rebuild named,
+/// for the alert text only.
+fn pool_exhausted_pcscfs() -> &'static Mutex<HashMap<String, Vec<String>>> {
+    static PCSCFS: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+    PCSCFS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Keyed by `(agent kind, module_id)`, not just agent kind — with
@@ -205,6 +243,7 @@ fn apply_report_with(
     let mut tunnel_unhealthy_since = existing.and_then(|r| r.tunnel_unhealthy_since);
     let mut gm_connection_unhealthy_since = existing.and_then(|r| r.gm_connection_unhealthy_since);
     let mut registration_expires_at = existing.and_then(|r| r.registration_expires_at);
+    let mut pool_exhausted = existing.map_or_else(PoolExhaustion::default, |r| r.pool_exhausted);
     // (category, transition, generation) to dispatch once the lock is
     // released. `generation` is the `*_unhealthy_since` value this
     // particular transition was decided against — threaded through to
@@ -225,6 +264,21 @@ fn apply_report_with(
             &mut gm_connection_unhealthy_since,
             &mut registration_expires_at,
         );
+
+        if report.agent == AgentKind::Supervisor {
+            let ims_epoch = guard
+                .get(&(AgentKind::Ims, module_id.to_string()))
+                .map(|r| r.last_applied.0);
+            note_pool_exhausted_rebuilds(&mut pool_exhausted, module_id, &report.events, ims_epoch);
+        } else if report.agent == AgentKind::Ims && report.state.registered == Some(true) {
+            // The line registered: that ends its supervisor's episode, unless
+            // this is the agent the latest rebuild is replacing.
+            if let Some(sup) = guard.get_mut(&(AgentKind::Supervisor, module_id.to_string())) {
+                if sup.pool_exhausted.stale_ims_epoch != Some(report.epoch) {
+                    sup.pool_exhausted.since = None;
+                }
+            }
+        }
 
         if report.agent == AgentKind::Supervisor {
             if let Some(cause) = report.state.ike_sa_loss_cause {
@@ -360,6 +414,25 @@ fn apply_report_with(
                 }
                 Transition::None => {}
             }
+            // Decided on the supervisor's own reports, which heartbeat, so an
+            // episode ended by an IMS report is all-cleared one interval later.
+            if report.agent == AgentKind::Supervisor {
+                let threshold =
+                    Duration::from_secs(cfg.pcscf_pool_exhausted_thresholds.unhealthy_sec);
+                match decide_transition(pool_exhausted.since, &mut pool_exhausted.phase, threshold)
+                {
+                    Transition::Event(kind) => pending_transitions.push((
+                        key.clone(),
+                        AlertCategory::PcscfPoolExhausted,
+                        kind,
+                        pool_exhausted.since,
+                    )),
+                    Transition::Suppressed => {
+                        crate::alerts::record_suppressed(AlertCategory::PcscfPoolExhausted)
+                    }
+                    Transition::None => {}
+                }
+            }
         }
     }
 
@@ -384,10 +457,67 @@ fn apply_report_with(
             gm_connection_unhealthy_since,
             gm_connection_alert_phase,
             registration_expires_at,
+            pool_exhausted,
         },
     );
     drop(guard);
     pending_transitions
+}
+
+/// Opens or extends a line's pool-exhaustion episode for each
+/// `PcscfPoolExhausted` recovery in a supervisor report (specs/097).
+/// `ims_epoch` is the line's IMS agent as it stands, which that rebuild is
+/// about to replace.
+fn note_pool_exhausted_rebuilds(
+    episode: &mut PoolExhaustion,
+    module_id: &str,
+    events: &[ObservedEvent],
+    ims_epoch: Option<u64>,
+) {
+    for event in events {
+        let ObservedEvent::TunnelRecovered {
+            reason: TunnelRecoveryReason::PcscfPoolExhausted,
+            pcscfs,
+        } = event
+        else {
+            continue;
+        };
+        if episode.since.is_none() {
+            episode.since = Some(Instant::now());
+            episode.rebuilds = 0;
+        }
+        episode.rebuilds = episode.rebuilds.saturating_add(1);
+        episode.stale_ims_epoch = ims_epoch;
+        pool_exhausted_pcscfs()
+            .lock()
+            .unwrap()
+            .insert(module_id.to_string(), pcscfs.clone());
+    }
+}
+
+/// The text of a pool-exhaustion alert (specs/097 contracts/alerts.md).
+fn pool_exhausted_description(
+    kind: CriticalEventKind,
+    unhealthy_sec: u64,
+    pcscfs: &[String],
+    rebuilds: u32,
+) -> String {
+    match kind {
+        CriticalEventKind::Failure => {
+            let addrs = if pcscfs.is_empty() {
+                "addresses unknown".to_string()
+            } else {
+                pcscfs.join(", ")
+            };
+            let plural = if rebuilds == 1 { "" } else { "s" };
+            format!(
+                "VoWiFi line's P-CSCF pool exhausted for over {unhealthy_sec}s ({addrs}; {rebuilds} tunnel rebuild{plural}): the carrier has not handed out a working P-CSCF"
+            )
+        }
+        CriticalEventKind::Recovered => {
+            "VoWiFi line registered again after its P-CSCF pool was exhausted".to_string()
+        }
+    }
 }
 
 /// specs/087: widens the supervisor's "unhealthy" from `!child_sa_up` to
@@ -664,8 +794,27 @@ fn build_alert(
                 key.0.as_str()
             )
         }
+        (AlertCategory::PcscfPoolExhausted, kind) => {
+            let rebuilds = liveness()
+                .lock()
+                .unwrap()
+                .get(key)
+                .map_or(0, |r| r.pool_exhausted.rebuilds);
+            let pcscfs = pool_exhausted_pcscfs()
+                .lock()
+                .unwrap()
+                .get(&key.1)
+                .cloned()
+                .unwrap_or_default();
+            pool_exhausted_description(
+                kind,
+                cfg.pcscf_pool_exhausted_thresholds.unhealthy_sec,
+                &pcscfs,
+                rebuilds,
+            )
+        }
         _ => unreachable!(
-            "only RegistrationLoss/TunnelFailure/GmConnectionLost transitions are produced here"
+            "only RegistrationLoss/TunnelFailure/GmConnectionLost/PcscfPoolExhausted transitions are produced here"
         ),
     };
     let phone_number = ALERTS_PHONE_MAP.get().and_then(|m| m.get(&key.1).cloned());
@@ -734,6 +883,10 @@ fn record_alert_outcome(
         AlertCategory::GmConnectionLost => (
             &mut record.gm_connection_alert_phase,
             record.gm_connection_unhealthy_since,
+        ),
+        AlertCategory::PcscfPoolExhausted => (
+            &mut record.pool_exhausted.phase,
+            record.pool_exhausted.since,
         ),
         _ => return false,
     };
@@ -1566,6 +1719,7 @@ mod tests {
                 gm_connection_unhealthy_since: None,
                 gm_connection_alert_phase: AlertPhase::Idle,
                 registration_expires_at: None,
+                pool_exhausted: PoolExhaustion::default(),
             },
         );
         generation
@@ -1772,6 +1926,7 @@ mod tests {
                     gm_connection_unhealthy_since: None,
                     gm_connection_alert_phase: AlertPhase::Idle,
                     registration_expires_at: None,
+                    pool_exhausted: PoolExhaustion::default(),
                 },
             );
         }
@@ -1798,6 +1953,205 @@ mod tests {
         assert_eq!(tunnel_alert_subject(AgentKind::Ims), "VoWiFi");
         assert_eq!(tunnel_alert_subject(AgentKind::Supervisor), "VoWiFi");
         assert_eq!(tunnel_alert_subject(AgentKind::Volte), "volte");
+    }
+
+    // --- specs/097: the pool-exhaustion episode -----------------------------
+
+    fn exhausted(addr: &str) -> ObservedEvent {
+        ObservedEvent::TunnelRecovered {
+            reason: TunnelRecoveryReason::PcscfPoolExhausted,
+            pcscfs: vec![addr.to_string()],
+        }
+    }
+
+    fn sup_report(
+        cfg: &AlertsConfig,
+        m: &str,
+        seq: u64,
+        events: Vec<ObservedEvent>,
+    ) -> Vec<PendingTransition> {
+        apply_report_with(
+            &AgentReport {
+                agent: AgentKind::Supervisor,
+                module_id: m.to_string(),
+                epoch: 1,
+                seq,
+                state: AgentState {
+                    child_sa_up: Some(true),
+                    tunnel_flapping: Some(false),
+                    ..AgentState::default()
+                },
+                events,
+                dropped: 0,
+            },
+            Some(cfg),
+        )
+    }
+
+    fn ims_report(cfg: &AlertsConfig, m: &str, epoch: u64, seq: u64, registered: bool) {
+        apply_report_with(
+            &AgentReport {
+                agent: AgentKind::Ims,
+                module_id: m.to_string(),
+                epoch,
+                seq,
+                state: AgentState {
+                    registered: Some(registered),
+                    ..AgentState::default()
+                },
+                events: vec![],
+                dropped: 0,
+            },
+            Some(cfg),
+        );
+    }
+
+    fn pool_events(t: &[PendingTransition]) -> Vec<CriticalEventKind> {
+        t.iter()
+            .filter(|(_, c, _, _)| *c == AlertCategory::PcscfPoolExhausted)
+            .map(|(_, _, kind, _)| *kind)
+            .collect()
+    }
+
+    fn episode(m: &str) -> PoolExhaustion {
+        liveness().lock().unwrap()[&(AgentKind::Supervisor, m.to_string())].pool_exhausted
+    }
+
+    fn backdate_episode(m: &str, secs: u64) {
+        let mut guard = liveness().lock().unwrap();
+        let r = guard
+            .get_mut(&(AgentKind::Supervisor, m.to_string()))
+            .unwrap();
+        r.pool_exhausted.since = Some(Instant::now() - Duration::from_secs(secs));
+    }
+
+    #[test]
+    fn a_long_exhaustion_alerts_once_and_all_clears_once_the_line_registers() {
+        let m = "test-pool-exhausted-episode";
+        let cfg = AlertsConfig::default();
+        ims_report(&cfg, m, 100, 1, true);
+        // The first rebuild opens the episode; nothing is due yet.
+        assert!(pool_events(&sup_report(&cfg, m, 1, vec![exhausted("10.0.0.11")])).is_empty());
+        assert_eq!(episode(m).rebuilds, 1);
+        assert_eq!(episode(m).stale_ims_epoch, Some(100));
+
+        // Past the threshold: exactly one Failure.
+        backdate_episode(m, 301);
+        let t = sup_report(&cfg, m, 2, vec![]);
+        assert_eq!(pool_events(&t), vec![CriticalEventKind::Failure]);
+        let generation = t[0].3.unwrap();
+        record_alert_outcome(
+            &(AgentKind::Supervisor, m.to_string()),
+            AlertCategory::PcscfPoolExhausted,
+            generation,
+            true,
+        );
+
+        // More rebuilds in the same episode count, but never alert again.
+        ims_report(&cfg, m, 200, 1, false);
+        for seq in 3..6 {
+            let t = sup_report(&cfg, m, seq, vec![exhausted("10.0.0.11")]);
+            assert!(pool_events(&t).is_empty());
+        }
+        assert_eq!(episode(m).rebuilds, 4);
+        assert_eq!(episode(m).stale_ims_epoch, Some(200));
+
+        // The agent being replaced still heartbeats `registered`: not the end.
+        ims_report(&cfg, m, 200, 2, true);
+        assert!(episode(m).since.is_some());
+        // A new agent's registration is.
+        ims_report(&cfg, m, 300, 1, true);
+        assert_eq!(episode(m).since, None);
+        assert_eq!(
+            pool_events(&sup_report(&cfg, m, 6, vec![])),
+            vec![CriticalEventKind::Recovered]
+        );
+        assert!(pool_events(&sup_report(&cfg, m, 7, vec![])).is_empty());
+    }
+
+    #[test]
+    fn a_short_exhaustion_never_alerts() {
+        let m = "test-pool-exhausted-short";
+        let cfg = AlertsConfig::default();
+        ims_report(&cfg, m, 100, 1, false);
+        sup_report(&cfg, m, 1, vec![exhausted("10.0.0.11")]);
+        ims_report(&cfg, m, 101, 1, true);
+        assert_eq!(episode(m).since, None);
+        for seq in 2..4 {
+            assert!(pool_events(&sup_report(&cfg, m, seq, vec![])).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_line_that_never_reported_an_agent_ends_on_any_registration() {
+        let m = "test-pool-exhausted-no-agent";
+        let cfg = AlertsConfig::default();
+        sup_report(&cfg, m, 1, vec![exhausted("2001:db8::1")]);
+        assert_eq!(episode(m).stale_ims_epoch, None);
+        ims_report(&cfg, m, 5, 1, true);
+        assert_eq!(episode(m).since, None);
+    }
+
+    #[test]
+    fn other_recovery_reasons_never_open_an_episode() {
+        let m = "test-pool-exhausted-other-reasons";
+        let cfg = AlertsConfig::default();
+        let events = TunnelRecoveryReason::ALL
+            .into_iter()
+            .filter(|r| *r != TunnelRecoveryReason::PcscfPoolExhausted)
+            .map(|reason| ObservedEvent::TunnelRecovered {
+                reason,
+                pcscfs: Vec::new(),
+            })
+            .collect();
+        sup_report(&cfg, m, 1, events);
+        assert_eq!(episode(m), PoolExhaustion::default());
+    }
+
+    #[test]
+    fn a_disabled_or_unconfigured_category_is_skipped_at_dispatch() {
+        // `enabled` and the webhook are honoured in `alerts::dispatch`, as for
+        // every category; the decision above is the same either way.
+        use crate::config::secret::Secret;
+        let mut cfg = AlertsConfig::default();
+        assert!(cfg.pcscf_pool_exhausted.enabled, "on by default");
+        assert_eq!(
+            crate::alerts::precheck(&cfg.pcscf_pool_exhausted, &cfg.default_webhook_url),
+            Some(AlertOutcome::Skipped),
+            "no webhook anywhere"
+        );
+        cfg.default_webhook_url = Secret::new("https://discord.com/api/webhooks/x".into());
+        assert_eq!(
+            crate::alerts::precheck(&cfg.pcscf_pool_exhausted, &cfg.default_webhook_url),
+            None
+        );
+        cfg.pcscf_pool_exhausted.enabled = false;
+        assert_eq!(
+            crate::alerts::precheck(&cfg.pcscf_pool_exhausted, &cfg.default_webhook_url),
+            Some(AlertOutcome::Skipped)
+        );
+    }
+
+    #[test]
+    fn pool_exhausted_alert_text_names_the_addresses_and_the_rebuilds() {
+        let failure = pool_exhausted_description(
+            CriticalEventKind::Failure,
+            300,
+            &["10.0.0.11".to_string()],
+            4,
+        );
+        assert_eq!(
+            failure,
+            "VoWiFi line's P-CSCF pool exhausted for over 300s (10.0.0.11; 4 tunnel rebuilds): the carrier has not handed out a working P-CSCF"
+        );
+        assert!(
+            pool_exhausted_description(CriticalEventKind::Failure, 300, &[], 1)
+                .contains("(addresses unknown; 1 tunnel rebuild)")
+        );
+        assert_eq!(
+            pool_exhausted_description(CriticalEventKind::Recovered, 300, &[], 4),
+            "VoWiFi line registered again after its P-CSCF pool was exhausted"
+        );
     }
 
     // --- Two-reporter wiring through `apply_report_with` (specs/086) ---------

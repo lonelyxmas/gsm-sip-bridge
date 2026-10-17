@@ -219,5 +219,6 @@ fn category_title(category: AlertCategory) -> &'static str {
         AlertCategory::MissedCall => "Missed Call",
         AlertCategory::LineDiscoveryFailed => "VoWiFi Line Discovery Failed",
         AlertCategory::GmConnectionLost => "Carrier Signaling Connection Lost",
+        AlertCategory::PcscfPoolExhausted => "VoWiFi P-CSCF Pool Exhausted",
     }
 }

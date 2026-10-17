@@ -582,10 +582,14 @@ pub struct AlertsConfig {
     /// **enabled**: a registered line whose Gm connection cannot be restored
     /// is unambiguously an incident, not something an operator must opt into.
     pub gm_connection_lost: CategoryAlertConfig,
+    /// specs/097. Defaults enabled, like `gm_connection_lost`: a line stuck
+    /// rebuilding onto a dead P-CSCF pool is an incident.
+    pub pcscf_pool_exhausted: CategoryAlertConfig,
     pub module_lifecycle_thresholds: ModuleLifecycleThresholds,
     pub tunnel_failure_thresholds: TunnelFailureThresholds,
     pub registration_loss_thresholds: RegistrationLossThresholds,
     pub gm_connection_lost_thresholds: GmConnectionLostThresholds,
+    pub pcscf_pool_exhausted_thresholds: PcscfPoolExhaustedThresholds,
 }
 
 #[derive(Clone, Debug)]
@@ -664,6 +668,21 @@ impl Default for GmConnectionLostThresholds {
     }
 }
 
+/// specs/097, default 300s: how long after a line's first `PcscfPoolExhausted`
+/// rebuild it may go without registering again before it is alerted on. A
+/// single rebuild that lands on a working P-CSCF re-registers in well under
+/// a minute, so one that self-heals never pages.
+#[derive(Clone, Copy, Debug)]
+pub struct PcscfPoolExhaustedThresholds {
+    pub unhealthy_sec: u64,
+}
+
+impl Default for PcscfPoolExhaustedThresholds {
+    fn default() -> Self {
+        Self { unhealthy_sec: 300 }
+    }
+}
+
 impl Default for AlertsConfig {
     fn default() -> Self {
         Self {
@@ -683,10 +702,15 @@ impl Default for AlertsConfig {
                 enabled: true,
                 webhook_url_override: None,
             },
+            pcscf_pool_exhausted: CategoryAlertConfig {
+                enabled: true,
+                webhook_url_override: None,
+            },
             module_lifecycle_thresholds: ModuleLifecycleThresholds::default(),
             tunnel_failure_thresholds: TunnelFailureThresholds::default(),
             registration_loss_thresholds: RegistrationLossThresholds::default(),
             gm_connection_lost_thresholds: GmConnectionLostThresholds::default(),
+            pcscf_pool_exhausted_thresholds: PcscfPoolExhaustedThresholds::default(),
         }
     }
 }

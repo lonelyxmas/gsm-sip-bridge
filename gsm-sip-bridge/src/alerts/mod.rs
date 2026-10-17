@@ -128,6 +128,10 @@ pub enum AlertCategory {
     /// connection has been down and unrecoverable for its configured
     /// threshold, despite automatic reconnects and a re-registration.
     GmConnectionLost,
+    /// specs/097: a VoWiFi line has kept rebuilding its tunnel because its
+    /// IMS agent gave up on every P-CSCF, and has not registered again within
+    /// its configured threshold of the first such rebuild.
+    PcscfPoolExhausted,
 }
 
 impl AlertCategory {
@@ -142,6 +146,7 @@ impl AlertCategory {
             AlertCategory::MissedCall => "missed_call",
             AlertCategory::LineDiscoveryFailed => "line_discovery_failed",
             AlertCategory::GmConnectionLost => "gm_connection_lost",
+            AlertCategory::PcscfPoolExhausted => "pcscf_pool_exhausted",
         }
     }
 }
@@ -240,6 +245,7 @@ fn category_config(config: &AlertsConfig, category: AlertCategory) -> &CategoryA
         AlertCategory::MissedCall => &config.missed_call,
         AlertCategory::LineDiscoveryFailed => &config.line_discovery_failed,
         AlertCategory::GmConnectionLost => &config.gm_connection_lost,
+        AlertCategory::PcscfPoolExhausted => &config.pcscf_pool_exhausted,
     }
 }
 
@@ -284,6 +290,7 @@ pub async fn dispatch(
             | AlertCategory::TunnelFailure
             | AlertCategory::LineDiscoveryFailed
             | AlertCategory::GmConnectionLost
+            | AlertCategory::PcscfPoolExhausted
     );
     if tracks_ongoing_health {
         if let Some(unit_id) = &event.unit_id {

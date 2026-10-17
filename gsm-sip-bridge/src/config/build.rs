@@ -594,6 +594,24 @@ fn build_alerts(raw: RawAlerts, sms: &SmsConfig) -> AlertsConfig {
             .unwrap_or(d.gm_connection_lost_thresholds.unhealthy_sec),
     };
 
+    let ppe_raw = raw.pcscf_pool_exhausted.unwrap_or_default();
+    let pcscf_pool_exhausted = CategoryAlertConfig {
+        // Defaults enabled, like `gm_connection_lost` (specs/097): a line
+        // rebuilt over and over because the carrier keeps handing out a dead
+        // P-CSCF is down until the carrier fixes it, and only a person can
+        // chase that.
+        enabled: ppe_raw.enabled.unwrap_or(true),
+        webhook_url_override: ppe_raw.discord_webhook_url,
+    };
+    let pcscf_pool_exhausted_thresholds = PcscfPoolExhaustedThresholds {
+        unhealthy_sec: ppe_raw
+            .unhealthy_sec
+            .and_then(|v| {
+                in_range_or_warn(v, "alerts.pcscf_pool_exhausted.unhealthy_sec", 30..=3600)
+            })
+            .unwrap_or(d.pcscf_pool_exhausted_thresholds.unhealthy_sec),
+    };
+
     AlertsConfig {
         // Falls back to the legacy `[sms].discord_webhook_url` so a
         // deployment that never adopted `[alerts]` keeps its SMS forwarding.
@@ -608,10 +626,12 @@ fn build_alerts(raw: RawAlerts, sms: &SmsConfig) -> AlertsConfig {
         missed_call: category(raw.missed_call, false),
         line_discovery_failed: category(raw.line_discovery_failed, false),
         gm_connection_lost,
+        pcscf_pool_exhausted,
         module_lifecycle_thresholds,
         tunnel_failure_thresholds,
         registration_loss_thresholds,
         gm_connection_lost_thresholds,
+        pcscf_pool_exhausted_thresholds,
     }
 }
 
