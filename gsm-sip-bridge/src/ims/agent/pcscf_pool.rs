@@ -17,8 +17,8 @@
 //! (`classify_register_failure`, the route probe, spec 090's qualifying
 //! endpoint failure, the Gm keepalive escalation). This module only records it.
 
+use crate::ims::pcscf_files::{PoolState, PoolStateMark, POOL_STATE_VERSION};
 use crate::ims::PcscfSnapshot;
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -37,9 +37,6 @@ const MARK_EXTRA: Duration = Duration::from_secs(300);
 /// `Retry-After` must not overflow `SystemTime` and panic the agent, and a
 /// genuine one, however long, is honoured in full (Greptile, PR #130).
 const FAR_FUTURE: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
-
-/// `.state` format version; anything else is ignored as a whole.
-const STATE_VERSION: u32 = 1;
 
 /// A failure attributable to the P-CSCF itself (FR-007, FR-008).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +129,11 @@ pub(crate) struct Mark {
     pub(crate) until: SystemTime,
     pub(crate) failures: u32,
     pub(crate) cause: String,
+    /// When this mark was last set or renewed. Persisted so the supervisor
+    /// can tell a mark against its current tunnel from one that outlived the
+    /// rebuild it caused (specs/097); `UNIX_EPOCH` for a mark loaded from a
+    /// file written before the field existed.
+    pub(crate) marked_at: SystemTime,
 }
 
 /// How long a P-CSCF stays unavailable after its `failures`-th consecutive
@@ -141,23 +143,6 @@ pub(crate) struct Mark {
 pub(crate) fn mark_duration(failures: u32) -> Duration {
     let doublings = failures.saturating_sub(1).min(16);
     (MARK_BASE * (1u32 << doublings)).min(MARK_CAP) + MARK_EXTRA
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PersistedPool {
-    version: u32,
-    last_registered: Option<IpAddr>,
-    #[serde(default)]
-    marks: Vec<PersistedMark>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PersistedMark {
-    addr: IpAddr,
-    until_unix: u64,
-    failures: u32,
-    #[serde(default)]
-    cause: String,
 }
 
 fn to_unix(t: SystemTime) -> u64 {
@@ -365,6 +350,7 @@ impl PcscfPool {
                 .unwrap_or_else(|| now + FAR_FUTURE),
             failures,
             cause: cause.to_string(),
+            marked_at: now,
         };
         self.marks.insert(addr, mark.clone());
         let remaining = self
@@ -463,14 +449,14 @@ impl PcscfPool {
                 return;
             }
         };
-        let persisted: PersistedPool = match serde_json::from_str(&raw) {
+        let persisted: PoolState = match serde_json::from_str(&raw) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "P-CSCF state unreadable; starting clean");
                 return;
             }
         };
-        if persisted.version != STATE_VERSION {
+        if persisted.version != POOL_STATE_VERSION {
             tracing::warn!(
                 path = %path.display(),
                 error = %format!("unsupported version {}", persisted.version),
@@ -497,6 +483,11 @@ impl PcscfPool {
                         until,
                         failures: m.failures,
                         cause: m.cause,
+                        // 0 (a file from before specs/097) or an impossible
+                        // value both read as "unknown", which never counts.
+                        marked_at: UNIX_EPOCH
+                            .checked_add(Duration::from_secs(m.marked_at_unix))
+                            .unwrap_or(UNIX_EPOCH),
                     },
                 );
             }
@@ -507,17 +498,18 @@ impl PcscfPool {
     /// it is logged and otherwise ignored.
     fn save(&self) {
         let Some(path) = &self.state_path else { return };
-        let persisted = PersistedPool {
-            version: STATE_VERSION,
+        let persisted = PoolState {
+            version: POOL_STATE_VERSION,
             last_registered: self.last_registered,
             marks: self
                 .marks
                 .iter()
-                .map(|(a, m)| PersistedMark {
+                .map(|(a, m)| PoolStateMark {
                     addr: *a,
                     until_unix: to_unix(m.until),
                     failures: m.failures,
                     cause: m.cause.clone(),
+                    marked_at_unix: to_unix(m.marked_at),
                 })
                 .collect(),
         };
@@ -891,6 +883,61 @@ mod tests {
         let p = PcscfPool::new(ip(C), ips(&[C]), Some(path.clone()));
         assert!(p.marks.is_empty());
         assert_eq!(p.last_registered, None);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // --- the marking time the supervisor reads (specs/097) ---
+
+    #[test]
+    fn a_mark_records_when_it_was_set_and_a_renewal_moves_it() {
+        let path = temp_state();
+        let mut p = PcscfPool::new(ip(A), ips(&[A]), Some(path.clone()));
+        p.select(t0());
+        let m = p
+            .on_failure(ip(A), FailureCause::GmKeepalive, t0())
+            .unwrap();
+        assert_eq!(m.marked_at, t0());
+        let saved = crate::ims::pcscf_files::read_pool_state(&path).unwrap();
+        assert_eq!(saved.marks[0].marked_at_unix, to_unix(t0()));
+        assert_eq!(saved.marks[0].cause, "gm-keepalive");
+
+        let later = t0() + secs(400);
+        p.select(later);
+        let m = p.on_failure(ip(A), FailureCause::Transport, later).unwrap();
+        assert_eq!(m.marked_at, later, "a renewal is a fresh failure");
+        let saved = crate::ims::pcscf_files::read_pool_state(&path).unwrap();
+        assert_eq!(saved.marks[0].marked_at_unix, to_unix(later));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_restart_keeps_the_marking_time() {
+        let path = temp_state();
+        {
+            let mut p = PcscfPool::new(ip(A), ips(&[A, B]), Some(path.clone()));
+            p.select(t0());
+            p.on_failure(ip(A), FailureCause::RegisterTimeout, t0());
+        }
+        let p = PcscfPool::new(ip(A), ips(&[A, B]), Some(path.clone()));
+        assert_eq!(p.marks[&ip(A)].marked_at, t0());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_state_file_without_marking_times_still_steers_failover() {
+        let path = temp_state();
+        let until = to_unix(t0() + secs(600));
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"last_registered":null,"marks":[
+                {{"addr":"{A}","until_unix":{until},"failures":1,"cause":"transport"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let mut p = PcscfPool::new(ip(A), ips(&[A, B]), Some(path.clone()));
+        assert_eq!(p.marks[&ip(A)].marked_at, UNIX_EPOCH);
+        assert_eq!(p.select(t0()).addr, ip(B), "the old mark still applies");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

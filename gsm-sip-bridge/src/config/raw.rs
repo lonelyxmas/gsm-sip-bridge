@@ -368,6 +368,10 @@ section! {
         /// unhealthy-duration like registration/tunnel loss, so it carries an
         /// `unhealthy_sec` threshold (`RawUnhealthyCategory`).
         pub gm_connection_lost: Option<RawUnhealthyCategory>,
+        /// specs/097: a line that keeps rebuilding because its IMS agent has
+        /// given up on every P-CSCF. Measured from the first such rebuild, so
+        /// it too carries `unhealthy_sec`.
+        pub pcscf_pool_exhausted: Option<RawUnhealthyCategory>,
     }
 }
 
@@ -714,6 +718,7 @@ pub fn section_key_lists() -> Vec<(&'static str, &'static [&'static str])> {
         ("alerts.tunnel_failure", RawUnhealthyCategory::KEYS),
         ("alerts.line_discovery_failed", RawAlertCategory::KEYS),
         ("alerts.gm_connection_lost", RawUnhealthyCategory::KEYS),
+        ("alerts.pcscf_pool_exhausted", RawUnhealthyCategory::KEYS),
         ("vowifi", RawVowifi::KEYS),
         ("vowifi.line", RawVowifiLine::KEYS),
         ("volte", RawVolte::KEYS),

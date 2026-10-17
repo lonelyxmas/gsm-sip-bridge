@@ -10,6 +10,22 @@ across releases.
 
 ### Added
 
+- **Rebuild on an exhausted P-CSCF pool.** When a VoWiFi line's IMS agent has
+  marked every P-CSCF it was given unavailable since the tunnel was last
+  negotiated, the supervisor rebuilds the tunnel to get a new one
+  (`recovered from PcscfPoolExhausted`). A carrier with a single P-CSCF, like
+  Vodafone IN, used to stay down indefinitely once the supervisor's probe was
+  out of the picture; it now recovers from the agent's own verdict. A call in
+  progress defers the rebuild until it ends
+  ([#120](https://github.com/selvakn/gsm-sip-bridge/issues/120)).
+
+- **`[alerts.pcscf_pool_exhausted]`.** A Discord alert, with a paired
+  all-clear, for a line that keeps rebuilding onto a dead P-CSCF pool for
+  longer than `unhealthy_sec` (default 300s). Upgrade note: it defaults
+  to enabled, like `gm_connection_lost`; set `enabled = false` under
+  `[alerts.pcscf_pool_exhausted]` to silence it
+  ([#120](https://github.com/selvakn/gsm-sip-bridge/issues/120)).
+
 - **Tunnel recovery counter.** `gsm_sip_bridge_vowifi_tunnel_recoveries_total`
   counts every steady-state recovery the supervisor performs on a strongSwan
   VoWiFi line, by `module` and `reason` (`default_route_missing`,

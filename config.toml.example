@@ -108,6 +108,14 @@ enabled = false
 enabled = true
 unhealthy_sec = 300               # range: 30-3600
 
+[alerts.pcscf_pool_exhausted]
+# A VoWiFi line keeps rebuilding its tunnel because its IMS agent has given
+# up on every P-CSCF, and has not registered again within unhealthy_sec of
+# the first such rebuild (typically a single-P-CSCF carrier handing out the
+# same dead address). Defaults ENABLED; set enabled = false to silence it.
+enabled = true
+unhealthy_sec = 300               # range: 30-3600
+
 [scheduled_restart]
 # Preventive nightly card-restart cycle. The daemon walks every known slot in
 # ascending order and restarts each modem with a randomized gap between

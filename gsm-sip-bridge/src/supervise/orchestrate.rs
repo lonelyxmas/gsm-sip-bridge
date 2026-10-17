@@ -26,7 +26,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// specs/022-discord-critical-alerts FR-004/research.md R2 (T011/T015): the
 /// pure decision of whether a `sim_recovery::Action` should raise or clear a
@@ -1830,6 +1830,8 @@ fn start_vowifi_line_strongswan(
 
     // Shared with the agent loop: set while a rebuild is syncing the P-CSCF.
     let rebuild_gate = Arc::new(RebuildGate::default());
+    // Before the agent starts, so its first marks count (specs/097 R3).
+    let negotiated_at = SystemTime::now();
     start_line_tail(
         ctx,
         idx,
@@ -1846,6 +1848,7 @@ fn start_vowifi_line_strongswan(
     // `current_pcscf`, so the tick function stays a decision over inputs.
     let mut tracking = line_supervisor::SteadyTracking {
         child_sa_usable: true,
+        negotiated_at: Some(negotiated_at),
         ..Default::default()
     };
     // IKE_SA rebuilds inside the tunnel-failure window; latching means flapping.
@@ -1892,6 +1895,7 @@ fn start_vowifi_line_strongswan(
             &mut tracking,
             line_supervisor::STEADY_STATE_POLL_INTERVAL,
             &|| line_in_call(runner.as_ref(), &line.pcscf_source_path),
+            &|| line_pool_state(runner.as_ref(), &line.pcscf_source_path),
         );
         report_pcscf_sibling(idx, &current_pcscf, via_sibling_before, &tracking);
         let renegotiated = matches!(
@@ -1960,6 +1964,7 @@ fn start_vowifi_line_strongswan(
                 };
                 current_pcscf = new_pcscf;
                 let _ = runner.run(&["pkill", "-f", &format!("vowifi-ims-agent --line {idx}$")]);
+                tracking.negotiated_at = Some(SystemTime::now());
             }
             line_supervisor::SteadyOutcome::Recovered {
                 reason,
@@ -1979,7 +1984,24 @@ fn start_vowifi_line_strongswan(
                     }
                     None => println!("[supervise] line {idx}: recovered from {reason:?}"),
                 }
-                send_tunnel(signal, vec![tunnel_recovered_event(reason)]);
+                if !tracking.pool_exhausted.is_empty() {
+                    println!(
+                        "{}",
+                        pool_exhausted_detail(
+                            idx,
+                            &tracking.pool_exhausted,
+                            tracking.negotiated_at
+                        )
+                    );
+                }
+                send_tunnel(
+                    signal,
+                    vec![tunnel_recovered_event(
+                        reason,
+                        &tracking.pool_exhausted,
+                        SystemTime::now(),
+                    )],
+                );
                 if let Some(new_handle) = engine.shared.current_handle() {
                     let mut st = started.lock().unwrap();
                     // Dedupe by identity: most recoveries are connection-
@@ -2051,6 +2073,11 @@ fn start_vowifi_line_strongswan(
                     }
                     let _ =
                         runner.run(&["pkill", "-f", &format!("vowifi-ims-agent --line {idx}$")]);
+                    // After the old agent is gone, not when the rebuild was
+                    // issued: while it waited for the new negotiation it could
+                    // still time a REGISTER out and mark, and that mark is about
+                    // the old tunnel, not this one (specs/097 R3).
+                    tracking.negotiated_at = Some(SystemTime::now());
                     rebuild_gate.open();
                     if rebuilds.record(std::time::Instant::now()) {
                         println!(
@@ -2376,13 +2403,67 @@ struct TunnelSignal {
     loss_cause: Option<crate::control::protocol::IkeSaLossCause>,
 }
 
-/// The event that counts one steady-state recovery of a line (specs/096).
+/// The event that counts one steady-state recovery of a line (specs/096),
+/// carrying, when the reason was an exhausted pool, the P-CSCFs and when the
+/// rebuild was issued (`now`), for the daemon's alert episode (specs/097).
 fn tunnel_recovered_event(
     reason: line_supervisor::DegradeReason,
+    exhausted: &[line_supervisor::ExhaustedMember],
+    now: SystemTime,
 ) -> crate::control::protocol::ObservedEvent {
     crate::control::protocol::ObservedEvent::TunnelRecovered {
         reason: reason.into(),
+        pcscfs: exhausted.iter().map(|m| m.addr.clone()).collect(),
+        rebuilt_at_unix: (!exhausted.is_empty()).then(|| {
+            now.duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs())
+        }),
     }
+}
+
+/// What a `PcscfPoolExhausted` rebuild was decided on, for the log: each
+/// member's mark and the negotiation it was compared against (FR-012).
+fn pool_exhausted_detail(
+    idx: u32,
+    members: &[line_supervisor::ExhaustedMember],
+    negotiated_at: Option<SystemTime>,
+) -> String {
+    let ts = |secs: u64| {
+        i64::try_from(secs)
+            .ok()
+            .and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0))
+            .map_or_else(|| format!("unix:{secs}"), |d| d.to_rfc3339())
+    };
+    let marks = members
+        .iter()
+        .map(|m| {
+            format!(
+                "{} ({}, marked {}, until {})",
+                m.addr,
+                m.cause,
+                ts(m.marked_at_unix),
+                ts(m.until_unix)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let since = negotiated_at
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or_else(|| "unknown".to_string(), |d| ts(d.as_secs()));
+    format!("[supervise] line {idx}: the IMS agent marked every P-CSCF unavailable since the negotiation at {since}: {marks}")
+}
+
+/// The line's IMS agent's P-CSCF pool state (`/tmp/pcscf-N.state`), read
+/// through the runner like [`line_in_call`]. `None` when it is missing or
+/// unusable, which the exhaustion check treats as "not exhausted".
+fn line_pool_state(
+    runner: &dyn CommandRunner,
+    pcscf_source_path: &str,
+) -> Option<crate::ims::pcscf_files::PoolState> {
+    runner
+        .read_file(&crate::ims::pcscf_files::state_path(pcscf_source_path))
+        .ok()
+        .and_then(|c| crate::ims::pcscf_files::parse_pool_state(&c))
 }
 
 /// Reports the tunnel signal if, and only if, it differs from the last one
@@ -2871,6 +2952,7 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
     }
 
     let usim_holder: Arc<Mutex<Option<Arc<ChildHandle>>>> = Arc::new(Mutex::new(None));
+    let negotiated_at = SystemTime::now();
     start_line_tail(
         ctx,
         idx,
@@ -2882,7 +2964,10 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
     );
 
     let mut current_pcscf = pcscf;
-    let mut tracking = line_supervisor::SteadyTracking::default();
+    let mut tracking = line_supervisor::SteadyTracking {
+        negotiated_at: Some(negotiated_at),
+        ..Default::default()
+    };
     loop {
         // Named, and shared with the reachability-window derivation: this loop
         // polls six times faster than the strongswan one, so any threshold
@@ -2906,9 +2991,11 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
             &current_pool,
             &mut tracking,
             line_supervisor::SWU_STEADY_STATE_POLL_INTERVAL,
-            // The swu engine reports no CHILD_SA lifetimes, so it never has a
-            // stuck-rekey rebuild to hold.
-            &|| false,
+            // The swu engine reports no CHILD_SA lifetimes, so a stuck-rekey
+            // rebuild never reaches this; it is here for the pool-exhaustion
+            // rebuild, which waits for a call to end (specs/097 R6).
+            &|| line_in_call(runner.as_ref(), &line.pcscf_source_path),
+            &|| line_pool_state(runner.as_ref(), &line.pcscf_source_path),
         );
         report_pcscf_sibling(idx, &current_pcscf, via_sibling_before, &tracking);
         match outcome {
@@ -2940,14 +3027,28 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
                     engine.latest_pcscf_pool(runner.as_ref()),
                 );
                 current_pcscf = new_pcscf;
+                tracking.negotiated_at = Some(SystemTime::now());
             }
             line_supervisor::SteadyOutcome::Recovered { reason, .. } => {
                 println!("[supervise] line {idx}: recovered from {reason:?}");
+                if !tracking.pool_exhausted.is_empty() {
+                    println!(
+                        "{}",
+                        pool_exhausted_detail(
+                            idx,
+                            &tracking.pool_exhausted,
+                            tracking.negotiated_at
+                        )
+                    );
+                }
                 if let Some(h) = engine.dialer_handle.borrow().clone() {
                     started.lock().unwrap().vowifi_child_handles.push(h);
                 }
                 drop(guard);
                 let _ = runner.run(&["pkill", "-f", &format!("vowifi-ims-agent --line {idx}$")]);
+                if line_supervisor::recovery_renegotiates(reason) {
+                    tracking.negotiated_at = Some(SystemTime::now());
+                }
             }
         }
     }
@@ -3961,13 +4062,74 @@ mod tests {
         #[test]
         fn a_recovery_is_reported_as_a_counted_event_with_its_reason() {
             use crate::control::protocol::{ObservedEvent, TunnelRecoveryReason};
-            let event = tunnel_recovered_event(line_supervisor::DegradeReason::DefaultRouteMissing);
-            assert!(matches!(
+            let event = tunnel_recovered_event(
+                line_supervisor::DegradeReason::DefaultRouteMissing,
+                &[],
+                SystemTime::now(),
+            );
+            assert_eq!(
                 event,
                 ObservedEvent::TunnelRecovered {
-                    reason: TunnelRecoveryReason::DefaultRouteMissing
+                    reason: TunnelRecoveryReason::DefaultRouteMissing,
+                    pcscfs: Vec::new(),
+                    rebuilt_at_unix: None,
                 }
-            ));
+            );
+        }
+
+        #[test]
+        fn a_pool_exhausted_recovery_reports_the_exhausted_pcscfs() {
+            use crate::control::protocol::{ObservedEvent, TunnelRecoveryReason};
+            let members = [line_supervisor::ExhaustedMember {
+                addr: "10.0.0.11".into(),
+                cause: "gm-keepalive".into(),
+                until_unix: 1_790_000_330,
+                marked_at_unix: 1_790_000_000,
+            }];
+            let event = tunnel_recovered_event(
+                line_supervisor::DegradeReason::PcscfPoolExhausted,
+                &members,
+                std::time::UNIX_EPOCH + Duration::from_secs(1_790_000_400),
+            );
+            assert_eq!(
+                event,
+                ObservedEvent::TunnelRecovered {
+                    reason: TunnelRecoveryReason::PcscfPoolExhausted,
+                    pcscfs: vec!["10.0.0.11".into()],
+                    rebuilt_at_unix: Some(1_790_000_400),
+                }
+            );
+            let detail = pool_exhausted_detail(
+                0,
+                &members,
+                Some(std::time::UNIX_EPOCH + Duration::from_secs(1_789_999_000)),
+            );
+            assert!(
+                detail.contains("10.0.0.11 (gm-keepalive, marked "),
+                "{detail}"
+            );
+            assert!(
+                detail.contains("since the negotiation at 2026-"),
+                "{detail}"
+            );
+        }
+
+        #[test]
+        fn the_pool_state_is_read_through_the_runner_and_unusable_is_none() {
+            let mock = MockCommandRunner::new();
+            assert!(line_pool_state(&mock, "/tmp/pcscf-0").is_none(), "no file");
+            mock.set_file("/tmp/pcscf-0.state", "garbage");
+            assert!(line_pool_state(&mock, "/tmp/pcscf-0").is_none());
+            mock.set_file(
+                "/tmp/pcscf-0.state",
+                r#"{"version":1,"last_registered":null,"marks":[{"addr":"10.0.0.11","until_unix":9,"failures":1,"cause":"transport","marked_at_unix":3}]}"#,
+            );
+            let state = line_pool_state(&mock, "/tmp/pcscf-0").unwrap();
+            assert_eq!(state.marks[0].marked_at_unix, 3);
+            assert!(
+                line_pool_state(&mock, "/tmp/pcscf-1").is_none(),
+                "another line's file"
+            );
         }
 
         #[test]

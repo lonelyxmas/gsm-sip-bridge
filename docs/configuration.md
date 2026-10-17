@@ -74,6 +74,8 @@ clears — never a repeating stream while a condition stays unhealthy.
 | `[alerts.line_discovery_failed]` | `enabled` | boolean | false | An explicitly configured VoWiFi line (`modem_port`/`modem_serial`) never resolved even after retrying discovery for it |
 | `[alerts.gm_connection_lost]` | `enabled` | boolean | **true** | A registered line's Gm signaling connection down and unrecoverable continuously past `unhealthy_sec`, despite automatic reconnects and a re-registration. Defaults enabled (an incident, not an opt-in) |
 | | `unhealthy_sec` | integer | 300 | Range: 30-3600 |
+| `[alerts.pcscf_pool_exhausted]` | `enabled` | boolean | **true** | A VoWiFi line keeps rebuilding its tunnel because its IMS agent has marked every P-CSCF it was given unavailable (`PcscfPoolExhausted`), and has not registered again within `unhealthy_sec` of the first such rebuild. Typical of a single-P-CSCF carrier that keeps handing out the same dead address. One alert per episode, one all-clear when the line registers. Defaults enabled. strongSwan lines only: the swu engine rebuilds but does not report |
+| | `unhealthy_sec` | integer | 300 | Range: 30-3600 |
 
 Every sub-table also accepts its own `discord_webhook_url` override; a
 category without one falls back to `[alerts].discord_webhook_url`. See

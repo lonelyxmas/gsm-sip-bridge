@@ -44,10 +44,15 @@ fn enabled_alerts_config(default_webhook: &str) -> AlertsConfig {
             enabled: true,
             webhook_url_override: None,
         },
+        pcscf_pool_exhausted: CategoryAlertConfig {
+            enabled: true,
+            webhook_url_override: None,
+        },
         module_lifecycle_thresholds: Default::default(),
         tunnel_failure_thresholds: Default::default(),
         registration_loss_thresholds: Default::default(),
         gm_connection_lost_thresholds: Default::default(),
+        pcscf_pool_exhausted_thresholds: Default::default(),
     }
 }
 

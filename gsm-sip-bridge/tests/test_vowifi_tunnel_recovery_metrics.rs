@@ -42,7 +42,11 @@ fn tunnel_state() -> AgentState {
 }
 
 fn recovered(reason: TunnelRecoveryReason) -> ObservedEvent {
-    ObservedEvent::TunnelRecovered { reason }
+    ObservedEvent::TunnelRecovered {
+        reason,
+        pcscfs: Vec::new(),
+        rebuilt_at_unix: None,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

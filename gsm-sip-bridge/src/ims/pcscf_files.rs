@@ -1,8 +1,9 @@
 //! The per-line P-CSCF files beside `/tmp/pcscf-N` (specs/091,
 //! `contracts/files.md`): the pool the supervisor publishes and the state the
-//! agent keeps across its own restarts. Plus the agent's active-call count,
-//! which the supervisor reads to hold a stuck-rekey rebuild for a call
-//! (specs/093 `contracts/files.md`).
+//! agent keeps across its own restarts, which the supervisor also reads to tell
+//! when the agent has given up on every P-CSCF (specs/097). Plus the agent's
+//! active-call count, which the supervisor reads to hold a stuck-rekey rebuild
+//! for a call (specs/093 `contracts/files.md`).
 //!
 //! Shared by both sides so the writer and the reader cannot disagree on a
 //! path or a format. The selection file itself (`/tmp/pcscf-N`) is untouched:
@@ -69,6 +70,52 @@ pub fn read_pool(path: &Path) -> Vec<IpAddr> {
         .unwrap_or_default()
 }
 
+/// The `.state` format's version; a file carrying any other is ignored whole.
+pub const POOL_STATE_VERSION: u32 = 1;
+
+/// The agent's `.state` file (specs/091 `contracts/files.md`): the P-CSCF it
+/// last registered through and the ones it has marked unavailable. Written by
+/// the agent only; read back by the agent across its own restarts and, since
+/// specs/097, by the supervisor every steady-state tick.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PoolState {
+    pub version: u32,
+    pub last_registered: Option<IpAddr>,
+    #[serde(default)]
+    pub marks: Vec<PoolStateMark>,
+}
+
+/// One P-CSCF the agent is avoiding, and until when.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PoolStateMark {
+    pub addr: IpAddr,
+    pub until_unix: u64,
+    pub failures: u32,
+    /// The agent's `FailureCause` rendering: `gm-keepalive`,
+    /// `register-timeout`, `transport`, `endpoint-failure:<c>`, `retry-after`.
+    #[serde(default)]
+    pub cause: String,
+    /// When the mark was last set or renewed (specs/097). `0` in a file
+    /// written before the field existed, which reads as "unknown, too old to
+    /// count" -- no version bump, so an older agent still loads the file.
+    #[serde(default)]
+    pub marked_at_unix: u64,
+}
+
+/// A `.state` file's contents, or `None` when they do not parse or carry an
+/// unsupported version.
+pub fn parse_pool_state(contents: &str) -> Option<PoolState> {
+    serde_json::from_str::<PoolState>(contents)
+        .ok()
+        .filter(|s| s.version == POOL_STATE_VERSION)
+}
+
+/// [`parse_pool_state`] of the file at `path`; `None` when it is missing or
+/// unreadable too.
+pub fn read_pool_state(path: &Path) -> Option<PoolState> {
+    parse_pool_state(&std::fs::read_to_string(path).ok()?)
+}
+
 /// Writes `<path>.tmp` and renames it over `path`, so a concurrent reader sees
 /// the old contents or the new, never a torn mix.
 pub fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
@@ -91,6 +138,52 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn mark(addr: &str, marked_at_unix: u64) -> PoolStateMark {
+        PoolStateMark {
+            addr: addr.parse().unwrap(),
+            until_unix: 1_790_000_330,
+            failures: 1,
+            cause: "gm-keepalive".into(),
+            marked_at_unix,
+        }
+    }
+
+    #[test]
+    fn a_pool_state_round_trips_with_its_marking_time() {
+        let state = PoolState {
+            version: POOL_STATE_VERSION,
+            last_registered: Some("10.0.0.10".parse().unwrap()),
+            marks: vec![mark("10.0.0.11", 1_790_000_000)],
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("\"marked_at_unix\":1790000000"), "{json}");
+        assert_eq!(parse_pool_state(&json), Some(state));
+    }
+
+    #[test]
+    fn a_state_file_from_before_the_marking_time_reads_it_as_zero() {
+        let old = r#"{"version":1,"last_registered":null,"marks":[
+            {"addr":"10.0.0.11","until_unix":1790000330,"failures":2,"cause":"transport"}]}"#;
+        let state = parse_pool_state(old).unwrap();
+        assert_eq!(state.marks[0].marked_at_unix, 0);
+        assert_eq!(state.marks[0].failures, 2);
+    }
+
+    #[test]
+    fn an_unusable_state_file_reads_as_none() {
+        let dir = temp_dir();
+        assert_eq!(read_pool_state(&dir.join("absent.state")), None);
+        let garbage = dir.join("garbage.state");
+        std::fs::write(&garbage, "not json").unwrap();
+        assert_eq!(read_pool_state(&garbage), None);
+        let v2 = dir.join("v2.state");
+        std::fs::write(&v2, r#"{"version":2,"last_registered":null,"marks":[]}"#).unwrap();
+        assert_eq!(read_pool_state(&v2), None);
+        let ok = dir.join("ok.state");
+        std::fs::write(&ok, r#"{"version":1,"last_registered":null}"#).unwrap();
+        assert_eq!(read_pool_state(&ok).map(|s| s.marks.len()), Some(0));
     }
 
     #[test]
