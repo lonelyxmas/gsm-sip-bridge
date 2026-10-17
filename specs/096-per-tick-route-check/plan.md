@@ -26,7 +26,7 @@ Clarifications Q3 and Q4 add a counter, `gsm_sip_bridge_vowifi_tunnel_recoveries
 - The order of every other tick check is unchanged (FR-005).
 - `DefaultRouteMissing` keeps its `recovery_restarts_agent`/`recovery_renegotiates` semantics (FR-009).
 - No new escalation (FR-012).
-- The counter's label cardinality stays bounded: one closed enum of 12 reasons.
+- The counter's label cardinality stays bounded: one closed enum of 11 reasons.
 - The swu engine is untouched (FR-008). The swu loop has no supervisor reporter, so it gets no counter.
 
 **Scale/Scope**: 1–8 lines per host. About 30 lines of production change in `line_supervisor.rs`, about 60 across `control/protocol.rs`, `metrics/{mod,ingest}.rs` and `supervise/orchestrate.rs`, plus tests, docs and the changelog

@@ -32,7 +32,7 @@ There were no NEEDS CLARIFICATION items in Technical Context. The decisions belo
 
 ## R4. The reason label set
 
-- **Decision**: `TunnelRecoveryReason` is a closed serde enum (`snake_case`) in `control/protocol.rs`, with one variant per `DegradeReason` variant (12). A total `From<DegradeReason>` lives in `line_supervisor.rs`, and `as_str()` gives the label.
+- **Decision**: `TunnelRecoveryReason` is a closed serde enum (`snake_case`) in `control/protocol.rs`, with one variant per `DegradeReason` variant (11). A total `From<DegradeReason>` lives in `line_supervisor.rs`, and `as_str()` gives the label.
 - **Rationale**:
   - The wire module keeps no dependency on `supervise`, the same layering as `OutboundAttemptOutcome`.
   - Cardinality is bounded (FR-014 of specs/014).

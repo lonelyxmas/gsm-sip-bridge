@@ -10,6 +10,14 @@ across releases.
 
 ### Added
 
+- **Tunnel recovery counter.** `gsm_sip_bridge_vowifi_tunnel_recoveries_total`
+  counts every steady-state recovery the supervisor performs on a strongSwan
+  VoWiFi line, by `module` and `reason` (`default_route_missing`,
+  `pcscf_unreachable`, `ike_sa_lost`, `child_sa_rekey_stuck`, ...). A rising
+  `default_route_missing` count is a route that keeps vanishing, which never
+  counts as flapping
+  ([#120](https://github.com/selvakn/gsm-sip-bridge/issues/120)).
+
 - **`tunnel_address_family`.** Which inner address families a VoWiFi line's
   ePDG tunnel requests and carries: `dual` (default, unchanged), `ipv4` or
   `ipv6`, under `[vowifi]` and `[[vowifi.line]]`. `ipv4` stops an ePDG that
@@ -82,6 +90,13 @@ across releases.
   ([#127](https://github.com/selvakn/gsm-sip-bridge/issues/127)).
 
 ### Fixed
+
+- **A lost default route is repaired on the next tick.** The supervisor
+  checked a line's default route only after its P-CSCF probe had failed, so
+  without that probe a deleted route was never put back. It is now checked on
+  every steady-state tick, ahead of the probe, and reinstated within 30 s
+  without touching the tunnel
+  ([#120](https://github.com/selvakn/gsm-sip-bridge/issues/120)).
 
 - **IPv6 lines repair a lost default route at once.** The supervisor's
   default-route check looked at IPv4 only, so on a line whose P-CSCF is IPv6
