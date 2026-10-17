@@ -1,7 +1,7 @@
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan at
-`specs/094-pcscf-probe-reduction/plan.md`.
+`specs/096-per-tick-route-check/plan.md`.
 <!-- SPECKIT END -->
 
 ## Pre-commit Checklist

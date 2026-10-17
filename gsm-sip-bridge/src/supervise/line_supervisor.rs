@@ -83,9 +83,30 @@ pub enum DegradeReason {
     /// `swanctl --list-sas` reported a healthy tunnel throughout.
     ///
     /// Distinct from [`Self::PcscfUnreachable`] because the remedy is completely
-    /// different — one `ip route replace`, no renegotiation, no dropped call —
-    /// and because a rebuild provably cannot fix it.
+    /// different — one `ip route replace`, no renegotiation — and because a
+    /// rebuild provably cannot fix it. The line's IMS agent is still restarted
+    /// ([`recovery_restarts_agent`]), so a call in progress is dropped.
     DefaultRouteMissing,
+}
+
+/// The wire label for a recovery (specs/096). Exhaustive on purpose, with no
+/// wildcard arm: a new reason does not compile until it has a label.
+impl From<DegradeReason> for crate::control::protocol::TunnelRecoveryReason {
+    fn from(reason: DegradeReason) -> Self {
+        match reason {
+            DegradeReason::ProcessDied => Self::ProcessDied,
+            DegradeReason::ViciBroken => Self::ViciBroken,
+            DegradeReason::TunVanished => Self::TunVanished,
+            DegradeReason::TunUnavailable => Self::TunUnavailable,
+            DegradeReason::ChildSaMissing => Self::ChildSaMissing,
+            DegradeReason::IkeSaLost => Self::IkeSaLost,
+            DegradeReason::ChildSaStuck => Self::ChildSaStuck,
+            DegradeReason::ChildSaRekeyStuck => Self::ChildSaRekeyStuck,
+            DegradeReason::PcscfChanged => Self::PcscfChanged,
+            DegradeReason::PcscfUnreachable => Self::PcscfUnreachable,
+            DegradeReason::DefaultRouteMissing => Self::DefaultRouteMissing,
+        }
+    }
 }
 
 /// Steady-state-only health, beyond "is the process alive" and "is a P-CSCF
@@ -239,6 +260,10 @@ pub trait TunnelEngine {
     fn recreate_interface(&self, runner: &dyn CommandRunner) -> bool;
     /// Reinstate this line's default route if it is missing, returning whether
     /// it had to (`true` = it was missing and has now been repaired).
+    ///
+    /// Called on every structurally healthy steady-state tick, ahead of the
+    /// P-CSCF probe, so a lost route is repaired whatever the probe says
+    /// (#120 finding 3).
     ///
     /// "Missing" means missing in `pcscf`'s address family: that is the route
     /// whose absence makes the P-CSCF unreachable, and the other family's
@@ -640,6 +665,32 @@ pub fn tick_steady_state_with_pool(
         }
     }
 
+    // Is the route simply gone? That is a millisecond repair with no
+    // renegotiation, against a rebuild that renegotiates the SA -- and it is
+    // the one fault that presents with every structural check passing.
+    //
+    // It is also what a rebuild cannot fix. The kernel deletes an interface's
+    // IPv4 default route when its last IPv4 address goes, so the `terminate`
+    // in the unreachable branch below destroys the route `recreate_interface`
+    // installs moments earlier. On 2026-08-19 that loop ran 202 times over six
+    // hours without ever restoring the data path.
+    //
+    // Checked on every tick, ahead of the probe, because it is structural: it
+    // used to run only once the probe had failed, so without the probe (#120)
+    // a lost route was never put back -- the probes-off soak left a line down
+    // for 10 minutes (#120 finding 3).
+    //
+    // The current selection's family, because that is the address the line
+    // registers through; a sibling only matters once it has been chosen. No
+    // selection yet means no family to check, as for the probe below.
+    if !current_pcscf.is_empty() && engine.repair_default_route(runner, current_pcscf) {
+        tracking.pcscf_unreachable = 0;
+        return SteadyOutcome::Recovered {
+            reason: DegradeReason::DefaultRouteMissing,
+            ike_sa_loss_cause: None,
+        };
+    }
+
     let selection_reachable = engine.pcscf_reachable(runner, current_pcscf);
     let sibling = if selection_reachable {
         None
@@ -654,26 +705,8 @@ pub fn tick_steady_state_with_pool(
     if selection_reachable || tracking.pcscf_via_sibling.is_some() {
         tracking.pcscf_unreachable = 0;
     } else {
-        // Before escalating: is the route simply gone? That is a millisecond
-        // repair with no disruption, against a rebuild that renegotiates the SA
-        // and drops any call — and it is the one fault that presents exactly
-        // like this, with every structural check passing.
-        //
-        // It is also what a rebuild cannot fix. The kernel deletes an
-        // interface's IPv4 default route when its last IPv4 address goes, so
-        // the `terminate` below destroys the route `recreate_interface`
-        // installs moments earlier. On 2026-08-19 that loop ran 202 times over
-        // six hours without ever restoring the data path.
-        //
-        // The current selection's family, because that is the address the line
-        // registers through; a sibling only matters once it has been chosen.
-        if engine.repair_default_route(runner, current_pcscf) {
-            tracking.pcscf_unreachable = 0;
-            return SteadyOutcome::Recovered {
-                reason: DegradeReason::DefaultRouteMissing,
-                ike_sa_loss_cause: None,
-            };
-        }
+        // The route was checked above, this same tick: unreachable with it in
+        // place is some other fault.
         tracking.pcscf_unreachable = tracking.pcscf_unreachable.saturating_add(1);
         // Derived from this loop's own cadence, so both engines wait the same
         // ~90s of real time rather than the same number of ticks.
@@ -868,6 +901,9 @@ mod tests {
         /// one specific *cause* of unreachability with its own cheap remedy.
         route_missing: RefCell<bool>,
         route_repairs: RefCell<u32>,
+        /// Every `repair_default_route` call, including the ones that found
+        /// nothing missing -- `route_repairs` counts only actual repairs.
+        repair_calls: RefCell<u32>,
         established: RefCell<bool>,
         pcscf: RefCell<Option<String>>,
         pool: RefCell<Vec<String>>,
@@ -906,6 +942,7 @@ mod tests {
                 // must not silently absorb those cases.
                 route_missing: RefCell::new(false),
                 route_repairs: RefCell::new(0),
+                repair_calls: RefCell::new(0),
                 alive: RefCell::new(true),
                 health: RefCell::new(SteadyStateHealth::Ok(None)),
                 max_attempts: None,
@@ -959,6 +996,7 @@ mod tests {
             self.rejection.borrow().clone()
         }
         fn repair_default_route(&self, _runner: &dyn CommandRunner, _pcscf: &str) -> bool {
+            *self.repair_calls.borrow_mut() += 1;
             if !*self.route_missing.borrow() {
                 return false;
             }
@@ -1481,9 +1519,100 @@ mod tests {
     }
 
     #[test]
-    fn a_reachable_line_is_never_probed_for_its_route() {
-        // Cheap as the repair is, it is still two `ip` invocations per line per
-        // tick. A healthy line must not pay for them.
+    fn every_recovery_reason_has_the_wire_label_of_the_same_name() {
+        use crate::control::protocol::TunnelRecoveryReason;
+        let reasons = [
+            DegradeReason::ProcessDied,
+            DegradeReason::ViciBroken,
+            DegradeReason::TunVanished,
+            DegradeReason::TunUnavailable,
+            DegradeReason::ChildSaMissing,
+            DegradeReason::IkeSaLost,
+            DegradeReason::ChildSaStuck,
+            DegradeReason::ChildSaRekeyStuck,
+            DegradeReason::PcscfChanged,
+            DegradeReason::PcscfUnreachable,
+            DegradeReason::DefaultRouteMissing,
+        ];
+        assert_eq!(reasons.len(), TunnelRecoveryReason::ALL.len());
+        for reason in reasons {
+            let wire = TunnelRecoveryReason::from(reason);
+            assert_eq!(format!("{reason:?}"), format!("{wire:?}"));
+        }
+    }
+
+    #[test]
+    fn a_missing_route_is_repaired_even_while_the_pcscf_answers() {
+        // #120 finding 3. The repair used to run only after the probe failed,
+        // so with the probe removed (or answering over whatever else survived)
+        // a lost route was never put back: run C left a line down for 10
+        // minutes. The route is structural; it gets checked like the rest.
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            pcscf_reachable: RefCell::new(true),
+            route_missing: RefCell::new(true),
+            ..Default::default()
+        };
+        let mut streak = SteadyTracking::default();
+        assert_eq!(
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::DefaultRouteMissing,
+                ike_sa_loss_cause: None,
+            }
+        );
+        assert_eq!(*engine.route_repairs.borrow(), 1);
+        assert_eq!(*engine.terminate_calls.borrow(), 0);
+        assert_eq!(*engine.reinitiate_calls.borrow(), 0);
+        assert_eq!(*engine.recreate_interface_calls.borrow(), 0);
+        assert_eq!(streak.pcscf_unreachable, 0);
+        assert_eq!(
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
+            SteadyOutcome::StillUp
+        );
+    }
+
+    #[test]
+    fn the_route_is_checked_before_the_probe() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            pcscf_reachable: RefCell::new(false),
+            route_missing: RefCell::new(true),
+            ..Default::default()
+        };
+        let mut streak = SteadyTracking::default();
+        assert!(matches!(
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::DefaultRouteMissing,
+                ..
+            }
+        ));
+        assert!(
+            engine.probed.borrow().is_empty(),
+            "a repairing tick must not depend on, or even run, the probe"
+        );
+    }
+
+    #[test]
+    fn an_empty_pcscf_skips_the_route_check() {
+        // No P-CSCF means no family to check; checking both would invent a
+        // missing IPv4 route on an IPv6-only line.
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            route_missing: RefCell::new(true),
+            ..Default::default()
+        };
+        let mut streak = SteadyTracking::default();
+        assert_eq!(
+            tick_steady_state(&engine, &runner, "", &mut streak),
+            SteadyOutcome::StillUp
+        );
+        assert_eq!(*engine.repair_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn a_present_route_still_lets_the_probe_decide() {
         let runner = MockCommandRunner::new();
         let engine = FakeEngine::default();
         let mut streak = SteadyTracking::default();
@@ -1491,7 +1620,70 @@ mod tests {
             tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
             SteadyOutcome::StillUp
         );
+        assert_eq!(*engine.repair_calls.borrow(), 1);
         assert!(!engine.call_order.borrow().contains(&"repair_route"));
+        assert_eq!(*engine.probed.borrow(), vec!["10.0.0.1".to_string()]);
+    }
+
+    #[test]
+    fn structural_faults_and_pcscf_changes_skip_the_route_check() {
+        let runner = MockCommandRunner::new();
+        for health in [
+            SteadyStateHealth::ViciBroken,
+            SteadyStateHealth::TunVanished,
+            SteadyStateHealth::IkeSaMissing,
+            SteadyStateHealth::ChildSaMissing,
+        ] {
+            let engine = FakeEngine {
+                health: RefCell::new(health),
+                route_missing: RefCell::new(true),
+                ..Default::default()
+            };
+            let outcome =
+                tick_steady_state(&engine, &runner, "10.0.0.1", &mut SteadyTracking::default());
+            assert!(
+                !matches!(
+                    outcome,
+                    SteadyOutcome::Recovered {
+                        reason: DegradeReason::DefaultRouteMissing,
+                        ..
+                    }
+                ),
+                "{health:?}: {outcome:?}"
+            );
+            assert_eq!(*engine.repair_calls.borrow(), 0, "{health:?}");
+        }
+
+        let engine = FakeEngine {
+            pcscf: RefCell::new(Some("10.0.0.2".to_string())),
+            route_missing: RefCell::new(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut SteadyTracking::default()),
+            SteadyOutcome::PcscfChanged {
+                new_pcscf: "10.0.0.2".to_string()
+            }
+        );
+        assert_eq!(*engine.repair_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn the_route_is_repaired_at_most_once_per_tick() {
+        // Route present, P-CSCF silent: the unreachable branch must not ask
+        // again what was asked milliseconds earlier in the same tick.
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            pcscf_reachable: RefCell::new(false),
+            ..Default::default()
+        };
+        let mut streak = SteadyTracking::default();
+        assert_eq!(
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut streak),
+            SteadyOutcome::StillUp
+        );
+        assert_eq!(*engine.repair_calls.borrow(), 1);
+        assert_eq!(streak.pcscf_unreachable, 1);
     }
 
     #[test]

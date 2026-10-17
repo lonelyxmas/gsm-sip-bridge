@@ -1768,8 +1768,10 @@ fn start_vowifi_line_strongswan(
         Duration::from_secs(ctx.config.metrics.agent_report_interval_seconds),
     );
     // Every report carries the whole supervisor signal (CHILD_SA, flapping, last
-    // IKE_SA loss cause) so ingest never has to infer one from another.
-    let report_tunnel = |s: TunnelSignal| {
+    // IKE_SA loss cause) so ingest never has to infer one from another -- the
+    // ones carrying a recovery event too, since the reporter heartbeats
+    // whatever state it was last handed.
+    let send_tunnel = |s: TunnelSignal, events: Vec<crate::control::protocol::ObservedEvent>| {
         child_sa_reporter.report(
             crate::control::protocol::AgentState {
                 child_sa_up: Some(s.child_sa_up),
@@ -1777,9 +1779,10 @@ fn start_vowifi_line_strongswan(
                 ike_sa_loss_cause: s.loss_cause,
                 ..Default::default()
             },
-            Vec::new(),
+            events,
         );
     };
+    let report_tunnel = |s: TunnelSignal| send_tunnel(s, Vec::new());
     let mut signal = TunnelSignal {
         child_sa_up: false,
         flapping: false,
@@ -1976,6 +1979,7 @@ fn start_vowifi_line_strongswan(
                     }
                     None => println!("[supervise] line {idx}: recovered from {reason:?}"),
                 }
+                send_tunnel(signal, vec![tunnel_recovered_event(reason)]);
                 if let Some(new_handle) = engine.shared.current_handle() {
                     let mut st = started.lock().unwrap();
                     // Dedupe by identity: most recoveries are connection-
@@ -2370,6 +2374,15 @@ struct TunnelSignal {
     child_sa_up: bool,
     flapping: bool,
     loss_cause: Option<crate::control::protocol::IkeSaLossCause>,
+}
+
+/// The event that counts one steady-state recovery of a line (specs/096).
+fn tunnel_recovered_event(
+    reason: line_supervisor::DegradeReason,
+) -> crate::control::protocol::ObservedEvent {
+    crate::control::protocol::ObservedEvent::TunnelRecovered {
+        reason: reason.into(),
+    }
 }
 
 /// Reports the tunnel signal if, and only if, it differs from the last one
@@ -3944,6 +3957,18 @@ mod tests {
         use super::*;
         use crate::control::protocol::IkeSaLossCause;
         use std::cell::RefCell;
+
+        #[test]
+        fn a_recovery_is_reported_as_a_counted_event_with_its_reason() {
+            use crate::control::protocol::{ObservedEvent, TunnelRecoveryReason};
+            let event = tunnel_recovered_event(line_supervisor::DegradeReason::DefaultRouteMissing);
+            assert!(matches!(
+                event,
+                ObservedEvent::TunnelRecovered {
+                    reason: TunnelRecoveryReason::DefaultRouteMissing
+                }
+            ));
+        }
 
         #[test]
         fn only_a_changed_signal_is_reported() {
