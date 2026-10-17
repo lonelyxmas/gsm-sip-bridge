@@ -136,6 +136,60 @@ impl std::fmt::Display for IkeSaLossCause {
     }
 }
 
+/// Why the line supervisor recovered a strongSwan VoWiFi line on a steady-state
+/// tick (specs/096). Mirrors `supervise::line_supervisor::DegradeReason`
+/// one-to-one without depending on it, the same layering `CallStatus` and
+/// `OutboundAttemptOutcome` keep; the mapping lives on the supervisor side and
+/// is exhaustive, so a new reason cannot ship without a label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelRecoveryReason {
+    ProcessDied,
+    ViciBroken,
+    TunVanished,
+    TunUnavailable,
+    ChildSaMissing,
+    IkeSaLost,
+    ChildSaStuck,
+    ChildSaRekeyStuck,
+    /// Never a steady-state recovery; present only so the mapping is total.
+    PcscfChanged,
+    PcscfUnreachable,
+    DefaultRouteMissing,
+}
+
+impl TunnelRecoveryReason {
+    pub const ALL: [Self; 11] = [
+        Self::ProcessDied,
+        Self::ViciBroken,
+        Self::TunVanished,
+        Self::TunUnavailable,
+        Self::ChildSaMissing,
+        Self::IkeSaLost,
+        Self::ChildSaStuck,
+        Self::ChildSaRekeyStuck,
+        Self::PcscfChanged,
+        Self::PcscfUnreachable,
+        Self::DefaultRouteMissing,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ProcessDied => "process_died",
+            Self::ViciBroken => "vici_broken",
+            Self::TunVanished => "tun_vanished",
+            Self::TunUnavailable => "tun_unavailable",
+            Self::ChildSaMissing => "child_sa_missing",
+            Self::IkeSaLost => "ike_sa_lost",
+            Self::ChildSaStuck => "child_sa_stuck",
+            Self::ChildSaRekeyStuck => "child_sa_rekey_stuck",
+            Self::PcscfChanged => "pcscf_changed",
+            Self::PcscfUnreachable => "pcscf_unreachable",
+            Self::DefaultRouteMissing => "default_route_missing",
+        }
+    }
+}
+
 /// Absolute, latest-wins gauge state. `None` means "this agent does not
 /// report this signal" — distinct from `Some(false)`, which means "reports
 /// it, and it is currently down". The daemon never invents a value for
@@ -255,6 +309,14 @@ pub enum ObservedEvent {
     /// FR-017a requires so that shortfall doesn't read as a healthy,
     /// silently RTCP-less bridge.
     RtcpUnavailable,
+    /// Supervisor only: one steady-state recovery of this line, sent once per
+    /// `SteadyOutcome::Recovered` (specs/096). An event rather than a running
+    /// total in `AgentState` so a supervisor restart cannot rewind the count,
+    /// and so a route that keeps vanishing -- repaired every tick, never
+    /// counted as flapping -- shows up somewhere other than the logs.
+    TunnelRecovered {
+        reason: TunnelRecoveryReason,
+    },
 }
 
 /// Whose view of the call [`ObservedEvent::MediaQuality`] describes.
@@ -502,6 +564,27 @@ mod tests {
             assert_eq!(serde_json::from_str::<IkeSaLossCause>(wire).unwrap(), c);
             assert_eq!(c.to_string(), text);
         }
+    }
+
+    #[test]
+    fn tunnel_recovery_reasons_round_trip_under_their_labels() {
+        for reason in TunnelRecoveryReason::ALL {
+            let json = serde_json::to_string(&reason).unwrap();
+            assert_eq!(json, format!("\"{}\"", reason.as_str()));
+            let back: TunnelRecoveryReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, reason);
+        }
+    }
+
+    #[test]
+    fn tunnel_recovered_event_wire_shape() {
+        let event = ObservedEvent::TunnelRecovered {
+            reason: TunnelRecoveryReason::DefaultRouteMissing,
+        };
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"event":"tunnel_recovered","reason":"default_route_missing"}"#
+        );
     }
 
     #[test]

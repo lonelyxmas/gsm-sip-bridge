@@ -475,6 +475,22 @@ pub static VOWIFI_BRIDGE_FAILURES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     .unwrap()
 });
 
+/// Steady-state recoveries the line supervisor performed on a strongSwan VoWiFi
+/// line, by reason (specs/096). Reported by the supervisor as one event per
+/// recovery, so a supervisor restart cannot rewind it. A rising
+/// `default_route_missing` count is a route that keeps vanishing: each one is
+/// repaired, and restarts the agent, but none counts as flapping.
+pub static VOWIFI_TUNNEL_RECOVERIES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        opts!(
+            "gsm_sip_bridge_vowifi_tunnel_recoveries_total",
+            "Supervisor recoveries of a VoWiFi line's tunnel, by reason"
+        ),
+        &["module", "reason"]
+    )
+    .unwrap()
+});
+
 // --- Agent liveness (specs/014-vowifi-metrics-restore) ---------------------
 // Owned by `metrics::ingest`, evaluated at scrape time in `metrics::server`.
 // Labeled by both `agent` (process kind: ims/sip) and `module` (card

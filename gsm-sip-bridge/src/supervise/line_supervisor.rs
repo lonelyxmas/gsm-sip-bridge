@@ -89,6 +89,26 @@ pub enum DegradeReason {
     DefaultRouteMissing,
 }
 
+/// The wire label for a recovery (specs/096). Exhaustive on purpose, with no
+/// wildcard arm: a new reason does not compile until it has a label.
+impl From<DegradeReason> for crate::control::protocol::TunnelRecoveryReason {
+    fn from(reason: DegradeReason) -> Self {
+        match reason {
+            DegradeReason::ProcessDied => Self::ProcessDied,
+            DegradeReason::ViciBroken => Self::ViciBroken,
+            DegradeReason::TunVanished => Self::TunVanished,
+            DegradeReason::TunUnavailable => Self::TunUnavailable,
+            DegradeReason::ChildSaMissing => Self::ChildSaMissing,
+            DegradeReason::IkeSaLost => Self::IkeSaLost,
+            DegradeReason::ChildSaStuck => Self::ChildSaStuck,
+            DegradeReason::ChildSaRekeyStuck => Self::ChildSaRekeyStuck,
+            DegradeReason::PcscfChanged => Self::PcscfChanged,
+            DegradeReason::PcscfUnreachable => Self::PcscfUnreachable,
+            DegradeReason::DefaultRouteMissing => Self::DefaultRouteMissing,
+        }
+    }
+}
+
 /// Steady-state-only health, beyond "is the process alive" and "is a P-CSCF
 /// change pending" (checked separately) — the three strongswan-specific
 /// checks (`tun_iface` presence, `swanctl --list-sas`'s exit status, the
@@ -1496,6 +1516,29 @@ mod tests {
         }
         assert!(rebuilt, "a genuinely dead data path must still be rebuilt");
         assert_eq!(*engine.route_repairs.borrow(), 0);
+    }
+
+    #[test]
+    fn every_recovery_reason_has_the_wire_label_of_the_same_name() {
+        use crate::control::protocol::TunnelRecoveryReason;
+        let reasons = [
+            DegradeReason::ProcessDied,
+            DegradeReason::ViciBroken,
+            DegradeReason::TunVanished,
+            DegradeReason::TunUnavailable,
+            DegradeReason::ChildSaMissing,
+            DegradeReason::IkeSaLost,
+            DegradeReason::ChildSaStuck,
+            DegradeReason::ChildSaRekeyStuck,
+            DegradeReason::PcscfChanged,
+            DegradeReason::PcscfUnreachable,
+            DegradeReason::DefaultRouteMissing,
+        ];
+        assert_eq!(reasons.len(), TunnelRecoveryReason::ALL.len());
+        for reason in reasons {
+            let wire = TunnelRecoveryReason::from(reason);
+            assert_eq!(format!("{reason:?}"), format!("{wire:?}"));
+        }
     }
 
     #[test]

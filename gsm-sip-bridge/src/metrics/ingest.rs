@@ -973,6 +973,11 @@ fn apply_event(agent: AgentKind, module_id: &str, event: &ObservedEvent) {
                 .with_label_values(&[module_id])
                 .inc();
         }
+        ObservedEvent::TunnelRecovered { reason } => {
+            metrics::VOWIFI_TUNNEL_RECOVERIES_TOTAL
+                .with_label_values(&[module_id, reason.as_str()])
+                .inc();
+        }
     }
 }
 
