@@ -72,3 +72,43 @@
 - **Method**: repeat 097's Vodafone run 1 (probe forced to pass, only P-CSCF black-holed with a /32 to the veth peer), but keep the agent log across the restart: `tail -F /tmp/ims-agent-0.out` into a file outside the container before injecting the fault.
 - Expected budget from 097: 120s ping interval + 3×10s ping timeouts + REGISTER attempt + ≤30s tick ≈ 200s; measured 234s. The note accounts for each interval.
 - A fix lands here only under FR-011a; otherwise an issue is filed.
+
+## R7 Findings (30s reproduction run, started 2026-10-17 22:20Z)
+
+Both rigs on the probe-forced throwaway (`dpd-098-forcedprobe-*`) with `dpd_delay_sec = 30`.
+
+### Jio, 2026-10-18 04:33:08Z: a LAN outage, not the ePDG
+
+Times are UTC; the Pi's charon log is in IST. Addresses are redacted to roles.
+
+| Time (Z) | Event | Source |
+|---|---|---|
+| 03:56:28 | Last CHILD_SA rekey (`CREATE_CHILD_SA` 191). The IKE_SA was last rekeyed at 02:03. | charon |
+| 04:15–04:29:53 | Every DPD (`INFORMATIONAL` 223–245, every 30s) answered within 1s | charon |
+| 04:30:12 | A PPPoE peer on the Pi's LAN terminates its session (`LCP TermReq "User request"`, after 41.6h connected) | journal |
+| 04:30:23.8 | DPD request 246 leaves `eth0` | capture |
+| 04:30:27.8 | Retransmit 1 leaves `eth0`. **Last packet on the wire, in either direction, until 04:32:03** | capture |
+| 04:30:35 / :47 / 04:31:11 / :53 | Retransmits 2–5, plus a NAT-T keepalive at 04:31:48, logged by charon and **absent from the capture** | charon vs capture |
+| 04:32:03 | Traffic resumes: outbound ESP first, inbound ESP from 04:32:24 | capture |
+| 04:32:07 | The PPPoE session comes back | journal |
+| 04:33:08 | `giving up after 5 retransmits`; supervisor: `dead peer verdict: false (inbound ESP 35s before the loss, 23 packets, snapshot 30s old)` | charon, supervisor |
+| 04:33:28–:54 | New IKE_SA: `IKE_SA_INIT` answered on its third retransmit, established 46s after the teardown | charon |
+
+There was no `eth0` carrier change (the last `bcmgenet` link flaps were on 2026-10-16). The Pi's packets stopped reaching the device tap while the carrier stayed up. That fits the gateway going away (a LAN router restart, with ARP to it failing and packets dropped in the neighbour queue), and it coincides with a LAN PPPoE peer dropping and reconnecting. The watcher's own ssh to the Pi failed at 04:32:13, in the same window.
+
+**Verdict for this event: neither "random ePDG loss" nor "rekey-triggered".** It was a ~100s local network outage. It was nowhere near a rekey: 34 minutes after the last CHILD_SA rekey, and in a stretch where every exchange was answered within a second.
+
+**What it shows about charon.** The retransmits go out at +0, +4, +11, +24, +47 and +90s, and then charon waits until +165s without sending. Any outage that covers the retransmits up to +90s kills the tunnel, even if the path comes back before +165s; here it came back at +100s. DPD only starts after `dpd_delay` of inbound silence, so a longer delay gives an outage that much longer to clear before the first request:
+
+| `dpd_delay` | Shortest outage that always kills the tunnel | Outage that can survive |
+|---|---|---|
+| 30s | ≈ 90–120s (the first request lands within 30s of the outage starting) | under ≈ 90s |
+| 120s | ≈ 210s | up to ≈ 120s outright, ≈ 90–210s depending on when inbound traffic last arrived |
+
+This ~100s outage would most likely have been survived at 120s.
+
+**What the `false` verdict means, corrected.** `false` says inbound ESP arrived after charon's first unanswered request could have gone out, i.e. the path was working again before charon gave up. That covers two causes: the ePDG ignoring an IKE request while ESP flowed (#120 run C), and a local outage shorter than the give-up window, as here. Telling them apart needs the capture, or at least whether inbound ESP also arrived *early* in the window; the snapshot cannot tell. The docs now say this.
+
+### Vodafone
+
+No dead-peer event so far. More than 800 DPD exchanges, all answered on the first try.

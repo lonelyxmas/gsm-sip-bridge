@@ -142,8 +142,10 @@ impl std::fmt::Display for IkeSaLossCause {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeadPeerVerdict {
-    /// Inbound ESP arrived while charon was retransmitting: the ePDG ignored
-    /// an IKE request on a working tunnel (#120 finding 2).
+    /// Inbound ESP arrived while charon was still retransmitting: the path
+    /// was working again before charon gave up. Either the ePDG ignored an IKE
+    /// request on a working tunnel (#120 finding 2), or a local outage ended
+    /// after charon's last retransmit (specs/098 research R7).
     False,
     /// Nothing arrived after the first unanswered request could have gone out.
     Real,
