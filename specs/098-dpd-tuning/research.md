@@ -109,6 +109,38 @@ This ~100s outage would most likely have been survived at 120s.
 
 **What the `false` verdict means, corrected.** `false` says inbound ESP arrived after charon's first unanswered request could have gone out, i.e. the path was working again before charon gave up. That covers two causes: the ePDG ignoring an IKE request while ESP flowed (#120 run C), and a local outage shorter than the give-up window, as here. Telling them apart needs the capture, or at least whether inbound ESP also arrived *early* in the window; the snapshot cannot tell. The docs now say this.
 
+### Jio, 2026-10-18 10:52:57Z: the ePDG ignored a DPD on a working tunnel
+
+This is the run-C pattern, and the capture shows it end to end. Times are UTC.
+
+| Time (Z) | Event | Source |
+|---|---|---|
+| 10:10:40 | Last CHILD_SA rekey, 42 minutes earlier | charon |
+| 10:49:42 | DPD 232 answered | charon, capture |
+| 10:50:12 | DPD request 233 leaves `eth0`, and so do retransmits 1–5 at +4, +11, +24, +48 and +90s. **The capture has every one, and no IKE response to any of them** | charon, capture |
+| 10:50:41 | ESP out and in (the agent's keepalive exchange) | capture |
+| 10:51:47 | The ePDG's own NAT-T keepalive arrives | capture |
+| 10:52:41 | ESP out and in again | capture |
+| 10:52:57 | `giving up after 5 retransmits`; supervisor: `dead peer verdict: false (inbound ESP 31s before the loss, 46 packets, snapshot 30s old)` | charon, supervisor |
+| 10:53:12 | A fresh `IKE_SA_INIT` is answered at once; the line is back within seconds | charon, capture |
+
+The ePDG's data plane kept both directions of the old CHILD_SA working and kept sending NAT-T keepalives, while its IKE side ignored the old IKE_SA for 2m45s, and answered a new IKE_SA immediately. The host's network was fine: every packet reached the wire, and a routine DHCP renewal 40s before the request did not interrupt anything (DPD 232 was answered after it).
+
+**Verdict: random ePDG loss.** No rekey or other IKE exchange was within 40 minutes.
+
 ### Vodafone
 
-No dead-peer event so far. More than 800 DPD exchanges, all answered on the first try.
+No dead-peer event: 1873 DPD exchanges, every one answered on the first try, and no retransmit at all.
+
+### Tally and conclusion
+
+The run lasted ~17.2h (22:20Z to 16:02Z; the planned 12h, plus the time the session was paused).
+
+| | DPD exchanges | ePDG ignored a request | Local outage | Rekey-adjacent |
+|---|---|---|---|---|
+| Vodafone | 1873 | 0 | 0 | — |
+| Jio | 1772 | 1 | 1 | no |
+
+- **The ePDG fault is real and random.** One ignored request in 1772 on Jio, and none in 1873 on Vodafone. Run C saw one on each in about 4.5h, which is about 540 exchanges each, so the rate varies, but it is on the order of one per thousand or more exchanges. The fault is not tied to rekeys.
+- **Fewer exchanges means fewer teardowns.** DPD is sent only after `dpd_delay` of inbound silence, so at 120s it fires far less often (SC-002 measures how much). It also gives local outages up to roughly two minutes the chance to clear first (the earlier Jio event).
+- **The 120s default stands** (US1 scenario 3 does not trigger). The charon-patch fallback stays in reserve, depending on what SC-001 and the production `false` count show.

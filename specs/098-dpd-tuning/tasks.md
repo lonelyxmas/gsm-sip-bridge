@@ -56,10 +56,10 @@ None: the setting and the classification are independent.
 
 **Independent test**: research note with evidence and a per-carrier verdict.
 
-- [ ] T019 [US1] Build the probe-forced throwaway image (quickstart) for amd64 (Vodafone, local) and arm64 (Jio, via `arm-build-200`). Never push the commit.
-- [ ] T020 [US1] Deploy on both rigs with `dpd_delay_sec = 30`; start the captures and the charon-log copy loop (quickstart §1). Recreate, confirm `Registered`.
-- [ ] T021 [US1] Run up to 12h. For each `giving up after 5 retransmits`, extract the timeline (R7) from charon log + outer capture + supervisor log, and the live `dead peer verdict`.
-- [ ] T022 [US1] Write the findings into `specs/098-dpd-tuning/research.md` (R7 Findings): per-carrier verdict, DPD exchanges answered vs ignored. If *rekey/collision-triggered*, stop and amend the spec (US1 scenario 3) before T023.
+- [X] T019 [US1] Build the probe-forced throwaway image (quickstart) for amd64 (Vodafone, local) and arm64 (Jio, via `arm-build-200`). Never push the commit.
+- [X] T020 [US1] Deploy on both rigs with `dpd_delay_sec = 30`; start the captures and the charon-log copy loop (quickstart §1). Recreate, confirm `Registered`.
+- [X] T021 [US1] Run up to 12h. For each `giving up after 5 retransmits`, extract the timeline (R7) from charon log + outer capture + supervisor log, and the live `dead peer verdict`.
+- [X] T022 [US1] Write the findings into `specs/098-dpd-tuning/research.md` (R7 Findings): per-carrier verdict, DPD exchanges answered vs ignored. If *rekey/collision-triggered*, stop and amend the spec (US1 scenario 3) before T023.
 
 ## Phase 7: User Story 4 — a dead ePDG is still caught (P2, live)
 
