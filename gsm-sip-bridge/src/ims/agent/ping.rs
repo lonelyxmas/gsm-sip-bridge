@@ -55,6 +55,11 @@ pub(super) struct PingState {
     last_sent: Option<Instant>,
     /// The unanswered ping, if one is outstanding.
     pending: Option<PendingPing>,
+    /// When the next probe is due after a repair that left none in flight
+    /// (the rebuild failed, or its confirming probe couldn't be sent). It
+    /// replaces `last_sent + PING_INTERVAL`, which would leave a dead
+    /// connection unprobed for most of an interval (#137).
+    retry_at: Option<Instant>,
 }
 
 /// What the idle-poll branch should do about liveness this iteration. Kept a
@@ -89,9 +94,11 @@ impl PingState {
                     PingVerdict::Await
                 }
             }
-            None => match self.last_sent {
-                Some(t) if now.duration_since(t) < PING_INTERVAL => PingVerdict::Idle,
-                _ => PingVerdict::Send,
+            None => match (self.retry_at, self.last_sent) {
+                (Some(r), _) if now < r => PingVerdict::Idle,
+                (Some(_), _) => PingVerdict::Send,
+                (None, Some(t)) if now.duration_since(t) < PING_INTERVAL => PingVerdict::Idle,
+                (None, _) => PingVerdict::Send,
             },
         }
     }
@@ -100,6 +107,15 @@ impl PingState {
     fn on_sent(&mut self, cseq: u32, now: Instant) {
         self.last_sent = Some(now);
         self.pending = Some(PendingPing { cseq, sent_at: now });
+        self.retry_at = None;
+    }
+
+    /// A repair at `now` left no probe in flight. The next one is due a
+    /// response timeout later, so the reconnect ladder's attempts land 10s
+    /// apart rather than an interval apart.
+    fn on_repair_failed(&mut self, now: Instant) {
+        self.pending = None;
+        self.retry_at = Some(now + PING_RESPONSE_TIMEOUT);
     }
 
     /// A response arrived. Returns `true` if it answers the pending ping
@@ -121,6 +137,7 @@ impl PingState {
     pub(super) fn reset(&mut self) {
         self.last_sent = None;
         self.pending = None;
+        self.retry_at = None;
     }
 }
 
@@ -275,10 +292,14 @@ pub(super) fn probe_gm_connection(
             Ok(()) => match session.send_gm_ping() {
                 Ok(cseq) => ping.on_sent(cseq, Instant::now()),
                 Err(e) => {
-                    tracing::warn!(error = %e, "confirming Gm probe failed to send; will retry")
+                    tracing::warn!(error = %e, "confirming Gm probe failed to send; will retry");
+                    ping.on_repair_failed(Instant::now());
                 }
             },
-            Err(e) => tracing::warn!(error = %e, "Gm client reconnect failed; will retry"),
+            Err(e) => {
+                tracing::warn!(error = %e, "Gm client reconnect failed; will retry");
+                ping.on_repair_failed(Instant::now());
+            }
         }
     }
     false
@@ -329,7 +350,7 @@ mod tests {
 
         let mut s2 = PingState {
             last_sent: Some(t0),
-            pending: None,
+            ..PingState::default()
         };
         // Interval not yet elapsed → idle.
         assert_eq!(s2.verdict(t0 + PING_INTERVAL / 2, false), PingVerdict::Idle);
@@ -447,5 +468,83 @@ mod tests {
         // After a reset the next verdict is Send, not a spurious Dead against a
         // CSeq that belonged to the replaced session (R11).
         assert_eq!(s.verdict(Instant::now(), false), PingVerdict::Send);
+    }
+
+    #[test]
+    fn a_failed_repair_makes_the_next_probe_due_after_the_response_timeout() {
+        // #137: the dead ping was sent at t0 and scored dead at t0 + 10s, and
+        // the rebuild failed. Waiting for the interval from t0 left 110s of
+        // nothing before the next attempt; the next probe is due 10s after the
+        // failure instead.
+        let mut s = PingState::default();
+        let t0 = Instant::now();
+        s.on_sent(1, t0);
+        let dead_at = t0 + PING_RESPONSE_TIMEOUT;
+        assert_eq!(s.verdict(dead_at, false), PingVerdict::Dead);
+        s.on_repair_failed(dead_at);
+        assert_eq!(
+            s.verdict(dead_at + PING_RESPONSE_TIMEOUT / 2, false),
+            PingVerdict::Idle
+        );
+        assert_eq!(
+            s.verdict(dead_at + PING_RESPONSE_TIMEOUT, false),
+            PingVerdict::Send
+        );
+        // A call still suppresses it.
+        assert_eq!(
+            s.verdict(dead_at + PING_RESPONSE_TIMEOUT, true),
+            PingVerdict::Idle
+        );
+    }
+
+    #[test]
+    fn three_failed_repairs_reach_the_escalation_within_twenty_seconds() {
+        // The ladder probe_gm_connection walks with no transport left: each
+        // due probe fails, counts an attempt and fails to repair. Attempts 2
+        // and 3 land 10s and 20s after the first, not 120s and 121s.
+        let mut s = PingState::default();
+        let t0 = Instant::now();
+        s.on_sent(1, t0);
+        let mut now = t0 + PING_RESPONSE_TIMEOUT;
+        let mut attempts_at = Vec::new();
+        assert_eq!(s.verdict(now, false), PingVerdict::Dead);
+        attempts_at.push(now);
+        s.on_repair_failed(now);
+        while attempts_at.len() < 3 {
+            now += Duration::from_secs(1);
+            if s.verdict(now, false) == PingVerdict::Send {
+                // The send fails (no transport), and so does the repair.
+                attempts_at.push(now);
+                s.on_repair_failed(now);
+            }
+            assert!(now < t0 + PING_INTERVAL, "no retry inside the interval");
+        }
+        assert_eq!(attempts_at[1] - attempts_at[0], PING_RESPONSE_TIMEOUT);
+        assert_eq!(attempts_at[2] - attempts_at[0], PING_RESPONSE_TIMEOUT * 2);
+    }
+
+    #[test]
+    fn a_sent_probe_or_a_reset_clears_the_retry() {
+        let t0 = Instant::now();
+        let mut s = PingState::default();
+        s.on_repair_failed(t0);
+        // A confirming probe that did go out is scored on its own deadline,
+        // and the interval after it runs from its send time again.
+        s.on_sent(2, t0 + Duration::from_secs(1));
+        assert!(s.on_response(2));
+        assert_eq!(
+            s.verdict(t0 + PING_RESPONSE_TIMEOUT * 2, false),
+            PingVerdict::Idle
+        );
+        assert_eq!(
+            s.verdict(t0 + Duration::from_secs(1) + PING_INTERVAL, false),
+            PingVerdict::Send
+        );
+
+        let mut r = PingState::default();
+        r.on_sent(3, t0);
+        r.on_repair_failed(t0);
+        r.reset();
+        assert_eq!(r.verdict(t0, false), PingVerdict::Send);
     }
 }

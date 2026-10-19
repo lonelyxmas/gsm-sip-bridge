@@ -144,3 +144,25 @@ The run lasted ~17.2h (22:20Z to 16:02Z; the planned 12h, plus the time the sess
 - **The ePDG fault is real and random.** One ignored request in 1772 on Jio, and none in 1873 on Vodafone. Run C saw one on each in about 4.5h, which is about 540 exchanges each, so the rate varies, but it is on the order of one per thousand or more exchanges. The fault is not tied to rekeys.
 - **Fewer exchanges means fewer teardowns.** DPD is sent only after `dpd_delay` of inbound silence, so at 120s it fires far less often (SC-002 measures how much). It also gives local outages up to roughly two minutes the chance to clear first (the earlier Jio event).
 - **The 120s default stands** (US1 scenario 3 does not trigger). The charon-patch fallback stays in reserve, depending on what SC-001 and the production `false` count show.
+
+## R8 Findings (#137 gap, Vodafone, 2026-10-19)
+
+Probe-forced image at 120s. Vodafone's only P-CSCF was black-holed with a /128 to the veth peer in `ims0`, and the agent's log was streamed out of the container with `tail -F`, so it survived the agent's restart. Times are UTC.
+
+| Time | Offset | Event | Source |
+|---|---|---|---|
+| 20:37:14 | 0s | The P-CSCF is black-holed | script |
+| 20:38:39 | +85s | The keepalive `OPTIONS` falls due (120s after the previous one) and goes out | agent |
+| 20:38:49.5 | +95s | `Gm keepalive went unanswered` (10s response timeout), attempt 1. The reconnect fails at once (`TCP connect … Address not available`), and the agent logs `Gm client reconnect failed; will retry` | agent |
+| | +95s → +205s | **Nothing happens for 110s.** No probe is in flight, and `last_sent` is still the dead probe's send time, so the next probe is due 120s after +85s | `ping.rs` |
+| 20:40:39.6 | +205s | `Gm keepalive send failed; client transport is not connected`: attempt 2. The reconnect fails again | agent |
+| 20:40:40.6 | +206s | The next 1s poll: the send fails, attempt 3, `Gm reconnect exhausted; escalating to re-registration`, and the P-CSCF is marked `gm-keepalive, remaining=0` | agent |
+| 20:40:59.6 | +225s | Supervisor: `recovered from PcscfPoolExhausted` (19s after the mark, waiting for its 30s poll) | supervisor |
+
+The sum is 85 + 10 + 110 + 1 + 19 = 225s, which accounts for every interval. 097's 234s run has the same shape (+95s, +205s, +206s), with a 28s supervisor wait instead of 19s.
+
+**Cause.** In `probe_gm_connection`, a failed rebuild, or a confirming probe that could not be sent, leaves no probe in flight. The next one is then due a full `PING_INTERVAL` after the dead probe was *sent*, so the second attempt comes 110s after the first. The ~200s estimate had assumed attempts 10s apart.
+
+**Fix (FR-011a: the agent's keepalive timing only, no config).** `PingState::on_repair_failed` makes the next probe due `PING_RESPONSE_TIMEOUT` (10s) after a failed repair. Attempts 2 and 3 now land 10s and 20s after the first. The expected detection time for the same fault is 85 + 10 + 20 ≈ 115s, plus up to 30s for the supervisor's poll. That still trails the probe's ~97s, because the agent only probes every 120s while idle. Re-verified live below.
+
+**Also seen.** Vodafone handed the same single P-CSCF back on the new negotiation. The agent then logged `every P-CSCF is unavailable; waiting before the startup attempt wait_secs=120` and retried it once the mark had expired.
