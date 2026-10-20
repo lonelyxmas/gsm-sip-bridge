@@ -200,3 +200,25 @@ From the first dead keepalive to the mark took 20s, down from 111s. The model (i
 ### Real image, probe on (SC-004)
 
 `dpd-098b-local`, registered at 09:06:12Z on 2026-10-20 and checked at 10:09:19Z: **0 DPD requests, 0 retransmits, 0 recoveries**, 115 NAT-T keepalives, the only INFORMATIONAL a CHILD_SA rekey's delete, still Registered with the Gm connection up. The startup log reads `strongSwan DPD: dpd_delay = 120s ([vowifi].dpd_delay_sec)`.
+
+## The dead-peer verdict after the review fix (`b0dab07`)
+
+The PR #143 review found that `real` rested only on the last healthy tick's snapshot, up to 30s old, so a path that recovered after it was misclassified. `b0dab07` also reads the tunnel interface's RX counter on the snapshot's tick and on the loss tick (`research.md` R4). Images: `dpd-098c-local` and `dpd-098c-arm64`, with throwaway forced-probe variants built the same way as before. Each rig was recreated on each image.
+
+| Rig | Fault (forced-probe image) | Verdict line |
+|---|---|---|
+| Vodafone | Outbound IKE to the ePDG dropped (`u32` match on the zero non-ESP marker); ESP and NAT-T keepalives pass. DPD at 11:46:26Z, give-up at 11:49:11Z | `false (inbound ESP 54s before the loss, 22 packets, snapshot 30s old, 0 received on the tunnel since; …)`. Re-registered 14s after the rule was removed |
+| Jio | ePDG black-holed at 12:00:38Z, seven minutes after registration | `real (inbound ESP 294s before the loss, 42 packets, snapshot 30s old, 0 received on the tunnel since; …)`, 224s after the fault. Re-registered 9s after the route was removed |
+
+The Vodafone run reproduces #120 finding 2 on demand: the ePDG never sees the DPD, ESP keeps flowing, and charon tears down a working tunnel.
+
+An earlier Jio black-hole, started 9s after registration, read `false`: inbound ESP 56s before the loss, and 1 packet on the tunnel after the snapshot. A blackhole route drops outbound only, and the network was still sending into the tunnel then. That is `false` by definition. As with the PPPoE-loop outage, the verdict cannot tell a one-way path loss from an ePDG that ignores IKE; the capture can.
+
+Real images, 30 minutes idle each:
+
+| Rig | DPD requests | Retransmits | Recoveries | Line |
+|---|---|---|---|---|
+| Vodafone, from 11:54:14Z | 0 | 0 | 0 | Registered, Gm up |
+| Jio, from 12:05:18Z | 0 | 0 | 0 | Registered, Gm up |
+
+The counter is read on both architectures: both verdict lines carry a count, not `tunnel counter unread`. Switching the check to `ip -s link show` caused no false reports of a missing tunnel interface.
