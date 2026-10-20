@@ -113,6 +113,35 @@ then returns to service unattended.
 suppressed. Do not leave this off in production: it reinstates exactly the
 silent outage the watchdog exists to prevent.
 
+### A VoWiFi line dropped for ~20s with "giving up after 5 retransmits"
+
+charon sent a dead-peer-detection request to the ePDG, got no answer to it or
+to five retransmits over ~165s, and deleted the tunnel. The supervisor
+re-initiates on its next tick and the line re-registers in about 20s. Any call
+in progress is dropped.
+
+The line after `recovered from IkeSaLost (cause: dead-peer timeout)` says which
+kind it was:
+
+- `dead peer verdict: false (...)` — ESP from the ePDG arrived while charon
+  was still retransmitting, so the path was working again before it gave up.
+  Two causes produce this. Either the ePDG ignored one IKE request on a
+  working tunnel (seen on Vodafone IN and Jio with DPD every 30s,
+  [#120](https://github.com/selvakn/gsm-sip-bridge/issues/120)), or the
+  host's own network dropped out for a minute or two and came back after
+  charon's last retransmit: charon stops sending 90s in and gives up at
+  165s. Check the host's own logs for a LAN or router event at that time. If
+  they are frequent and the network is clean, raise `[vowifi].dpd_delay_sec`
+  (default 120), or set it to `0` to turn charon-initiated DPD off, and
+  recreate the container.
+- `dead peer verdict: real (...)` — nothing arrived from the ePDG; the path
+  was down. Look at the uplink or the ePDG, not at DPD.
+- `dead peer verdict: unknown (...)` — the supervisor had no usable snapshot
+  (it had just restarted, or the previous tick found a fault).
+
+`gsm_sip_bridge_vowifi_dead_peer_losses_total{verdict=...}` counts them per
+line.
+
 ### Is this line actually reachable right now?
 
 Three surfaces, which must now agree:

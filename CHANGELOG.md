@@ -10,6 +10,23 @@ across releases.
 
 ### Added
 
+- **`[vowifi].dpd_delay_sec`.** How long charon waits with nothing from the
+  ePDG before sending a dead-peer-detection request on a strongSwan line;
+  `0` turns it off. It was a fixed 30s and now defaults to 120s, the Android
+  IWLAN default. With nothing else arriving between the agent's 120s
+  keepalives, 30s DPD gave the ePDG an exchange every 30s to ignore, and on
+  both Vodafone and Jio one ignored request tore down a working tunnel. No
+  effect while the supervisor's P-CSCF probe runs, because its traffic keeps
+  DPD from firing. Applies when the container is recreated
+  ([#120](https://github.com/selvakn/gsm-sip-bridge/issues/120)).
+
+- **Dead-peer loss counter.** `gsm_sip_bridge_vowifi_dead_peer_losses_total`
+  counts IKE_SA losses to an unresponsive ePDG by `verdict`: `false` when
+  inbound ESP was still arriving while charon retransmitted, `real` when it
+  was not, `unknown` when the supervisor could not tell. The supervisor logs
+  the verdict and its evidence
+  ([#120](https://github.com/selvakn/gsm-sip-bridge/issues/120)).
+
 - **Rebuild on an exhausted P-CSCF pool.** When a VoWiFi line's IMS agent has
   marked every P-CSCF it was given unavailable since the tunnel was last
   negotiated, the supervisor rebuilds the tunnel to get a new one
@@ -106,6 +123,15 @@ across releases.
   ([#127](https://github.com/selvakn/gsm-sip-bridge/issues/127)).
 
 ### Fixed
+
+- **A dead P-CSCF is given up on about 110 s sooner.** When the IMS agent's
+  Gm keepalive went unanswered and reconnecting failed, nothing was tried
+  again until the next keepalive was due, a full 120 s after the dead one was
+  sent. The second and third attempts, and the escalation that marks the
+  P-CSCF unavailable, now follow 10 s apart. On Vodafone, losing the only
+  P-CSCF took 225 s to rebuild the tunnel. The expected time is now about
+  115 s, plus up to 30 s for the supervisor's next check
+  ([#137](https://github.com/selvakn/gsm-sip-bridge/issues/137)).
 
 - **A lost default route is repaired on the next tick.** The supervisor
   checked a line's default route only after its P-CSCF probe had failed, so

@@ -7,9 +7,10 @@
 //! exact bash this replaces.
 
 use super::runner::CommandRunner;
+pub use crate::control::protocol::DeadPeerVerdict;
 use crate::control::protocol::IkeSaLossCause;
 use crate::ims::pcscf_files::PoolState;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Mirrors the current establish-time loop's `attempt`/`stuck_without_pcscf`
 /// locals and the steady-state loop's tracked P-CSCF.
@@ -157,6 +158,112 @@ pub struct ChildSaLifetime {
     pub expires_in: Option<i64>,
 }
 
+/// What one steady-state tick saw of inbound ESP across every CHILD_SA the
+/// line's connection lists, a rekey's old and new SA included (specs/098 R4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InboundEsp {
+    /// The youngest inbound last-use age (`in … Ns ago`); `None` when no
+    /// listed CHILD_SA has received anything.
+    pub last_in_age: Option<Duration>,
+    /// Inbound packets summed over those CHILD_SAs, for the log line only:
+    /// a rekey resets them, so they are never compared across ticks.
+    pub packets: u64,
+    /// The tunnel interface's received-packet counter on the same tick. It
+    /// counts only what was decrypted, survives a rekey, and stops when
+    /// charon deletes the CHILD_SA, so comparing it with the loss tick's
+    /// reading covers the time the snapshot cannot. `None` if unread.
+    pub tun_rx_packets: Option<u64>,
+}
+
+/// How long charon retransmits an unanswered request before giving up on the
+/// peer: sent once and retransmitted `retransmit_tries` (5) times at
+/// `retransmit_timeout · retransmit_base^k` = 4s · 1.8^k, so
+/// 4 + 7.2 + 13.0 + 23.3 + 42.0 + 75.6 ≈ 165s. charon's defaults, which
+/// `charon-extra.conf` leaves alone; tuning those means changing this too.
+pub const DPD_GIVE_UP_WINDOW: Duration = Duration::from_secs(165);
+
+/// A dead-peer verdict and the evidence it rests on, for the log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadPeerClassification {
+    pub verdict: DeadPeerVerdict,
+    /// How old the snapshot was when the loss was seen.
+    pub snapshot_age: Option<Duration>,
+    /// How long before the loss was seen the last inbound packet arrived.
+    pub last_in_before_loss: Option<Duration>,
+    pub packets: Option<u64>,
+    /// Packets the tunnel interface received between the snapshot and the
+    /// loss; `None` when either reading is missing or the counter went back.
+    pub rx_since_snapshot: Option<u64>,
+}
+
+/// Classifies a dead-peer loss seen at `now` from the last structurally
+/// healthy tick's inbound snapshot (specs/098 R4, contracts/dead-peer.md).
+///
+/// charon gave up somewhere after the snapshot `S` and at or before `now`
+/// (`T`), so its first unanswered request went out in `(S − G, T − G]`, with
+/// `G` = [`DPD_GIVE_UP_WINDOW`]. An inbound packet at `L` after `T − G` came
+/// while charon was retransmitting (false); one at or before `S − G` came
+/// before the request could have gone out (real). In between, or with no
+/// inbound use on any listed SA, cannot be told.
+/// For a really dead peer DPD itself needed `dpd_delay` of silence first, so
+/// at the default `L` sits well below `S − G`.
+///
+/// The snapshot says nothing about `(S, T]`, and a path that recovers there
+/// still loses the tunnel, since charon keeps retransmitting regardless. So
+/// the tunnel interface's counter, read at `S` and again at `T`, settles it:
+/// a packet decrypted after `S` arrived after `T − G` whenever the snapshot is
+/// younger than `G` (false), and `real` needs the counter to show none.
+pub fn classify_dead_peer(
+    snapshot: Option<(Instant, InboundEsp)>,
+    now: Instant,
+    tun_rx_now: Option<u64>,
+) -> DeadPeerClassification {
+    let Some((taken, esp)) = snapshot else {
+        return DeadPeerClassification {
+            verdict: DeadPeerVerdict::Unknown,
+            snapshot_age: None,
+            last_in_before_loss: None,
+            packets: None,
+            rx_since_snapshot: None,
+        };
+    };
+    let snapshot_age = now.saturating_duration_since(taken);
+    let last_in_before_loss = esp.last_in_age.map(|age| snapshot_age + age);
+    let rx_since_snapshot = esp
+        .tun_rx_packets
+        .zip(tun_rx_now)
+        .and_then(|(then, now)| now.checked_sub(then));
+    let verdict = match last_in_before_loss {
+        // `L > T − G`  ⇔  `T − L < G`
+        Some(before) if before < DPD_GIVE_UP_WINDOW => DeadPeerVerdict::False,
+        // Decrypted after `S`, and `S > T − G` while the snapshot is younger
+        // than `G`.
+        _ if snapshot_age < DPD_GIVE_UP_WINDOW && rx_since_snapshot.is_some_and(|n| n > 0) => {
+            DeadPeerVerdict::False
+        }
+        // No listed SA has received anything, which a fresh rekey's SA also
+        // shows. A really dead peer cannot have completed that rekey, so its
+        // SA still carries a last-use age; this is not evidence either way.
+        None => DeadPeerVerdict::Unknown,
+        // `L ≤ S − G`  ⇔  `S − L ≥ G`, and `S − L` is the snapshot's own age;
+        // and nothing arrived in `(S, T]`.
+        Some(_)
+            if esp.last_in_age.is_some_and(|age| age >= DPD_GIVE_UP_WINDOW)
+                && rx_since_snapshot == Some(0) =>
+        {
+            DeadPeerVerdict::Real
+        }
+        Some(_) => DeadPeerVerdict::Unknown,
+    };
+    DeadPeerClassification {
+        verdict,
+        snapshot_age: Some(snapshot_age),
+        last_in_before_loss,
+        packets: Some(esp.packets),
+        rx_since_snapshot,
+    }
+}
+
 /// Matches the establish-time loop's `sleep 2` between polls, both engines.
 pub const ESTABLISH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Matches the strongswan establish-time loop's `$((attempt % 15))`
@@ -240,6 +347,19 @@ pub trait TunnelEngine {
     /// strongswan engine can tell; the default is `Unknown` (specs/087).
     fn ike_sa_loss_cause(&self, _runner: &dyn CommandRunner) -> IkeSaLossCause {
         IkeSaLossCause::Unknown
+    }
+    /// Inbound ESP as the last [`Self::steady_state_health`] listed it, for
+    /// classifying a later dead-peer loss (specs/098). Only the strongswan
+    /// engine lists SAs; the default is `None`.
+    fn inbound_esp(&self) -> Option<InboundEsp> {
+        None
+    }
+    /// The tunnel interface's received-packet counter as the last
+    /// [`Self::steady_state_health`] read it, on whatever tick that was; the
+    /// loss tick's own reading, for [`classify_dead_peer`]. Only the
+    /// strongswan engine reads it; the default is `None`.
+    fn tun_rx_packets(&self) -> Option<u64> {
+        None
     }
     /// The notify the ePDG last refused a CHILD_SA with in the current
     /// IKE_SA session, for the stuck-rekey log line only (specs/093 R4). Only
@@ -428,6 +548,13 @@ pub struct SteadyTracking {
     /// Whether the current exhaustion's deferral for a call has been logged,
     /// so it is said once rather than every tick (specs/097 FR-007).
     pub pool_exhausted_deferral_logged: bool,
+    /// Inbound ESP as the last structurally healthy tick saw it, and when
+    /// (specs/098 R4). Dropped by every other tick: a snapshot of SAs that a
+    /// fault or a respawn has since replaced says nothing about the next loss.
+    pub inbound: Option<(Instant, InboundEsp)>,
+    /// The verdict on a dead-peer IKE_SA loss, for the caller's log line and
+    /// report. `None` after every other tick.
+    pub dead_peer: Option<DeadPeerClassification>,
 }
 
 impl SteadyTracking {
@@ -664,7 +791,9 @@ pub fn tick_steady_state_with_pool(
     agent_pool: &dyn Fn() -> Option<PoolState>,
 ) -> SteadyOutcome {
     tracking.pool_exhausted.clear();
+    tracking.dead_peer = None;
     if !engine.is_process_alive(runner) {
+        tracking.inbound = None;
         // A respawned charon starts a fresh connection that gets its own first
         // retry, so a miss counted against the old one must not carry over.
         tracking.child_sa_missing = 0;
@@ -678,6 +807,12 @@ pub fn tick_steady_state_with_pool(
     }
 
     let health = engine.steady_state_health(runner);
+    // Taken from the healthy listing only, and before anything else in this
+    // tick acts on it; consumed below if this tick finds the IKE_SA gone.
+    let last_inbound = tracking.inbound.take();
+    if matches!(health, SteadyStateHealth::Ok(_)) {
+        tracking.inbound = engine.inbound_esp().map(|esp| (Instant::now(), esp));
+    }
     // Only a fully healthy structural check counts as a usable CHILD_SA; an
     // unreachable P-CSCF later in the tick does not undo that (specs/086).
     tracking.child_sa_usable = matches!(health, SteadyStateHealth::Ok(_));
@@ -742,6 +877,13 @@ pub fn tick_steady_state_with_pool(
             // Read before re-initiating: the parser resets on the next
             // establishment, so a slow tick would otherwise lose the cause.
             let cause = engine.ike_sa_loss_cause(runner);
+            if cause == IkeSaLossCause::DeadPeer {
+                tracking.dead_peer = Some(classify_dead_peer(
+                    last_inbound,
+                    Instant::now(),
+                    engine.tun_rx_packets(),
+                ));
+            }
             engine.reinitiate(runner);
             return SteadyOutcome::Recovered {
                 reason: DegradeReason::IkeSaLost,
@@ -1010,6 +1152,145 @@ pub fn recovery_renegotiates(reason: DegradeReason) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod dead_peer {
+        use super::super::*;
+
+        const RX_AT_SNAPSHOT: u64 = 1000;
+
+        fn esp(age: Option<u64>) -> InboundEsp {
+            InboundEsp {
+                last_in_age: age.map(Duration::from_secs),
+                packets: 42,
+                tun_rx_packets: Some(RX_AT_SNAPSHOT),
+            }
+        }
+
+        /// Classify with the snapshot taken `snapshot_age` before the loss
+        /// was seen, its last inbound packet `age` before that, and nothing
+        /// received on the tunnel interface in between.
+        fn verdict(snapshot_age: u64, age: Option<u64>) -> DeadPeerVerdict {
+            verdict_rx(snapshot_age, age, Some(RX_AT_SNAPSHOT))
+        }
+
+        /// As [`verdict`], with the loss tick's counter reading `rx_now`.
+        fn verdict_rx(snapshot_age: u64, age: Option<u64>, rx_now: Option<u64>) -> DeadPeerVerdict {
+            let now = Instant::now() + Duration::from_secs(10_000);
+            let taken = now - Duration::from_secs(snapshot_age);
+            classify_dead_peer(Some((taken, esp(age))), now, rx_now).verdict
+        }
+
+        #[test]
+        fn no_snapshot_is_unknown_never_false() {
+            let c = classify_dead_peer(None, Instant::now(), Some(5));
+            assert_eq!(c.verdict, DeadPeerVerdict::Unknown);
+            assert_eq!(c.snapshot_age, None);
+            assert_eq!(c.packets, None);
+        }
+
+        #[test]
+        fn esp_while_charon_retransmitted_is_false() {
+            // Run C: OPTIONS answered every 120s inside the 165s window.
+            assert_eq!(verdict(12, Some(30)), DeadPeerVerdict::False);
+            assert_eq!(verdict(30, Some(134)), DeadPeerVerdict::False);
+        }
+
+        #[test]
+        fn silence_from_before_the_request_could_go_out_is_real() {
+            // A dead ePDG at the default: dpd_delay (120s) of silence, then
+            // 165s of retransmits, seen within one 30s tick.
+            assert_eq!(verdict(20, Some(270)), DeadPeerVerdict::Real);
+            assert_eq!(verdict(0, Some(165)), DeadPeerVerdict::Real);
+        }
+
+        #[test]
+        fn the_band_between_is_unknown() {
+            // L ≤ T − G but L > S − G: either side of the first request.
+            assert_eq!(verdict(30, Some(140)), DeadPeerVerdict::Unknown);
+            assert_eq!(verdict(30, Some(164)), DeadPeerVerdict::Unknown);
+        }
+
+        #[test]
+        fn boundaries_follow_the_contract() {
+            // T − L == G exactly is not "after T − G".
+            assert_eq!(verdict(15, Some(150)), DeadPeerVerdict::Unknown);
+            assert_eq!(verdict(15, Some(149)), DeadPeerVerdict::False);
+            // S − L == G exactly is "at or before S − G".
+            assert_eq!(verdict(15, Some(165)), DeadPeerVerdict::Real);
+        }
+
+        #[test]
+        fn no_inbound_use_on_any_listed_sa_is_unknown() {
+            assert_eq!(verdict(10, None), DeadPeerVerdict::Unknown);
+        }
+
+        #[test]
+        fn the_evidence_is_carried_for_the_log() {
+            let now = Instant::now() + Duration::from_secs(100);
+            let c = classify_dead_peer(
+                Some((now - Duration::from_secs(12), esp(Some(30)))),
+                now,
+                Some(RX_AT_SNAPSHOT + 3),
+            );
+            assert_eq!(c.snapshot_age, Some(Duration::from_secs(12)));
+            assert_eq!(c.last_in_before_loss, Some(Duration::from_secs(42)));
+            assert_eq!(c.packets, Some(42));
+            assert_eq!(c.rx_since_snapshot, Some(3));
+        }
+
+        #[test]
+        fn esp_resuming_after_the_snapshot_is_false_not_real() {
+            // 270s of silence at the snapshot, ESP back 10s later, charon
+            // giving up 20s after that: the path recovered inside the window.
+            assert_eq!(
+                verdict_rx(30, Some(270), Some(RX_AT_SNAPSHOT + 4)),
+                DeadPeerVerdict::False
+            );
+            // It also settles the band the snapshot alone cannot.
+            assert_eq!(
+                verdict_rx(30, Some(140), Some(RX_AT_SNAPSHOT + 1)),
+                DeadPeerVerdict::False
+            );
+            assert_eq!(
+                verdict_rx(10, None, Some(RX_AT_SNAPSHOT + 1)),
+                DeadPeerVerdict::False
+            );
+        }
+
+        #[test]
+        fn real_needs_the_counter_to_cover_the_rest_of_the_window() {
+            assert_eq!(verdict_rx(20, Some(270), None), DeadPeerVerdict::Unknown);
+            let now = Instant::now() + Duration::from_secs(10_000);
+            let unread_then = InboundEsp {
+                tun_rx_packets: None,
+                ..esp(Some(270))
+            };
+            assert_eq!(
+                classify_dead_peer(
+                    Some((now - Duration::from_secs(20), unread_then)),
+                    now,
+                    Some(9)
+                )
+                .verdict,
+                DeadPeerVerdict::Unknown
+            );
+            // A counter that went back (the interface was recreated) proves
+            // nothing.
+            assert_eq!(
+                verdict_rx(20, Some(270), Some(RX_AT_SNAPSHOT - 1)),
+                DeadPeerVerdict::Unknown
+            );
+        }
+
+        #[test]
+        fn packets_after_a_snapshot_older_than_the_window_prove_nothing() {
+            // `S ≤ T − G`: a packet just after `S` may predate the request.
+            assert_eq!(
+                verdict_rx(165, Some(10), Some(RX_AT_SNAPSHOT + 1)),
+                DeadPeerVerdict::Unknown
+            );
+        }
+    }
+
     use super::*;
     use crate::supervise::runner::MockCommandRunner;
     use std::cell::RefCell;
@@ -1077,6 +1358,12 @@ mod tests {
         call_order: RefCell<Vec<&'static str>>,
         /// What `child_sa_rejection` reports (specs/093 R4).
         rejection: RefCell<Option<String>>,
+        /// What `inbound_esp` reports (specs/098).
+        inbound: RefCell<Option<InboundEsp>>,
+        /// What `tun_rx_packets` reports (specs/098).
+        tun_rx: RefCell<Option<u64>>,
+        /// What `ike_sa_loss_cause` reports.
+        loss_cause: RefCell<IkeSaLossCause>,
     }
 
     impl Default for FakeEngine {
@@ -1107,6 +1394,9 @@ mod tests {
                 recreate_ok: true,
                 call_order: RefCell::new(Vec::new()),
                 rejection: RefCell::new(None),
+                inbound: RefCell::new(None),
+                tun_rx: RefCell::new(None),
+                loss_cause: RefCell::new(IkeSaLossCause::Unknown),
             }
         }
     }
@@ -1142,7 +1432,13 @@ mod tests {
         }
         fn ike_sa_loss_cause(&self, _runner: &dyn CommandRunner) -> IkeSaLossCause {
             self.call_order.borrow_mut().push("loss_cause");
-            IkeSaLossCause::Unknown
+            *self.loss_cause.borrow()
+        }
+        fn inbound_esp(&self) -> Option<InboundEsp> {
+            *self.inbound.borrow()
+        }
+        fn tun_rx_packets(&self) -> Option<u64> {
+            *self.tun_rx.borrow()
         }
         fn child_sa_rejection(&self, _runner: &dyn CommandRunner) -> Option<String> {
             self.call_order.borrow_mut().push("rejection");
@@ -2492,6 +2788,167 @@ mod tests {
             vec!["loss_cause", "reinitiate"],
             "a new establishment would reset the parser"
         );
+    }
+
+    fn esp_seen(age_secs: u64) -> Option<InboundEsp> {
+        Some(InboundEsp {
+            last_in_age: Some(Duration::from_secs(age_secs)),
+            packets: 7,
+            tun_rx_packets: Some(500),
+        })
+    }
+
+    #[test]
+    fn a_healthy_tick_snapshots_inbound_esp() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            inbound: RefCell::new(esp_seen(4)),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        assert_eq!(tracking.inbound.map(|(_, e)| e), esp_seen(4));
+    }
+
+    #[test]
+    fn a_dead_peer_loss_after_recent_esp_is_classified_false() {
+        // #120 finding 2: ESP still arriving while charon gave up.
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            inbound: RefCell::new(esp_seen(30)),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        *engine.health.borrow_mut() = SteadyStateHealth::IkeSaMissing;
+        *engine.loss_cause.borrow_mut() = IkeSaLossCause::DeadPeer;
+        let outcome = tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        assert_eq!(
+            outcome,
+            SteadyOutcome::Recovered {
+                reason: DegradeReason::IkeSaLost,
+                ike_sa_loss_cause: Some(IkeSaLossCause::DeadPeer),
+            }
+        );
+        let c = tracking.dead_peer.expect("classified");
+        assert_eq!(c.verdict, DeadPeerVerdict::False);
+        assert_eq!(c.packets, Some(7));
+        assert_eq!(tracking.inbound, None, "the lost SA's snapshot is spent");
+    }
+
+    #[test]
+    fn a_dead_peer_loss_after_long_silence_is_classified_real() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            inbound: RefCell::new(esp_seen(300)),
+            tun_rx: RefCell::new(Some(500)),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        *engine.health.borrow_mut() = SteadyStateHealth::IkeSaMissing;
+        *engine.loss_cause.borrow_mut() = IkeSaLossCause::DeadPeer;
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        assert_eq!(
+            tracking.dead_peer.map(|c| c.verdict),
+            Some(DeadPeerVerdict::Real)
+        );
+    }
+
+    #[test]
+    fn a_dead_peer_loss_after_long_silence_but_esp_since_is_classified_false() {
+        // The path came back after the last healthy tick, before charon gave
+        // up: the loss tick's counter is ahead of the snapshot's.
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            inbound: RefCell::new(esp_seen(300)),
+            tun_rx: RefCell::new(Some(500)),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        *engine.health.borrow_mut() = SteadyStateHealth::IkeSaMissing;
+        *engine.loss_cause.borrow_mut() = IkeSaLossCause::DeadPeer;
+        *engine.tun_rx.borrow_mut() = Some(517);
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        let c = tracking.dead_peer.expect("classified");
+        assert_eq!(c.verdict, DeadPeerVerdict::False);
+        assert_eq!(c.rx_since_snapshot, Some(17));
+    }
+
+    #[test]
+    fn a_dead_peer_loss_with_no_snapshot_is_unknown() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            health: RefCell::new(SteadyStateHealth::IkeSaMissing),
+            loss_cause: RefCell::new(IkeSaLossCause::DeadPeer),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        assert_eq!(
+            tracking.dead_peer.map(|c| c.verdict),
+            Some(DeadPeerVerdict::Unknown)
+        );
+    }
+
+    #[test]
+    fn other_loss_causes_and_outcomes_are_not_classified() {
+        let runner = MockCommandRunner::new();
+        for cause in [IkeSaLossCause::CarrierDelete, IkeSaLossCause::Unknown] {
+            let engine = FakeEngine {
+                inbound: RefCell::new(esp_seen(30)),
+                ..Default::default()
+            };
+            let mut tracking = SteadyTracking::default();
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+            *engine.health.borrow_mut() = SteadyStateHealth::IkeSaMissing;
+            *engine.loss_cause.borrow_mut() = cause;
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+            assert_eq!(tracking.dead_peer, None, "{cause}");
+        }
+        let engine = FakeEngine {
+            health: RefCell::new(SteadyStateHealth::ChildSaMissing),
+            loss_cause: RefCell::new(IkeSaLossCause::DeadPeer),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        assert_eq!(tracking.dead_peer, None);
+    }
+
+    #[test]
+    fn the_verdict_lasts_one_tick_and_unhealthy_ticks_drop_the_snapshot() {
+        let runner = MockCommandRunner::new();
+        let engine = FakeEngine {
+            health: RefCell::new(SteadyStateHealth::IkeSaMissing),
+            loss_cause: RefCell::new(IkeSaLossCause::DeadPeer),
+            inbound: RefCell::new(esp_seen(5)),
+            ..Default::default()
+        };
+        let mut tracking = SteadyTracking::default();
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        assert!(tracking.dead_peer.is_some());
+        *engine.health.borrow_mut() = SteadyStateHealth::Ok(None);
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        assert_eq!(tracking.dead_peer, None);
+        assert!(tracking.inbound.is_some());
+        for health in [
+            SteadyStateHealth::ViciBroken,
+            SteadyStateHealth::TunVanished,
+            SteadyStateHealth::ChildSaMissing,
+        ] {
+            *engine.health.borrow_mut() = SteadyStateHealth::Ok(None);
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+            *engine.health.borrow_mut() = health;
+            tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+            assert_eq!(tracking.inbound, None, "{health:?}");
+        }
+        *engine.health.borrow_mut() = SteadyStateHealth::Ok(None);
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        *engine.alive.borrow_mut() = false;
+        tick_steady_state(&engine, &runner, "10.0.0.1", &mut tracking);
+        assert_eq!(tracking.inbound, None, "ProcessDied");
     }
 
     #[test]

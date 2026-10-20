@@ -230,6 +230,12 @@ fn start_vowifi_subsystem(
             idle_keepalive_log_line(&config.vowifi)
         ),
     }
+    // Also once per run (specs/098 contracts/config.md).
+    tracing::info!(
+        dpd_delay_sec = config.vowifi.dpd_delay_sec,
+        "{}",
+        dpd_log_line(&config.vowifi)
+    );
 
     // Note: the swu-on-slim payload check is NOT here — it is an image
     // property, not a line-table one, so `run` performs it before discovery
@@ -1548,6 +1554,7 @@ pub(super) fn establish_line_tunnel(
         updown_script: &updown_path,
         src_addr: src_addr.as_deref(),
         address_family,
+        dpd_delay_sec: config.vowifi.dpd_delay_sec,
     };
     let swanctl_epdg = super::render::render_swanctl_epdg(&epdg_template, &params);
     let _ = runner.write_file(
@@ -1650,6 +1657,8 @@ pub(super) fn establish_line_tunnel(
         // priming capture comes through here too; its line is a VoWiFi line
         // and carries the same `[vowifi]`-derived family.
         address_family,
+        last_inbound: Default::default(),
+        last_tun_rx: Default::default(),
     };
     {
         // Greptile P1 (round 3, same design gap): the RwLock guard added for
@@ -1810,6 +1819,8 @@ fn start_vowifi_line_strongswan(
         shared: Arc::clone(ctx.shared_charon),
         max_establish_attempts: None,
         address_family: line.config.tunnel_address_family,
+        last_inbound: Default::default(),
+        last_tun_rx: Default::default(),
     };
 
     let mut current_pool = engine.latest_pcscf_pool(runner.as_ref());
@@ -1994,11 +2005,15 @@ fn start_vowifi_line_strongswan(
                         )
                     );
                 }
+                if let Some(classification) = tracking.dead_peer {
+                    println!("{}", dead_peer_detail(idx, &classification));
+                }
                 send_tunnel(
                     signal,
                     vec![tunnel_recovered_event(
                         reason,
                         &tracking.pool_exhausted,
+                        tracking.dead_peer.map(|c| c.verdict),
                         SystemTime::now(),
                     )],
                 );
@@ -2405,10 +2420,12 @@ struct TunnelSignal {
 
 /// The event that counts one steady-state recovery of a line (specs/096),
 /// carrying, when the reason was an exhausted pool, the P-CSCFs and when the
-/// rebuild was issued (`now`), for the daemon's alert episode (specs/097).
+/// rebuild was issued (`now`), for the daemon's alert episode (specs/097), and,
+/// for a dead-peer loss, the supervisor's verdict on it (specs/098).
 fn tunnel_recovered_event(
     reason: line_supervisor::DegradeReason,
     exhausted: &[line_supervisor::ExhaustedMember],
+    dead_peer: Option<line_supervisor::DeadPeerVerdict>,
     now: SystemTime,
 ) -> crate::control::protocol::ObservedEvent {
     crate::control::protocol::ObservedEvent::TunnelRecovered {
@@ -2418,6 +2435,44 @@ fn tunnel_recovered_event(
             now.duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs())
         }),
+        dead_peer,
+    }
+}
+
+/// What the tunnel interface received after the snapshot, for the log.
+fn rx_since(packets: Option<u64>) -> String {
+    packets.map_or_else(
+        || "tunnel counter unread".to_string(),
+        |n| format!("{n} received on the tunnel since"),
+    )
+}
+
+/// The verdict on a dead-peer loss and the inbound ESP it rests on, for the
+/// log (specs/098 contracts/dead-peer.md).
+fn dead_peer_detail(idx: u32, c: &line_supervisor::DeadPeerClassification) -> String {
+    let verdict = c.verdict.as_str();
+    let window = line_supervisor::DPD_GIVE_UP_WINDOW.as_secs();
+    match (c.snapshot_age, c.last_in_before_loss, c.packets) {
+        (None, _, _) => {
+            format!(
+                "[supervise] line {idx}: dead peer verdict: {verdict} (no inbound ESP snapshot)"
+            )
+        }
+        (Some(snap), None, packets) => format!(
+            "[supervise] line {idx}: dead peer verdict: {verdict} (no inbound ESP on any listed \
+             CHILD_SA, {} packets, snapshot {}s old, {}; charon retransmits for {window}s)",
+            packets.unwrap_or(0),
+            snap.as_secs(),
+            rx_since(c.rx_since_snapshot)
+        ),
+        (Some(snap), Some(before), packets) => format!(
+            "[supervise] line {idx}: dead peer verdict: {verdict} (inbound ESP {}s before the \
+             loss, {} packets, snapshot {}s old, {}; charon retransmits for {window}s)",
+            before.as_secs(),
+            packets.unwrap_or(0),
+            snap.as_secs(),
+            rx_since(c.rx_since_snapshot)
+        ),
     }
 }
 
@@ -2824,6 +2879,18 @@ fn idle_keepalive_log_line(v: &crate::config::VowifiConfig) -> String {
     }
 }
 
+/// The startup line naming the DPD delay every strongSwan line renders, or
+/// saying it is ignored on swu (specs/098 FR-006).
+fn dpd_log_line(v: &crate::config::VowifiConfig) -> String {
+    match (v.tunnel_engine.as_str(), v.dpd_delay_sec) {
+        ("strongswan", 0) => "strongSwan DPD off ([vowifi].dpd_delay_sec = 0)".to_string(),
+        ("strongswan", secs) => {
+            format!("strongSwan DPD: dpd_delay = {secs}s ([vowifi].dpd_delay_sec)")
+        }
+        _ => "[vowifi].dpd_delay_sec ignored: the swu engine has no DPD setting".to_string(),
+    }
+}
+
 /// One idle-tunnel keepalive cycle (TCP connect, not ICMP — operators filter
 /// ICMP over the tunnel): if the line has a P-CSCF, connect to its SIP port
 /// from inside the line's namespace and discard the result.
@@ -3116,6 +3183,31 @@ mod tests {
             idle_keepalive_log_line(&on),
             "idle-tunnel keepalive on: TCP connect to each line's P-CSCF :5060 every 30s \
              ([vowifi].idle_keepalive = true)"
+        );
+    }
+
+    #[test]
+    fn the_startup_dpd_line_names_the_delay_or_says_it_is_ignored() {
+        let default = crate::config::VowifiConfig::default();
+        assert_eq!(
+            dpd_log_line(&default),
+            "strongSwan DPD: dpd_delay = 120s ([vowifi].dpd_delay_sec)"
+        );
+        let off = crate::config::VowifiConfig {
+            dpd_delay_sec: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            dpd_log_line(&off),
+            "strongSwan DPD off ([vowifi].dpd_delay_sec = 0)"
+        );
+        let swu = crate::config::VowifiConfig {
+            tunnel_engine: "swu".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            dpd_log_line(&swu),
+            "[vowifi].dpd_delay_sec ignored: the swu engine has no DPD setting"
         );
     }
 
@@ -4065,6 +4157,7 @@ mod tests {
             let event = tunnel_recovered_event(
                 line_supervisor::DegradeReason::DefaultRouteMissing,
                 &[],
+                None,
                 SystemTime::now(),
             );
             assert_eq!(
@@ -4073,7 +4166,64 @@ mod tests {
                     reason: TunnelRecoveryReason::DefaultRouteMissing,
                     pcscfs: Vec::new(),
                     rebuilt_at_unix: None,
+                    dead_peer: None,
                 }
+            );
+        }
+
+        #[test]
+        fn a_dead_peer_loss_carries_its_verdict_and_says_why() {
+            use crate::control::protocol::{DeadPeerVerdict, ObservedEvent, TunnelRecoveryReason};
+            let event = tunnel_recovered_event(
+                line_supervisor::DegradeReason::IkeSaLost,
+                &[],
+                Some(DeadPeerVerdict::False),
+                SystemTime::now(),
+            );
+            assert_eq!(
+                event,
+                ObservedEvent::TunnelRecovered {
+                    reason: TunnelRecoveryReason::IkeSaLost,
+                    pcscfs: Vec::new(),
+                    rebuilt_at_unix: None,
+                    dead_peer: Some(DeadPeerVerdict::False),
+                }
+            );
+            let c = line_supervisor::DeadPeerClassification {
+                verdict: DeadPeerVerdict::False,
+                snapshot_age: Some(Duration::from_secs(12)),
+                last_in_before_loss: Some(Duration::from_secs(42)),
+                packets: Some(1834),
+                rx_since_snapshot: Some(3),
+            };
+            assert_eq!(
+                dead_peer_detail(0, &c),
+                "[supervise] line 0: dead peer verdict: false (inbound ESP 42s before the loss, \
+                 1834 packets, snapshot 12s old, 3 received on the tunnel since; charon \
+                 retransmits for 165s)"
+            );
+            let unread = line_supervisor::DeadPeerClassification {
+                verdict: DeadPeerVerdict::Unknown,
+                rx_since_snapshot: None,
+                last_in_before_loss: Some(Duration::from_secs(300)),
+                ..c
+            };
+            assert_eq!(
+                dead_peer_detail(0, &unread),
+                "[supervise] line 0: dead peer verdict: unknown (inbound ESP 300s before the \
+                 loss, 1834 packets, snapshot 12s old, tunnel counter unread; charon retransmits \
+                 for 165s)"
+            );
+            let none = line_supervisor::DeadPeerClassification {
+                verdict: DeadPeerVerdict::Unknown,
+                snapshot_age: None,
+                last_in_before_loss: None,
+                packets: None,
+                rx_since_snapshot: None,
+            };
+            assert_eq!(
+                dead_peer_detail(1, &none),
+                "[supervise] line 1: dead peer verdict: unknown (no inbound ESP snapshot)"
             );
         }
 
@@ -4089,6 +4239,7 @@ mod tests {
             let event = tunnel_recovered_event(
                 line_supervisor::DegradeReason::PcscfPoolExhausted,
                 &members,
+                None,
                 std::time::UNIX_EPOCH + Duration::from_secs(1_790_000_400),
             );
             assert_eq!(
@@ -4097,6 +4248,7 @@ mod tests {
                     reason: TunnelRecoveryReason::PcscfPoolExhausted,
                     pcscfs: vec!["10.0.0.11".into()],
                     rebuilt_at_unix: Some(1_790_000_400),
+                    dead_peer: None,
                 }
             );
             let detail = pool_exhausted_detail(

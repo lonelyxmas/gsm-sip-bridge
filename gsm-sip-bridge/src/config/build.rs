@@ -59,6 +59,19 @@ where
     }
 }
 
+/// `[vowifi].dpd_delay_sec`: `0` (off), or 10–3600 (specs/098 R6). Below 10
+/// the 30s supervisor tick cannot tell a false dead peer from a real one;
+/// above an hour it is effectively off, which is what `0` is for.
+fn dpd_delay_sec(value: u64) -> BridgeResult<u64> {
+    if value == 0 || (10..=3600).contains(&value) {
+        Ok(value)
+    } else {
+        Err(BridgeError::Config(format!(
+            "field vowifi.dpd_delay_sec must be 0 or between 10 and 3600, got {value}"
+        )))
+    }
+}
+
 fn require_non_empty(value: &str, key: &str) -> BridgeResult<()> {
     if value.is_empty() {
         return Err(BridgeError::Config(format!(
@@ -840,6 +853,7 @@ fn build_vowifi(raw: RawVowifi) -> BridgeResult<VowifiConfig> {
         epdg_ip: raw.epdg_ip.filter(|s| !s.is_empty()),
         src_addr: raw.src_addr.filter(|s| !s.is_empty()),
         idle_keepalive: raw.idle_keepalive,
+        dpd_delay_sec: dpd_delay_sec(raw.dpd_delay_sec)?,
         keepalive_interval_sec: in_range(
             raw.keepalive_interval_sec,
             "vowifi.keepalive_interval_sec",

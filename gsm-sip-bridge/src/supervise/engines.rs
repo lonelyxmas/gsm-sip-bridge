@@ -5,7 +5,7 @@
 //! current script's `grep`/`sed` pattern with the same fixture the original
 //! bash comment used, tested independently of any [`CommandRunner`].
 
-use super::line_supervisor::{ChildSaLifetime, SteadyStateHealth, TunnelEngine};
+use super::line_supervisor::{ChildSaLifetime, InboundEsp, SteadyStateHealth, TunnelEngine};
 use super::runner::{ChildHandle, ChildSpec, CommandRunner};
 use crate::config::TunnelAddressFamily;
 use crate::control::protocol::IkeSaLossCause;
@@ -290,6 +290,82 @@ pub fn newest_child_sa_lifetime(sas_output: &str, conn_name: &str) -> Option<Chi
         }
     }
     newest
+}
+
+/// Inbound ESP across every CHILD_SA of `conn_name` that `swanctl --list-sas`
+/// lists, whatever its state, so a rekey's old and new SA are both looked at
+/// (specs/098 R4). Each prints an inbound line under its header:
+///
+/// ```text
+///   ims0: #12, reqid 1, INSTALLED, TUNNEL-in-UDP, ESP:AES_CBC-128/HMAC_SHA1_96
+///     installed 1109s ago, rekeying in 2167s, expires in 2852s
+///     in  cea6576a (-|0x00000017),  21600 bytes,   242 packets,     4s ago
+/// ```
+///
+/// The trailing `Ns ago` is the kernel's last use of that inbound SA, and is
+/// absent while it has received nothing. `None` when no CHILD_SA of the
+/// connection is listed.
+pub fn inbound_esp(sas_output: &str, conn_name: &str) -> Option<InboundEsp> {
+    let mut seen = false;
+    let mut in_conn = false;
+    let mut youngest: Option<u64> = None;
+    let mut packets = 0u64;
+    for line in sas_output.lines() {
+        if child_sa_header(line, conn_name).is_some() {
+            seen = true;
+            in_conn = true;
+            continue;
+        }
+        // Any other line at the IKE_SA or CHILD_SA header's depth ends the
+        // CHILD_SA whose details were being read.
+        if !line.starts_with("    ") {
+            in_conn = false;
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("    in  ").filter(|_| in_conn) else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.split(", ").map(str::trim).collect();
+        packets += fields
+            .iter()
+            .find_map(|f| f.strip_suffix(" packets"))
+            .and_then(|n| n.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let age = fields
+            .iter()
+            .find_map(|f| f.strip_suffix("s ago"))
+            .and_then(|n| n.trim().parse::<u64>().ok());
+        if let Some(age) = age {
+            youngest = Some(youngest.map_or(age, |y| y.min(age)));
+        }
+    }
+    seen.then(|| InboundEsp {
+        last_in_age: youngest.map(Duration::from_secs),
+        packets,
+        tun_rx_packets: None,
+    })
+}
+
+/// The received-packet counter from `ip -s link show <iface>`:
+///
+/// ```text
+/// 344: tun23-0@NONE: <NOARP,UP,LOWER_UP> mtu 1500 qdisc noqueue state UNKNOWN …
+///     link/none  link-netnsid 0
+///     RX:  bytes packets errors dropped  missed   mcast
+///          63043     379      3       3       0       0
+/// ```
+///
+/// The column is found by its header, which iproute2 has renamed and
+/// re-spaced across versions. `None` when there is no RX block.
+pub fn link_rx_packets(ip_s_link_output: &str) -> Option<u64> {
+    let mut lines = ip_s_link_output.lines();
+    while let Some(line) = lines.next() {
+        if let Some(header) = line.trim_start().strip_prefix("RX:") {
+            let column = header.split_whitespace().position(|h| h == "packets")?;
+            return lines.next()?.split_whitespace().nth(column)?.parse().ok();
+        }
+    }
+    None
 }
 
 /// Whether `swanctl --list-sas --ike <conn>` lists an IKE_SA for `conn_name`
@@ -609,6 +685,15 @@ pub struct StrongswanEngine {
     /// P-CSCFs this engine selects and publishes (FR-013), and gates the
     /// `INVALID_SELECTORS` rekey hint to `Dual` lines (FR-009a).
     pub address_family: TunnelAddressFamily,
+    /// What the last [`TunnelEngine::steady_state_health`] read of inbound
+    /// ESP, for [`TunnelEngine::inbound_esp`] (specs/098). Cleared whenever a
+    /// health check could not read the SAs, so it is never older than the
+    /// listing it came from.
+    pub last_inbound: std::cell::Cell<Option<InboundEsp>>,
+    /// The tunnel interface's received-packet counter as the last
+    /// [`TunnelEngine::steady_state_health`] read it, on every tick that
+    /// found the interface, for [`TunnelEngine::tun_rx_packets`] (specs/098).
+    pub last_tun_rx: std::cell::Cell<Option<u64>>,
 }
 
 impl StrongswanEngine {
@@ -863,14 +948,21 @@ impl TunnelEngine for StrongswanEngine {
     }
 
     fn steady_state_health(&self, runner: &dyn CommandRunner) -> SteadyStateHealth {
-        let tun_check = runner.run_in_netns(&self.netns, &["ip", "link", "show", &self.tun_iface]);
-        if tun_check.map(|o| !o.status.success()).unwrap_or(true) {
+        self.last_inbound.set(None);
+        self.last_tun_rx.set(None);
+        // `-s` for the counter a dead-peer verdict compares across ticks; the
+        // existence check is the same.
+        let tun_check =
+            runner.run_in_netns(&self.netns, &["ip", "-s", "link", "show", &self.tun_iface]);
+        let Some(tun_check) = tun_check.ok().filter(|o| o.status.success()) else {
             println!(
                 "[supervise] line {}: {} missing from netns {}; recreating and forcing reinitiate",
                 self.idx, self.tun_iface, self.netns
             );
             return SteadyStateHealth::TunVanished;
-        }
+        };
+        let tun_rx = link_rx_packets(&String::from_utf8_lossy(&tun_check.stdout));
+        self.last_tun_rx.set(tun_rx);
 
         // Bounded and scoped to this line: see `list_sas`.
         let Some(sas_output) = self.list_sas(runner) else {
@@ -894,7 +986,21 @@ impl TunnelEngine for StrongswanEngine {
             );
             return SteadyStateHealth::ChildSaMissing;
         }
+        self.last_inbound.set(
+            inbound_esp(&sas_output, &self.conn_name).map(|esp| InboundEsp {
+                tun_rx_packets: tun_rx,
+                ..esp
+            }),
+        );
         SteadyStateHealth::Ok(newest_child_sa_lifetime(&sas_output, &self.conn_name))
+    }
+
+    fn inbound_esp(&self) -> Option<InboundEsp> {
+        self.last_inbound.get()
+    }
+
+    fn tun_rx_packets(&self) -> Option<u64> {
+        self.last_tun_rx.get()
     }
 
     /// Recovery for "the process died" and "vici is unreachable".
@@ -1336,6 +1442,108 @@ mod tests {
         })
     }
 
+    /// A CHILD_SA with an explicit inbound line (`in_tail` is everything after
+    /// the SPI, as the pinned 5.9.3 prints it).
+    fn child_with_in(conn: &str, n: u32, state: &str, in_tail: &str) -> String {
+        format!(
+            "  {conn}: #{n}, reqid 1, {state}, TUNNEL-in-UDP, ESP:AES_CBC-128/HMAC_SHA1_96\n    installed 10s ago, rekeying in 3000s, expires in 3600s\n    in  cea6576a (-|0x00000017), {in_tail}\n    out 0badf00d (-|0x00000017),  1200 bytes,    20 packets,     2s ago\n    local  192.0.2.10/32\n    remote 0.0.0.0/0\n"
+        )
+    }
+
+    fn esp(age: Option<u64>, packets: u64) -> Option<InboundEsp> {
+        Some(InboundEsp {
+            last_in_age: age.map(Duration::from_secs),
+            packets,
+            tun_rx_packets: None,
+        })
+    }
+
+    #[test]
+    fn link_rx_packets_reads_the_packets_column_by_its_header() {
+        // iproute2 6.x, as the live rig prints it.
+        let new = "344: tun23-0@NONE: <NOARP,UP,LOWER_UP> mtu 1500 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\n    link/none  link-netnsid 0\n    RX:  bytes packets errors dropped  missed   mcast           \n         63043     379      3       3       0       0 \n    TX:  bytes packets errors dropped carrier collsns           \n         79828     688     11      11      11       0 \n";
+        assert_eq!(link_rx_packets(new), Some(379));
+        // Older iproute2 names the columns differently.
+        let old = "5: tun23: <NOARP,UP,LOWER_UP> mtu 1500\n    link/none \n    RX: bytes  packets  errors  dropped overrun mcast   \n    1200       12       0       0       0       0       \n    TX: bytes  packets  errors  dropped carrier collsns \n    900        9        0       0       0       0       \n";
+        assert_eq!(link_rx_packets(old), Some(12));
+        assert_eq!(link_rx_packets("5: tun23\n"), None);
+    }
+
+    #[test]
+    fn inbound_esp_reads_the_last_use_age_and_packets() {
+        let sas = format!(
+            "{}{}",
+            ike_header("ims0"),
+            child_with_in(
+                "ims0",
+                3,
+                "INSTALLED",
+                " 21600 bytes,   242 packets,     4s ago"
+            )
+        );
+        assert_eq!(inbound_esp(&sas, "ims0"), esp(Some(4), 242));
+    }
+
+    #[test]
+    fn inbound_esp_takes_the_youngest_age_across_a_rekeys_two_sas() {
+        let sas = format!(
+            "{}{}{}",
+            ike_header("ims0"),
+            child_with_in(
+                "ims0",
+                3,
+                "REKEYED",
+                " 21600 bytes,   242 packets,    95s ago"
+            ),
+            child_with_in(
+                "ims0",
+                4,
+                "INSTALLED",
+                "   300 bytes,     3 packets,    12s ago"
+            )
+        );
+        assert_eq!(inbound_esp(&sas, "ims0"), esp(Some(12), 245));
+    }
+
+    #[test]
+    fn inbound_esp_without_any_inbound_use_has_no_age() {
+        let sas = format!(
+            "{}{}",
+            ike_header("ims0"),
+            child_with_in("ims0", 4, "INSTALLED", "     0 bytes,     0 packets")
+        );
+        assert_eq!(inbound_esp(&sas, "ims0"), esp(None, 0));
+    }
+
+    #[test]
+    fn inbound_esp_ignores_another_connections_sa() {
+        let sas = format!(
+            "{}{}{}{}",
+            ike_header("ims1"),
+            child_with_in(
+                "ims1",
+                7,
+                "INSTALLED",
+                " 9000 bytes,   90 packets,     1s ago"
+            ),
+            ike_header("ims0"),
+            child_with_in(
+                "ims0",
+                3,
+                "INSTALLED",
+                " 21600 bytes,   242 packets,    40s ago"
+            )
+        );
+        assert_eq!(inbound_esp(&sas, "ims0"), esp(Some(40), 242));
+        assert_eq!(inbound_esp(&sas, "ims10"), None);
+    }
+
+    #[test]
+    fn inbound_esp_with_no_child_sa_is_none() {
+        assert_eq!(inbound_esp(&ike_header("ims0"), "ims0"), None);
+        assert_eq!(inbound_esp("", "ims0"), None);
+    }
+
     #[test]
     fn child_sa_lifetime_table() {
         let h = ike_header("ims0");
@@ -1666,6 +1874,8 @@ mod tests {
                 shared: shared_charon(),
                 max_establish_attempts: None,
                 address_family: TunnelAddressFamily::Dual,
+                last_inbound: Default::default(),
+                last_tun_rx: Default::default(),
             }
         }
 
@@ -1840,7 +2050,7 @@ mod tests {
             let runner = MockCommandRunner::new();
             let engine = strongswan_engine();
             assert!(engine.shared.ensure_started(&runner).is_some());
-            runner.set_netns_output("ims", &["ip", "link", "show", "tun23"], "5: tun23\n");
+            runner.set_netns_output("ims", &["ip", "-s", "link", "show", "tun23"], "5: tun23\n");
             runner.set_run_output(
                 "timeout 10 env STRONGSWAN_CONF=/etc/strongswan-shared.conf swanctl --list-sas --ike ims0",
                 std::process::Output {
@@ -1936,6 +2146,35 @@ mod tests {
             );
         }
 
+        #[test]
+        fn a_healthy_check_snapshots_the_tunnel_counter_with_the_esp() {
+            use std::os::unix::process::ExitStatusExt;
+            let runner = MockCommandRunner::new();
+            let engine = strongswan_engine();
+            assert!(engine.shared.ensure_started(&runner).is_some());
+            runner.set_netns_output(
+                "ims",
+                &["ip", "-s", "link", "show", "tun23"],
+                "5: tun23\n    RX:  bytes packets errors dropped  missed   mcast\n         900      77      0       0       0       0\n",
+            );
+            runner.set_run_output(
+                "timeout 10 env STRONGSWAN_CONF=/etc/strongswan-shared.conf swanctl --list-sas --ike ims0",
+                std::process::Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: format!("{}{}", super::ike_header("ims0"), super::child_with_in("ims0", 1, "INSTALLED", " 900 bytes,     9 packets,     4s ago")).into_bytes(),
+                    stderr: Vec::new(),
+                },
+            );
+            assert!(matches!(
+                engine.steady_state_health(&runner),
+                SteadyStateHealth::Ok(_)
+            ));
+            assert_eq!(engine.tun_rx_packets(), Some(77));
+            assert_eq!(
+                engine.inbound_esp().and_then(|e| e.tun_rx_packets),
+                Some(77)
+            );
+        }
         #[test]
         fn steady_state_health_reports_a_missing_ike_sa_distinctly() {
             use std::os::unix::process::ExitStatusExt;
@@ -2268,7 +2507,7 @@ mod tests {
             // MockCommandRunner::run_in_netns's own lookup key.
             use std::os::unix::process::ExitStatusExt;
             runner.set_run_output(
-                "netns:ims:ip link show tun23",
+                "netns:ims:ip -s link show tun23",
                 std::process::Output {
                     status: std::process::ExitStatus::from_raw(256),
                     stdout: vec![],
@@ -2346,6 +2585,8 @@ mod tests {
         fn engine_with(family: TunnelAddressFamily) -> StrongswanEngine {
             StrongswanEngine {
                 address_family: family,
+                last_inbound: Default::default(),
+                last_tun_rx: Default::default(),
                 ..strongswan_engine()
             }
         }

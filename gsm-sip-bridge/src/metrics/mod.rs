@@ -491,6 +491,23 @@ pub static VOWIFI_TUNNEL_RECOVERIES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     .unwrap()
 });
 
+/// IKE_SA losses to an unresponsive ePDG on a strongSwan VoWiFi line, by the
+/// supervisor's verdict (specs/098): `false` when inbound ESP arrived while
+/// charon was still retransmitting (the path worked again before it gave up:
+/// the ePDG ignored an IKE request, or a short local outage ended), `real`
+/// when it did not, `unknown` when it could not tell.
+/// One event per loss, so a supervisor restart cannot rewind it.
+pub static VOWIFI_DEAD_PEER_LOSSES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        opts!(
+            "gsm_sip_bridge_vowifi_dead_peer_losses_total",
+            "IKE_SA losses to an unresponsive ePDG, by whether inbound ESP was still arriving"
+        ),
+        &["module", "verdict"]
+    )
+    .unwrap()
+});
+
 // --- Agent liveness (specs/014-vowifi-metrics-restore) ---------------------
 // Owned by `metrics::ingest`, evaluated at scrape time in `metrics::server`.
 // Labeled by both `agent` (process kind: ims/sip) and `module` (card

@@ -48,6 +48,8 @@
 #                  [[vowifi.line]] override (specs/092): "dual" renders
 #                  `0.0.0.0, ::` and `0.0.0.0/0, ::/0`, "ipv4" and "ipv6"
 #                  only their own family. Per line, like @IF_ID@.
+#   @DPD_DELAY@  - charon's DPD delay, from [vowifi].dpd_delay_sec as `<N>s`
+#                  (`0s` = off; specs/098). Per deployment.
 #
 # No `secrets{}` block: authentication runs live EAP-AKA against the SIM
 # inside the modem via `vowifi-usim-bridge` (pcscd/vpcd), not a static key.
@@ -132,7 +134,16 @@ connections {
 
         # Dead-peer-detection cadence (FR-004's "detect a dead peer / broken
         # path" — the reliability primitive Option 1 never had at all).
-        dpd_delay = 30s
+        #
+        # The value is `[vowifi].dpd_delay_sec` (default 120s, `0s` = off;
+        # specs/098). charon sends a DPD request only after this long with
+        # nothing received from the ePDG, inbound ESP included. It was 30s:
+        # with no other inbound traffic that is a DPD exchange every 30s, and
+        # on both Vodafone and Jio the ePDG once ignored one and all five
+        # retransmits while ESP still flowed both ways — charon gave up after
+        # ~165s and tore down a working tunnel (#120 finding 2). 120s is the
+        # Android IWLAN default (`KEY_DPD_TIMER_SEC_INT`).
+        dpd_delay = @DPD_DELAY@
 
         # MOBIKE off. charon defaults it on, and on a multi-homed host it
         # promptly sends an INFORMATIONAL carrying ADD_4_ADDR/ADD_6_ADDR for

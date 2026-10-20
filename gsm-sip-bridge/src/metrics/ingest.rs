@@ -526,6 +526,7 @@ fn note_pool_exhausted_rebuilds(
             reason: TunnelRecoveryReason::PcscfPoolExhausted,
             pcscfs,
             rebuilt_at_unix,
+            ..
         } = event
         else {
             continue;
@@ -1215,10 +1216,17 @@ fn apply_event(agent: AgentKind, module_id: &str, event: &ObservedEvent) {
                 .with_label_values(&[module_id])
                 .inc();
         }
-        ObservedEvent::TunnelRecovered { reason, .. } => {
+        ObservedEvent::TunnelRecovered {
+            reason, dead_peer, ..
+        } => {
             metrics::VOWIFI_TUNNEL_RECOVERIES_TOTAL
                 .with_label_values(&[module_id, reason.as_str()])
                 .inc();
+            if let Some(verdict) = dead_peer {
+                metrics::VOWIFI_DEAD_PEER_LOSSES_TOTAL
+                    .with_label_values(&[module_id, verdict.as_str()])
+                    .inc();
+            }
         }
     }
 }
@@ -2054,6 +2062,7 @@ mod tests {
             reason: TunnelRecoveryReason::PcscfPoolExhausted,
             pcscfs: vec![addr.to_string()],
             rebuilt_at_unix: Some(now_unix() - ago),
+            dead_peer: None,
         }
     }
 
@@ -2273,6 +2282,7 @@ mod tests {
                 reason,
                 pcscfs: Vec::new(),
                 rebuilt_at_unix: None,
+                dead_peer: None,
             })
             .collect();
         sup_report(&cfg, m, 1, events);

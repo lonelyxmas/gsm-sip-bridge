@@ -211,6 +211,7 @@ fn render_asset(asset: &crate::cli::RenderAsset) -> Result<String, String> {
             updown_script,
             src_addr,
             address_family,
+            dpd_delay_sec,
         } => {
             let template = std::fs::read_to_string(template_path)
                 .map_err(|e| format!("could not read {}: {e}", template_path.display()))?;
@@ -224,6 +225,7 @@ fn render_asset(asset: &crate::cli::RenderAsset) -> Result<String, String> {
                 updown_script,
                 src_addr: src_addr.as_deref(),
                 address_family: *address_family,
+                dpd_delay_sec: *dpd_delay_sec,
             };
             render::render_swanctl_epdg(&template, &params)
         }
@@ -394,6 +396,12 @@ mod render_command_tests {
         let default = render_epdg(&[]);
         assert_eq!(default, render_epdg(&["--address-family", "dual"]));
         assert!(default.contains("        vips = 0.0.0.0, ::\n"));
+    }
+
+    #[test]
+    fn render_swanctl_epdg_defaults_to_the_configured_dpd_default() {
+        assert!(render_epdg(&[]).contains("        dpd_delay = 120s\n"));
+        assert!(render_epdg(&["--dpd-delay-sec", "0"]).contains("        dpd_delay = 0s\n"));
     }
 
     #[test]
