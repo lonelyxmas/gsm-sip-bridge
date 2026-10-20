@@ -63,18 +63,18 @@ None: the setting and the classification are independent.
 
 ## Phase 7: User Story 4 — a dead ePDG is still caught (P2, live)
 
-- [ ] T023 [US4] On the probe-forced build at the default 120s, black-hole the ePDG on each rig (quickstart §3). Record fault → first DPD → give-up → rebuild → re-registration after removal; expect verdict `real` and a rebuild within 300s.
+- [X] T023 [US4] On the probe-forced build at the default 120s, black-hole the ePDG on each rig (quickstart §3). Record fault → first DPD → give-up → rebuild → re-registration after removal; expect verdict `real` and a rebuild within 300s.
 
 ## Phase 8: User Story 5 — the #137 gap (P3, live)
 
-- [ ] T024 [US5] Vodafone, probe-forced, P-CSCF black-holed with the agent log streamed out (quickstart §5). Account for every interval within 5s in `research.md` (R8 Findings).
-- [ ] T025 [US5] If a fix qualifies under FR-011a, implement it test-first in `ims/agent/`, re-verify on both rigs, commit separately; otherwise file a GitHub issue and link it from R8.
+- [X] T024 [US5] Vodafone, probe-forced, P-CSCF black-holed with the agent log streamed out (quickstart §5). Account for every interval within 5s in `research.md` (R8 Findings).
+- [X] T025 [US5] If a fix qualifies under FR-011a, implement it test-first in `ims/agent/`, re-verify on both rigs, commit separately; otherwise file a GitHub issue and link it from R8.
 
 ## Phase 9: Verification soak and sign-off
 
-- [ ] T026 12h idle soak per carrier on the probe-forced build at the default (quickstart §2): zero `giving up after`, ≥1 REGISTER refresh, CHILD_SA rekey and IKE_SA rekey; DPD requests/hour vs T021's baseline (SC-002).
-- [ ] T027 Real branch image (probe on), 1h idle per rig: no DPD in the outer capture, no new recoveries (SC-004).
-- [ ] T028 Write `specs/098-dpd-tuning/live-verification.md` (SC-001…SC-007, addresses redacted to roles); commit `docs(098): research findings and live verification (#120)`.
+- [X] T026 12h idle soak per carrier on the probe-forced build at the default (quickstart §2): zero `giving up after`, ≥1 REGISTER refresh, CHILD_SA rekey and IKE_SA rekey; DPD requests/hour vs T021's baseline (SC-002).
+- [X] T027 Real branch image (probe on), 1h idle per rig: no DPD in the outer capture, no new recoveries (SC-004).
+- [X] T028 Write `specs/098-dpd-tuning/live-verification.md` (SC-001…SC-007, addresses redacted to roles); commit `docs(098): research findings and live verification (#120)`.
 
 ## Dependencies
 
