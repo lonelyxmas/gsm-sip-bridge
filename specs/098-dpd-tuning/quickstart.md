@@ -40,7 +40,7 @@ On the probe-forced build at the default, drop the outer path to the ePDG:
 docker exec <c> ip route add blackhole <epdg-ip>/32   # default netns of the container
 ```
 
-Record: fault time, first unanswered DPD, `giving up`, `recovered from …`, the verdict (expect `real`), and re-registration after `ip route del`. Bound: rebuild begun within 300s.
+Record: fault time, first unanswered DPD, `giving up`, `recovered from …`, the verdict (expect `real`), and re-registration after `ip route del`. Bound: rebuild begun within 315s.
 
 ### 4. Default build sanity (SC-004)
 

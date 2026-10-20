@@ -24,13 +24,13 @@ Captures: outer UDP 500/4500 on the host (`tcpdump -i any`), charon's log copied
 |---|---|---|
 | SC-001: 12h at 120s, probe forced off, zero false dead-peer teardowns, ≥1 REGISTER refresh, CHILD_SA and IKE_SA rekey | **Pass**: 12h, 0 teardowns, 0 DPD retransmits; 13 REGISTER refreshes, 12 CHILD_SA and 3 IKE_SA rekeys | **Pass**: 26.5h, 1 teardown, caused by a host uplink outage, not a false dead peer (below) |
 | SC-002: idle-hour DPD requests ≤ ⅓ of the 30s baseline | **Pass**: 6–20/h, 13/h on average, against ~109/h at 30s | **Pass**: ≤ 28/h at 120s against ~110/h at 30s |
-| SC-003: black-holed ePDG detected and rebuild begun within 300s | **Pass**: 254s, by the IMS agent's path, 14s before DPD would have given up | **Pass**: 198s by DPD |
+| SC-003: black-holed ePDG detected and rebuild begun within 315s | **Pass**: 254s, by the IMS agent's path, 14s before DPD would have given up | **Pass**: 198s by DPD |
 | SC-004: real image, idle hour, no DPD, no new recoveries | **Pass** on `dpd-098b-local`: 0 DPD, 0 retransmits, 0 recoveries | **Pass** on `dpd-098b-arm64`: 0 DPD, 0 retransmits, 0 recoveries (after a nightly uplink outage, below) |
 | SC-005: per-carrier verdict, handset default | See `research.md` R1 and R7 Findings | See `research.md` R7 Findings |
 | SC-006: every dead-peer loss classified, matching the capture | **Pass**: none occurred (the black-hole was caught by the agent first) | **Pass**: 3 of 3 (two `false`, one `real`) |
 | SC-007: #137 gap accounted for to within 5s | **Pass**: 225s = 95 + 110 + 1 + 19, cause fixed in `287d078`; the fixed image matched its model to the second (171s) | n/a (Vodafone only); the fix re-checked on Jio's failover path |
 
-**SC-003's bound is not guaranteed by DPD alone.** Detection takes the remaining DPD delay, plus charon's 165s of retransmits, plus up to 30s until the supervisor's next poll. A fault that lands just after an inbound packet gives 120 + 165 + 30 ≈ 315s. Both runs here landed late in the idle phase (198s and 254s). With the probe removed, the IMS agent's keepalive path (120s interval, three 10s retries since `287d078`) bounds it independently at about 120 + 30 + 30 = 180s for a dead path that also kills the Gm connection, which a black-holed ePDG does.
+**SC-003's bound is DPD's worst case.** It was 300s until this run, and was widened to 315s once the worst case was worked out: detection takes the remaining DPD delay, plus charon's 165s of retransmits, plus up to 30s until the supervisor's next poll. A fault that lands just after an inbound packet gives 120 + 165 + 30 = 315s. Both runs here landed late in the idle phase (198s and 254s). With the probe removed, the IMS agent's keepalive path (120s interval, three 10s retries since `287d078`) bounds it independently at about 120 + 30 + 30 = 180s for a dead path that also kills the Gm connection, which a black-holed ePDG does.
 
 ## Jio
 
@@ -98,7 +98,7 @@ Probe-forced image at 120s. The Pi has no packet filter, so the fault is a black
 | 18:39:40 | New IKE_SA |
 | 18:39:44 | Agent registered, 9s after the route was removed |
 
-The loss was detected **198s** after the fault, within the 300s bound. The verdict was `real`, matching the capture. Here the line had already been idle for 103s when the fault began; see the Summary for the worst case.
+The loss was detected **198s** after the fault, within the 315s bound. The verdict was `real`, matching the capture. Here the line had already been idle for 103s when the fault began; see the Summary for the worst case.
 
 ### P-CSCF failover with the #137 fix
 

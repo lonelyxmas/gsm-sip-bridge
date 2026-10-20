@@ -36,6 +36,10 @@
 - Q: Can a fix for #137's detection gap land in this PR? → A: Yes, if small: confined to the IMS agent's keepalive/failover timing, no new config, covered by unit tests, and re-verified live (Vodafone single-P-CSCF black-hole plus Jio sibling failover). Anything larger becomes a filed follow-up issue.
 - Q: How long must the 120s probe-off soak run? → A: 12h clean per carrier to merge this feature; the later probe-removal feature requires at least 48h probe-off per carrier with zero false dead-peer teardowns, plus the production false/real metric.
 
+### Session 2026-10-20
+
+- Q: SC-003's 300s bound is below DPD's worst case (120s delay + 165s retransmits + 30s poll). Widen it? → A: Yes, to 315s.
+
 ## User Scenarios & Testing *(mandatory)*
 
 ### User Story 1 - Know why the ePDG ignored a DPD request (Priority: P1)
@@ -101,7 +105,7 @@ With the probe forced off and the default DPD delay, the maintainer black-holes 
 
 **Acceptance Scenarios**:
 
-1. **Given** a healthy Vodafone line with the probe forced off and default DPD, **When** the ePDG's outer address is black-holed, **Then** the supervisor detects the loss and begins a rebuild within 300s, and the time and the signal that fired first are recorded.
+1. **Given** a healthy Vodafone line with the probe forced off and default DPD, **When** the ePDG's outer address is black-holed, **Then** the supervisor detects the loss and begins a rebuild within 315s, and the time and the signal that fired first are recorded.
 2. **Given** the same on Jio, **When** the ePDG is black-holed, **Then** the same bound and recording apply.
 3. **Given** the black hole is removed, **When** the next rebuild attempt runs, **Then** the line re-registers without manual action.
 
@@ -163,7 +167,7 @@ With the probe forced off and the default DPD delay, the maintainer black-holes 
 
 - **SC-001**: With the probe forced off and the default DPD delay, each carrier runs at least 12h idle with **zero** false dead-peer teardowns, at least one REGISTER refresh, one CHILD_SA rekey and one IKE_SA rekey. 12h is the merge bar for this feature only; it is weak evidence on its own (at the expected ~1 per 18h rate a clean 12h is roughly a coin flip), which is why the probe-removal gate below is stricter.
 - **SC-002**: At the default, the number of DPD requests sent over an idle hour (probe forced off) falls to at most one third of the 30s baseline measured in User Story 1.
-- **SC-003**: With the probe forced off and the default DPD delay, a black-holed ePDG is detected and a rebuild begun within 300s on both carriers.
+- **SC-003**: With the probe forced off and the default DPD delay, a black-holed ePDG is detected and a rebuild begun within 315s on both carriers: the remaining DPD delay (up to 120s), charon's 165s of retransmits, and up to 30s until the supervisor's next poll.
 - **SC-004**: With the default build (probe on), an idle hour on each rig shows no DPD exchanges, no new recoveries and the same outer traffic as before this feature.
 - **SC-005**: The research note gives a verdict per carrier, with evidence, and the handset default is confirmed or explicitly marked unconfirmed.
 - **SC-006**: Every dead-peer loss observed during the live runs is classified, and the classification matches the capture (false when ESP was inbound during the window, real for the black-hole test).

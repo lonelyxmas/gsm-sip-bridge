@@ -63,7 +63,7 @@ None: the setting and the classification are independent.
 
 ## Phase 7: User Story 4 — a dead ePDG is still caught (P2, live)
 
-- [X] T023 [US4] On the probe-forced build at the default 120s, black-hole the ePDG on each rig (quickstart §3). Record fault → first DPD → give-up → rebuild → re-registration after removal; expect verdict `real` and a rebuild within 300s.
+- [X] T023 [US4] On the probe-forced build at the default 120s, black-hole the ePDG on each rig (quickstart §3). Record fault → first DPD → give-up → rebuild → re-registration after removal; expect verdict `real` and a rebuild within 315s.
 
 ## Phase 8: User Story 5 — the #137 gap (P3, live)
 
