@@ -1658,6 +1658,7 @@ pub(super) fn establish_line_tunnel(
         // and carries the same `[vowifi]`-derived family.
         address_family,
         last_inbound: Default::default(),
+        last_tun_rx: Default::default(),
     };
     {
         // Greptile P1 (round 3, same design gap): the RwLock guard added for
@@ -1819,6 +1820,7 @@ fn start_vowifi_line_strongswan(
         max_establish_attempts: None,
         address_family: line.config.tunnel_address_family,
         last_inbound: Default::default(),
+        last_tun_rx: Default::default(),
     };
 
     let mut current_pool = engine.latest_pcscf_pool(runner.as_ref());
@@ -2437,6 +2439,14 @@ fn tunnel_recovered_event(
     }
 }
 
+/// What the tunnel interface received after the snapshot, for the log.
+fn rx_since(packets: Option<u64>) -> String {
+    packets.map_or_else(
+        || "tunnel counter unread".to_string(),
+        |n| format!("{n} received on the tunnel since"),
+    )
+}
+
 /// The verdict on a dead-peer loss and the inbound ESP it rests on, for the
 /// log (specs/098 contracts/dead-peer.md).
 fn dead_peer_detail(idx: u32, c: &line_supervisor::DeadPeerClassification) -> String {
@@ -2450,16 +2460,18 @@ fn dead_peer_detail(idx: u32, c: &line_supervisor::DeadPeerClassification) -> St
         }
         (Some(snap), None, packets) => format!(
             "[supervise] line {idx}: dead peer verdict: {verdict} (no inbound ESP on any listed \
-             CHILD_SA, {} packets, snapshot {}s old; charon retransmits for {window}s)",
+             CHILD_SA, {} packets, snapshot {}s old, {}; charon retransmits for {window}s)",
             packets.unwrap_or(0),
-            snap.as_secs()
+            snap.as_secs(),
+            rx_since(c.rx_since_snapshot)
         ),
         (Some(snap), Some(before), packets) => format!(
             "[supervise] line {idx}: dead peer verdict: {verdict} (inbound ESP {}s before the \
-             loss, {} packets, snapshot {}s old; charon retransmits for {window}s)",
+             loss, {} packets, snapshot {}s old, {}; charon retransmits for {window}s)",
             before.as_secs(),
             packets.unwrap_or(0),
-            snap.as_secs()
+            snap.as_secs(),
+            rx_since(c.rx_since_snapshot)
         ),
     }
 }
@@ -4182,17 +4194,32 @@ mod tests {
                 snapshot_age: Some(Duration::from_secs(12)),
                 last_in_before_loss: Some(Duration::from_secs(42)),
                 packets: Some(1834),
+                rx_since_snapshot: Some(3),
             };
             assert_eq!(
                 dead_peer_detail(0, &c),
                 "[supervise] line 0: dead peer verdict: false (inbound ESP 42s before the loss, \
-                 1834 packets, snapshot 12s old; charon retransmits for 165s)"
+                 1834 packets, snapshot 12s old, 3 received on the tunnel since; charon \
+                 retransmits for 165s)"
+            );
+            let unread = line_supervisor::DeadPeerClassification {
+                verdict: DeadPeerVerdict::Unknown,
+                rx_since_snapshot: None,
+                last_in_before_loss: Some(Duration::from_secs(300)),
+                ..c
+            };
+            assert_eq!(
+                dead_peer_detail(0, &unread),
+                "[supervise] line 0: dead peer verdict: unknown (inbound ESP 300s before the \
+                 loss, 1834 packets, snapshot 12s old, tunnel counter unread; charon retransmits \
+                 for 165s)"
             );
             let none = line_supervisor::DeadPeerClassification {
                 verdict: DeadPeerVerdict::Unknown,
                 snapshot_age: None,
                 last_in_before_loss: None,
                 packets: None,
+                rx_since_snapshot: None,
             };
             assert_eq!(
                 dead_peer_detail(1, &none),

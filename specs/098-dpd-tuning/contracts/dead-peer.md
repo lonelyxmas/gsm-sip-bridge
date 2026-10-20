@@ -9,8 +9,11 @@
 | no snapshot | `unknown` |
 | `L` is `None` (no listed SA has received anything, e.g. a CHILD_SA rekeyed moments earlier) | `unknown` |
 | `L > T − G` | `false` |
-| `L ≤ S − G` | `real` |
+| the tunnel interface received ≥ 1 packet in `(S, T]`, and `T − S < G` | `false` |
+| `L ≤ S − G`, and the tunnel interface received 0 packets in `(S, T]` | `real` |
 | otherwise | `unknown` |
+
+The interface count is the RX packet counter from `ip -s link show <tun>`, read on the snapshot's tick and on the loss tick. If either reading is missing, or the counter went back, the count is unknown and the `real` row cannot apply.
 
 Applied only when the cause is `DeadPeer`. `CarrierDelete`, `Unknown` and every other recovery reason leave `dead_peer` unset.
 
@@ -18,10 +21,10 @@ Applied only when the cause is `DeadPeer`. `CarrierDelete`, `Unknown` and every 
 
 ```text
 [supervise] line 0: recovered from IkeSaLost (cause: dead-peer timeout)
-[supervise] line 0: dead peer verdict: false (inbound ESP 42s before the loss, 1834 packets, snapshot 12s old; charon retransmits for 165s)
+[supervise] line 0: dead peer verdict: false (inbound ESP 42s before the loss, 1834 packets, snapshot 12s old, 3 received on the tunnel since; charon retransmits for 165s)
 ```
 
-`unknown` with no snapshot: `dead peer verdict: unknown (no inbound ESP snapshot)`; with no inbound use on any listed SA: `dead peer verdict: unknown (no inbound ESP on any listed CHILD_SA, 0 packets, snapshot 12s old; …)`.
+`unknown` with no snapshot: `dead peer verdict: unknown (no inbound ESP snapshot)`; with no inbound use on any listed SA: `dead peer verdict: unknown (no inbound ESP on any listed CHILD_SA, 0 packets, snapshot 12s old, …; …)`. A missing interface count reads `tunnel counter unread`.
 
 ## Wire
 

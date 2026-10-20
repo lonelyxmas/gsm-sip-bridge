@@ -342,7 +342,30 @@ pub fn inbound_esp(sas_output: &str, conn_name: &str) -> Option<InboundEsp> {
     seen.then(|| InboundEsp {
         last_in_age: youngest.map(Duration::from_secs),
         packets,
+        tun_rx_packets: None,
     })
+}
+
+/// The received-packet counter from `ip -s link show <iface>`:
+///
+/// ```text
+/// 344: tun23-0@NONE: <NOARP,UP,LOWER_UP> mtu 1500 qdisc noqueue state UNKNOWN …
+///     link/none  link-netnsid 0
+///     RX:  bytes packets errors dropped  missed   mcast
+///          63043     379      3       3       0       0
+/// ```
+///
+/// The column is found by its header, which iproute2 has renamed and
+/// re-spaced across versions. `None` when there is no RX block.
+pub fn link_rx_packets(ip_s_link_output: &str) -> Option<u64> {
+    let mut lines = ip_s_link_output.lines();
+    while let Some(line) = lines.next() {
+        if let Some(header) = line.trim_start().strip_prefix("RX:") {
+            let column = header.split_whitespace().position(|h| h == "packets")?;
+            return lines.next()?.split_whitespace().nth(column)?.parse().ok();
+        }
+    }
+    None
 }
 
 /// Whether `swanctl --list-sas --ike <conn>` lists an IKE_SA for `conn_name`
@@ -667,6 +690,10 @@ pub struct StrongswanEngine {
     /// health check could not read the SAs, so it is never older than the
     /// listing it came from.
     pub last_inbound: std::cell::Cell<Option<InboundEsp>>,
+    /// The tunnel interface's received-packet counter as the last
+    /// [`TunnelEngine::steady_state_health`] read it, on every tick that
+    /// found the interface, for [`TunnelEngine::tun_rx_packets`] (specs/098).
+    pub last_tun_rx: std::cell::Cell<Option<u64>>,
 }
 
 impl StrongswanEngine {
@@ -922,14 +949,20 @@ impl TunnelEngine for StrongswanEngine {
 
     fn steady_state_health(&self, runner: &dyn CommandRunner) -> SteadyStateHealth {
         self.last_inbound.set(None);
-        let tun_check = runner.run_in_netns(&self.netns, &["ip", "link", "show", &self.tun_iface]);
-        if tun_check.map(|o| !o.status.success()).unwrap_or(true) {
+        self.last_tun_rx.set(None);
+        // `-s` for the counter a dead-peer verdict compares across ticks; the
+        // existence check is the same.
+        let tun_check =
+            runner.run_in_netns(&self.netns, &["ip", "-s", "link", "show", &self.tun_iface]);
+        let Some(tun_check) = tun_check.ok().filter(|o| o.status.success()) else {
             println!(
                 "[supervise] line {}: {} missing from netns {}; recreating and forcing reinitiate",
                 self.idx, self.tun_iface, self.netns
             );
             return SteadyStateHealth::TunVanished;
-        }
+        };
+        let tun_rx = link_rx_packets(&String::from_utf8_lossy(&tun_check.stdout));
+        self.last_tun_rx.set(tun_rx);
 
         // Bounded and scoped to this line: see `list_sas`.
         let Some(sas_output) = self.list_sas(runner) else {
@@ -953,13 +986,21 @@ impl TunnelEngine for StrongswanEngine {
             );
             return SteadyStateHealth::ChildSaMissing;
         }
-        self.last_inbound
-            .set(inbound_esp(&sas_output, &self.conn_name));
+        self.last_inbound.set(
+            inbound_esp(&sas_output, &self.conn_name).map(|esp| InboundEsp {
+                tun_rx_packets: tun_rx,
+                ..esp
+            }),
+        );
         SteadyStateHealth::Ok(newest_child_sa_lifetime(&sas_output, &self.conn_name))
     }
 
     fn inbound_esp(&self) -> Option<InboundEsp> {
         self.last_inbound.get()
+    }
+
+    fn tun_rx_packets(&self) -> Option<u64> {
+        self.last_tun_rx.get()
     }
 
     /// Recovery for "the process died" and "vici is unreachable".
@@ -1413,7 +1454,19 @@ mod tests {
         Some(InboundEsp {
             last_in_age: age.map(Duration::from_secs),
             packets,
+            tun_rx_packets: None,
         })
+    }
+
+    #[test]
+    fn link_rx_packets_reads_the_packets_column_by_its_header() {
+        // iproute2 6.x, as the live rig prints it.
+        let new = "344: tun23-0@NONE: <NOARP,UP,LOWER_UP> mtu 1500 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\n    link/none  link-netnsid 0\n    RX:  bytes packets errors dropped  missed   mcast           \n         63043     379      3       3       0       0 \n    TX:  bytes packets errors dropped carrier collsns           \n         79828     688     11      11      11       0 \n";
+        assert_eq!(link_rx_packets(new), Some(379));
+        // Older iproute2 names the columns differently.
+        let old = "5: tun23: <NOARP,UP,LOWER_UP> mtu 1500\n    link/none \n    RX: bytes  packets  errors  dropped overrun mcast   \n    1200       12       0       0       0       0       \n    TX: bytes  packets  errors  dropped carrier collsns \n    900        9        0       0       0       0       \n";
+        assert_eq!(link_rx_packets(old), Some(12));
+        assert_eq!(link_rx_packets("5: tun23\n"), None);
     }
 
     #[test]
@@ -1822,6 +1875,7 @@ mod tests {
                 max_establish_attempts: None,
                 address_family: TunnelAddressFamily::Dual,
                 last_inbound: Default::default(),
+                last_tun_rx: Default::default(),
             }
         }
 
@@ -1996,7 +2050,7 @@ mod tests {
             let runner = MockCommandRunner::new();
             let engine = strongswan_engine();
             assert!(engine.shared.ensure_started(&runner).is_some());
-            runner.set_netns_output("ims", &["ip", "link", "show", "tun23"], "5: tun23\n");
+            runner.set_netns_output("ims", &["ip", "-s", "link", "show", "tun23"], "5: tun23\n");
             runner.set_run_output(
                 "timeout 10 env STRONGSWAN_CONF=/etc/strongswan-shared.conf swanctl --list-sas --ike ims0",
                 std::process::Output {
@@ -2092,6 +2146,35 @@ mod tests {
             );
         }
 
+        #[test]
+        fn a_healthy_check_snapshots_the_tunnel_counter_with_the_esp() {
+            use std::os::unix::process::ExitStatusExt;
+            let runner = MockCommandRunner::new();
+            let engine = strongswan_engine();
+            assert!(engine.shared.ensure_started(&runner).is_some());
+            runner.set_netns_output(
+                "ims",
+                &["ip", "-s", "link", "show", "tun23"],
+                "5: tun23\n    RX:  bytes packets errors dropped  missed   mcast\n         900      77      0       0       0       0\n",
+            );
+            runner.set_run_output(
+                "timeout 10 env STRONGSWAN_CONF=/etc/strongswan-shared.conf swanctl --list-sas --ike ims0",
+                std::process::Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: format!("{}{}", super::ike_header("ims0"), super::child_with_in("ims0", 1, "INSTALLED", " 900 bytes,     9 packets,     4s ago")).into_bytes(),
+                    stderr: Vec::new(),
+                },
+            );
+            assert!(matches!(
+                engine.steady_state_health(&runner),
+                SteadyStateHealth::Ok(_)
+            ));
+            assert_eq!(engine.tun_rx_packets(), Some(77));
+            assert_eq!(
+                engine.inbound_esp().and_then(|e| e.tun_rx_packets),
+                Some(77)
+            );
+        }
         #[test]
         fn steady_state_health_reports_a_missing_ike_sa_distinctly() {
             use std::os::unix::process::ExitStatusExt;
@@ -2424,7 +2507,7 @@ mod tests {
             // MockCommandRunner::run_in_netns's own lookup key.
             use std::os::unix::process::ExitStatusExt;
             runner.set_run_output(
-                "netns:ims:ip link show tun23",
+                "netns:ims:ip -s link show tun23",
                 std::process::Output {
                     status: std::process::ExitStatus::from_raw(256),
                     stdout: vec![],
@@ -2503,6 +2586,7 @@ mod tests {
             StrongswanEngine {
                 address_family: family,
                 last_inbound: Default::default(),
+                last_tun_rx: Default::default(),
                 ..strongswan_engine()
             }
         }
