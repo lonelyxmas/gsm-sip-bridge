@@ -236,6 +236,12 @@ fn start_vowifi_subsystem(
         "{}",
         dpd_log_line(&config.vowifi)
     );
+    // And whether the underlay guard runs (specs/100 contracts/config.md).
+    tracing::info!(
+        underlay_guard = config.vowifi.underlay_guard,
+        "{}",
+        underlay_guard_log_line(&config.vowifi)
+    );
 
     // Note: the swu-on-slim payload check is NOT here — it is an image
     // property, not a line-table one, so `run` performs it before discovery
@@ -1447,7 +1453,7 @@ pub(super) type UsimHolder = Arc<Mutex<Option<Arc<ChildHandle>>>>;
 /// for them.
 ///
 /// Returns `None` on any fatal step (already logged at the point of
-/// failure), or `Some((pcscf, usim_holder))` — `usim_holder` is returned
+/// failure), or `Some((pcscf, usim_holder, epdg_ip))` — `usim_holder` is returned
 /// because a persistent line's caller still needs it afterward, for
 /// `start_line_tail`'s per-incident USIM recovery.
 #[allow(clippy::too_many_lines)]
@@ -1457,7 +1463,7 @@ pub(super) fn establish_line_tunnel(
     mcc: &str,
     mnc: &str,
     max_establish_attempts: Option<u32>,
-) -> Option<(String, UsimHolder)> {
+) -> Option<(String, UsimHolder, String)> {
     let runner = ctx.runner;
     let bin = ctx.bin;
     let config_path = ctx.config_path;
@@ -1659,6 +1665,8 @@ pub(super) fn establish_line_tunnel(
         address_family,
         last_inbound: Default::default(),
         last_tun_rx: Default::default(),
+        epdg_addr: Some(epdg_ip.clone()),
+        last_ike_header: Default::default(),
     };
     {
         // Greptile P1 (round 3, same design gap): the RwLock guard added for
@@ -1750,7 +1758,7 @@ pub(super) fn establish_line_tunnel(
         }
     };
 
-    pcscf.map(|p| (p, usim_holder))
+    pcscf.map(|p| (p, usim_holder, epdg_ip))
 }
 
 fn start_vowifi_line_strongswan(
@@ -1786,6 +1794,7 @@ fn start_vowifi_line_strongswan(
                 child_sa_up: Some(s.child_sa_up),
                 tunnel_flapping: Some(s.flapping),
                 ike_sa_loss_cause: s.loss_cause,
+                uplink: s.uplink,
                 ..Default::default()
             },
             events,
@@ -1796,10 +1805,12 @@ fn start_vowifi_line_strongswan(
         child_sa_up: false,
         flapping: false,
         loss_cause: None,
+        uplink: None,
     };
     report_tunnel(signal);
 
-    let Some((pcscf, usim_holder)) = establish_line_tunnel(ctx, line, mcc, mnc, None) else {
+    let Some((pcscf, usim_holder, epdg_ip)) = establish_line_tunnel(ctx, line, mcc, mnc, None)
+    else {
         return;
     };
 
@@ -1821,6 +1832,8 @@ fn start_vowifi_line_strongswan(
         address_family: line.config.tunnel_address_family,
         last_inbound: Default::default(),
         last_tun_rx: Default::default(),
+        epdg_addr: Some(epdg_ip),
+        last_ike_header: Default::default(),
     };
 
     let mut current_pool = engine.latest_pcscf_pool(runner.as_ref());
@@ -1870,8 +1883,30 @@ fn start_vowifi_line_strongswan(
     // The IKE_SA session already warned about for an INVALID_SELECTORS rekey
     // rejection, so the hint appears once per tunnel session (specs/092).
     let mut warned_inval_sel: Option<String> = None;
+    // What the guard believes about the path to the ePDG, and the hold it can
+    // put this line in (specs/100).
+    let underlay_enabled = ctx.config.vowifi.underlay_guard;
+    let mut underlay = super::underlay::UnderlayTracker::new(
+        engine.log_mark(runner.as_ref()),
+        std::time::Instant::now(),
+    );
+    // What `vowifi-status` reads (specs/100 contracts/status-file.md), written
+    // when the verdict changes, and once now so a healthy line says `up`.
+    let mut written_uplink: Option<String> = None;
+    if underlay_enabled {
+        write_uplink_file(
+            runner.as_ref(),
+            idx,
+            &line.pcscf_source_path,
+            &underlay,
+            &mut written_uplink,
+        );
+    }
     loop {
-        runner.sleep(line_supervisor::STEADY_STATE_POLL_INTERVAL);
+        // Quicker while a hold is on, so the path coming back is noticed within
+        // seconds instead of up to a whole tick later (specs/100 SC-003).
+        let pause = underlay.poll_after(std::time::Instant::now());
+        runner.sleep(pause);
         // Held across the whole tick_steady_state call, not just a one-off
         // check before it: Greptile P1 (round 2) caught that a plain
         // check-then-call still lets a Recovered outcome's respawn
@@ -1887,27 +1922,140 @@ fn start_vowifi_line_strongswan(
         // to snapshot StartedState until this whole section releases it.
         let guard = shutting_down.read().unwrap();
         if *guard {
+            if let Some(end) = underlay.end_for_shutdown(std::time::Instant::now()) {
+                println!("{}", hold_ended_line(idx, &end));
+                signal.uplink = Some(crate::control::protocol::UplinkState::Up);
+                send_tunnel(signal, vec![hold_ended_event(&end)]);
+                write_uplink_file(
+                    runner.as_ref(),
+                    idx,
+                    &line.pcscf_source_path,
+                    &underlay,
+                    &mut written_uplink,
+                );
+            }
             return;
         }
         // Taken before the tick: a recovery inside it renegotiates, and only a
         // negotiation logged after this point can carry the new P-CSCF.
         let mark = engine.log_mark(runner.as_ref());
+        let tick_started = std::time::Instant::now();
+        let tick_started_at = SystemTime::now();
+        let mut uplink_events: Vec<crate::control::protocol::ObservedEvent> = Vec::new();
+        let underlay_view = if underlay_enabled {
+            let observation = observe_underlay(&engine, runner.as_ref(), &underlay, mark);
+            let begin = underlay.begin_tick(&observation, tick_started, tick_started_at);
+            if let (Some(epdg), Some(heard)) = (engine.epdg_addr(), begin.heard) {
+                engine.shared.epdg_heard.record(epdg, idx, heard);
+            }
+            if let Some(end) = &begin.ended {
+                println!("{}", hold_ended_line(idx, end));
+                uplink_events.push(hold_ended_event(end));
+                // Marks the agent set while the path was down describe the
+                // outage, not the tunnel (FR-011). Only when it came back,
+                // though: at the 15-minute bound the path is not known to be
+                // back, and the ordinary pass that follows exists in case the
+                // guard was wrong, so it judges every mark (FR-012). The one
+                // initiation a hold allows has done its job once the hold is
+                // over (FR-010a); a change of cause is the same hold.
+                if end.path_returned() {
+                    tracking.negotiated_at = Some(tick_started_at);
+                }
+                if end.ended_by != crate::control::protocol::HoldEndedBy::CauseChanged {
+                    tracking.held_initiate_sent = false;
+                }
+                // Now, before the tick: a recovery it takes restarts the agent,
+                // which must find the outage it is to forget (FR-011).
+                write_uplink_file(
+                    runner.as_ref(),
+                    idx,
+                    &line.pcscf_source_path,
+                    &underlay,
+                    &mut written_uplink,
+                );
+            }
+            if let Some(start) = begin.started {
+                println!(
+                    "{}",
+                    hold_started_line(
+                        idx,
+                        start.cause,
+                        engine.epdg_addr(),
+                        observation.evidence.unanswered_retransmits
+                    )
+                );
+                uplink_events.push(crate::control::protocol::ObservedEvent::UplinkHoldStarted {
+                    cause: start.cause,
+                });
+            }
+            begin.view
+        } else {
+            line_supervisor::UnderlayView::disabled()
+        };
         // Closed before the tick, not after it: a teardown inside the tick can
         // take many seconds, and an agent that exits meanwhile must not be
         // respawned against the old P-CSCF (specs/087 R5). Released below
         // unless this tick turns out to renegotiate.
         rebuild_gate.close();
         let via_sibling_before = tracking.pcscf_via_sibling;
-        let outcome = line_supervisor::tick_steady_state_with_pool(
+        let outcome = line_supervisor::tick_steady_state_underlay(
             &engine,
             runner.as_ref(),
             &current_pcscf,
             &current_pool,
             &mut tracking,
-            line_supervisor::STEADY_STATE_POLL_INTERVAL,
+            // The pause actually taken, which is 5s around a hold: the
+            // unreachable window is counted in time (specs/100).
+            pause,
             &|| line_in_call(runner.as_ref(), &line.pcscf_source_path),
             &|| line_pool_state(runner.as_ref(), &line.pcscf_source_path),
+            &underlay_view,
         );
+        if underlay_enabled {
+            if let Some(start) = underlay.end_tick(&outcome, mark, tick_started, tick_started_at) {
+                println!(
+                    "{}",
+                    hold_started_line(idx, start.cause, engine.epdg_addr(), 0)
+                );
+                uplink_events.push(crate::control::protocol::ObservedEvent::UplinkHoldStarted {
+                    cause: start.cause,
+                });
+            }
+        }
+        // A dead-peer loss seen on a held line is the uplink's doing, and is
+        // reported as such rather than not at all (specs/100 FR-022).
+        if let line_supervisor::SteadyOutcome::Held {
+            skipped: line_supervisor::DegradeReason::IkeSaLost,
+            initiated: true,
+            ..
+        } = &outcome
+        {
+            if let Some(classification) = tracking.dead_peer {
+                println!("{}", dead_peer_detail(idx, &classification));
+                uplink_events.push(tunnel_recovered_event(
+                    line_supervisor::DegradeReason::IkeSaLost,
+                    &[],
+                    Some(classification.verdict),
+                    SystemTime::now(),
+                ));
+            }
+        }
+        let uplink_now = underlay_enabled.then(|| underlay.state());
+        if underlay_enabled {
+            write_uplink_file(
+                runner.as_ref(),
+                idx,
+                &line.pcscf_source_path,
+                &underlay,
+                &mut written_uplink,
+            );
+        }
+        if !uplink_events.is_empty() {
+            // Sent with the state they describe, so the gauge and the counters
+            // move together.
+            signal.uplink = uplink_now;
+            send_tunnel(signal, std::mem::take(&mut uplink_events));
+        }
         report_pcscf_sibling(idx, &current_pcscf, via_sibling_before, &tracking);
         let renegotiated = matches!(
             outcome,
@@ -1925,6 +2073,7 @@ fn start_vowifi_line_strongswan(
             &tracking,
             &rebuilds,
             last_loss_cause,
+            uplink_now,
             &report_tunnel,
         );
         match outcome {
@@ -1955,6 +2104,26 @@ fn start_vowifi_line_strongswan(
                     ) {
                         println!("{warning}");
                     }
+                }
+            }
+            // charon is still working on a half-open IKE_SA and the tick has
+            // said so (specs/100). Nothing was issued, so the rebuild gate is
+            // already open and the signal reported above.
+            line_supervisor::SteadyOutcome::WaitingForNegotiation => drop(guard),
+            // The tick queued a liveness check and said so (specs/100); the
+            // recovery it is for waits for the answer.
+            line_supervisor::SteadyOutcome::Deferred { .. } => drop(guard),
+            line_supervisor::SteadyOutcome::Held {
+                cause, initiated, ..
+            } => {
+                drop(guard);
+                // What a hold held back is summarised once, on the line that
+                // ends it, not logged on every tick.
+                if initiated {
+                    println!(
+                        "[supervise] line {idx}: uplink down ({}); no IKE_SA, so one initiation was issued and charon's retries carry it",
+                        cause.as_str()
+                    );
                 }
             }
             line_supervisor::SteadyOutcome::PcscfChanged { new_pcscf } => {
@@ -2106,6 +2275,7 @@ fn start_vowifi_line_strongswan(
                         &tracking,
                         &rebuilds,
                         last_loss_cause,
+                        uplink_now,
                         &report_tunnel,
                     );
                 } else if line_supervisor::recovery_restarts_agent(reason) {
@@ -2119,11 +2289,123 @@ fn start_vowifi_line_strongswan(
                     &tracking,
                     &rebuilds,
                     last_loss_cause,
+                    uplink_now,
                     &report_tunnel,
                 );
             }
         }
     }
+}
+
+/// Reads what the underlay tracker needs to judge the path to the ePDG this
+/// tick (specs/100): the route, the ePDG's side of the IKE traffic, and the
+/// tunnel's received-packet counter, read now rather than as the previous
+/// tick's health check left it.
+fn observe_underlay(
+    engine: &StrongswanEngine,
+    runner: &dyn CommandRunner,
+    tracker: &super::underlay::UnderlayTracker,
+    mark: super::engines::LogMark,
+) -> super::underlay::Observation {
+    use line_supervisor::TunnelEngine;
+    super::underlay::Observation {
+        route_ok: engine.route_ok(runner),
+        evidence: engine.ike_evidence_since(runner, tracker.evidence_mark()),
+        parsed_since_tick: engine
+            .ike_evidence_since(runner, tracker.tick_mark())
+            .parsed_from_peer,
+        rx_packets: engine.read_tun_rx_packets(runner),
+        pending_life: tracker
+            .pending_mark()
+            .map(|m| engine.ike_evidence_since(runner, m).parsed_from_peer),
+        sibling_heard: engine
+            .epdg_addr()
+            .and_then(|epdg| engine.shared.epdg_heard.others(epdg, engine.idx)),
+        mark,
+    }
+}
+
+/// The line logged when a hold begins, naming the cause and its evidence
+/// (specs/100 FR-020).
+fn hold_started_line(
+    idx: u32,
+    cause: crate::control::protocol::UplinkHoldCause,
+    epdg: Option<&str>,
+    unanswered_retransmits: u32,
+) -> String {
+    use crate::control::protocol::UplinkHoldCause;
+    let epdg = epdg.unwrap_or("the ePDG");
+    match cause {
+        UplinkHoldCause::NoRoute => format!(
+            "[supervise] line {idx}: uplink down (no route to {epdg}); holding tunnel recovery until it returns"
+        ),
+        UplinkHoldCause::NoResponse if unanswered_retransmits > 0 => format!(
+            "[supervise] line {idx}: uplink down ({epdg} not responding: {unanswered_retransmits} unanswered retransmit(s), nothing received from it); holding tunnel recovery until it answers"
+        ),
+        UplinkHoldCause::NoResponse => format!(
+            "[supervise] line {idx}: uplink down ({epdg} not responding: its liveness check went unanswered); holding tunnel recovery until it answers"
+        ),
+    }
+}
+
+/// Writes `/tmp/pcscf-N.uplink` when what it would say differs from what was
+/// last written: the verdict, or the last outage the path came back from
+/// (specs/100 contracts/status-file.md). A failed write is logged and retried
+/// on the next change; it never affects supervision.
+fn write_uplink_file(
+    runner: &dyn CommandRunner,
+    idx: u32,
+    selection_path: &str,
+    tracker: &super::underlay::UnderlayTracker,
+    written: &mut Option<String>,
+) {
+    let since = tracker
+        .hold
+        .as_ref()
+        .and_then(|h| h.started_at.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    let contents =
+        crate::ims::pcscf_files::render_uplink(tracker.state(), since, tracker.last_outage());
+    if written.as_deref() == Some(contents.as_str()) {
+        return;
+    }
+    let path = crate::ims::pcscf_files::uplink_path(selection_path);
+    match runner.write_file_atomic(&path, &contents) {
+        Ok(()) => *written = Some(contents),
+        Err(e) => eprintln!(
+            "[supervise] line {idx}: could not write {}: {e}",
+            path.display()
+        ),
+    }
+}
+
+/// The event that closes a hold, for the held-seconds counter (specs/100).
+fn hold_ended_event(end: &super::underlay::HoldEnd) -> crate::control::protocol::ObservedEvent {
+    crate::control::protocol::ObservedEvent::UplinkHoldEnded {
+        cause: end.cause,
+        held_secs: end.held.as_secs(),
+        ended_by: end.ended_by,
+    }
+}
+
+/// The line logged when a hold ends, with how long it lasted, what ended it
+/// and the recoveries it held back (specs/100 FR-020).
+fn hold_ended_line(idx: u32, end: &super::underlay::HoldEnd) -> String {
+    let skipped = if end.skipped.is_empty() {
+        "none".to_string()
+    } else {
+        end.skipped
+            .iter()
+            .map(|r| format!("{r:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "[supervise] line {idx}: uplink hold ({}) ended after {}s ({}); held back: {skipped}",
+        end.cause.as_str(),
+        end.held.as_secs(),
+        end.ended_by.as_str()
+    )
 }
 
 /// Whether this line's VoWiFi agent reports a call in progress, from the
@@ -2416,6 +2698,9 @@ struct TunnelSignal {
     child_sa_up: bool,
     flapping: bool,
     loss_cause: Option<crate::control::protocol::IkeSaLossCause>,
+    /// The underlay guard's verdict (specs/100); `None` with the guard off, so
+    /// the field is never sent and ingest keeps whatever it had.
+    uplink: Option<crate::control::protocol::UplinkState>,
 }
 
 /// The event that counts one steady-state recovery of a line (specs/096),
@@ -2453,6 +2738,9 @@ fn dead_peer_detail(idx: u32, c: &line_supervisor::DeadPeerClassification) -> St
     let verdict = c.verdict.as_str();
     let window = line_supervisor::DPD_GIVE_UP_WINDOW.as_secs();
     match (c.snapshot_age, c.last_in_before_loss, c.packets) {
+        (None, _, _) if c.verdict == line_supervisor::DeadPeerVerdict::Uplink => format!(
+            "[supervise] line {idx}: dead peer verdict: {verdict} (seen while the line was held for an uplink outage; the ePDG's silence is the path's)"
+        ),
         (None, _, _) => {
             format!(
                 "[supervise] line {idx}: dead peer verdict: {verdict} (no inbound ESP snapshot)"
@@ -2528,12 +2816,14 @@ fn sync_tunnel_signal(
     tracking: &line_supervisor::SteadyTracking,
     rebuilds: &line_supervisor::RebuildWindow,
     loss_cause: Option<crate::control::protocol::IkeSaLossCause>,
+    uplink: Option<crate::control::protocol::UplinkState>,
     report: &dyn Fn(TunnelSignal),
 ) {
     let now = TunnelSignal {
         child_sa_up: tracking.child_sa_usable,
         flapping: rebuilds.is_flapping(),
         loss_cause,
+        uplink,
     };
     if now != *signal {
         *signal = now;
@@ -2891,6 +3181,16 @@ fn dpd_log_line(v: &crate::config::VowifiConfig) -> String {
     }
 }
 
+/// The startup line saying whether the underlay guard runs (specs/100
+/// contracts/config.md), or that the swu engine ignores it.
+fn underlay_guard_log_line(v: &crate::config::VowifiConfig) -> String {
+    match (v.tunnel_engine.as_str(), v.underlay_guard) {
+        ("strongswan", true) => "underlay guard on".to_string(),
+        ("strongswan", false) => "underlay guard off ([vowifi].underlay_guard = false)".to_string(),
+        _ => "underlay guard ignored by the swu engine".to_string(),
+    }
+}
+
 /// One idle-tunnel keepalive cycle (TCP connect, not ICMP — operators filter
 /// ICMP over the tunnel): if the line has a P-CSCF, connect to its SIP port
 /// from inside the line's namespace and discard the result.
@@ -3096,6 +3396,10 @@ fn start_vowifi_line_swu(ctx: &LineStartup, line: &LineResolutionEntry, mcc: &st
                 current_pcscf = new_pcscf;
                 tracking.negotiated_at = Some(SystemTime::now());
             }
+            // Only the strongSwan engine has a half-open IKE_SA to wait on.
+            line_supervisor::SteadyOutcome::WaitingForNegotiation
+            | line_supervisor::SteadyOutcome::Deferred { .. }
+            | line_supervisor::SteadyOutcome::Held { .. } => drop(guard),
             line_supervisor::SteadyOutcome::Recovered { reason, .. } => {
                 println!("[supervise] line {idx}: recovered from {reason:?}");
                 if !tracking.pool_exhausted.is_empty() {
@@ -3208,6 +3512,28 @@ mod tests {
         assert_eq!(
             dpd_log_line(&swu),
             "[vowifi].dpd_delay_sec ignored: the swu engine has no DPD setting"
+        );
+    }
+
+    #[test]
+    fn the_startup_underlay_guard_line_says_on_off_or_ignored() {
+        let default = crate::config::VowifiConfig::default();
+        assert_eq!(underlay_guard_log_line(&default), "underlay guard on");
+        let off = crate::config::VowifiConfig {
+            underlay_guard: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            underlay_guard_log_line(&off),
+            "underlay guard off ([vowifi].underlay_guard = false)"
+        );
+        let swu = crate::config::VowifiConfig {
+            tunnel_engine: "swu".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            underlay_guard_log_line(&swu),
+            "underlay guard ignored by the swu engine"
         );
     }
 
@@ -4292,26 +4618,66 @@ mod tests {
                 child_sa_up: true,
                 flapping: false,
                 loss_cause: None,
+                uplink: None,
             };
             let rebuilds = line_supervisor::RebuildWindow::new(Duration::from_secs(300));
             let mut tracking = line_supervisor::SteadyTracking {
                 child_sa_usable: true,
                 ..Default::default()
             };
-            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, None, &report);
+            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, None, None, &report);
             assert!(sent.borrow().is_empty(), "nothing changed");
             // A new loss cause alone is a change worth reporting.
             let cause = Some(IkeSaLossCause::CarrierDelete);
-            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, cause, &report);
+            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, cause, None, &report);
             assert_eq!(sent.borrow().len(), 1);
             assert_eq!(sent.borrow()[0].loss_cause, cause);
             // ...and the same state again is not.
-            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, cause, &report);
+            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, cause, None, &report);
             assert_eq!(sent.borrow().len(), 1);
             tracking.child_sa_usable = false;
-            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, cause, &report);
+            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, cause, None, &report);
             assert_eq!(sent.borrow().len(), 2);
             assert!(!sent.borrow()[1].child_sa_up);
+        }
+
+        #[test]
+        fn a_changed_uplink_verdict_is_reported_once_and_an_absent_one_never() {
+            use crate::control::protocol::UplinkState;
+            let sent = RefCell::new(Vec::new());
+            let report = |s: TunnelSignal| sent.borrow_mut().push(s);
+            let mut signal = TunnelSignal {
+                child_sa_up: true,
+                flapping: false,
+                loss_cause: None,
+                uplink: Some(UplinkState::Up),
+            };
+            let rebuilds = line_supervisor::RebuildWindow::new(Duration::from_secs(300));
+            let tracking = line_supervisor::SteadyTracking {
+                child_sa_usable: true,
+                ..Default::default()
+            };
+            let held = Some(UplinkState::NoRoute);
+            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, None, held, &report);
+            sync_tunnel_signal(&mut signal, &tracking, &rebuilds, None, held, &report);
+            assert_eq!(sent.borrow().len(), 1, "reported on change only");
+            assert_eq!(sent.borrow()[0].uplink, held);
+            sync_tunnel_signal(
+                &mut signal,
+                &tracking,
+                &rebuilds,
+                None,
+                Some(UplinkState::Up),
+                &report,
+            );
+            assert_eq!(sent.borrow().len(), 2);
+            // With the guard off the field is never set, so nothing is sent for it.
+            let mut off = TunnelSignal {
+                uplink: None,
+                ..signal
+            };
+            sync_tunnel_signal(&mut off, &tracking, &rebuilds, None, None, &report);
+            assert_eq!(sent.borrow().len(), 2);
         }
     }
 }

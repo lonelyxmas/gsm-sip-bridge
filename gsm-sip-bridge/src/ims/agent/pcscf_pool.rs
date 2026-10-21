@@ -17,7 +17,7 @@
 //! (`classify_register_failure`, the route probe, spec 090's qualifying
 //! endpoint failure, the Gm keepalive escalation). This module only records it.
 
-use crate::ims::pcscf_files::{PoolState, PoolStateMark, POOL_STATE_VERSION};
+use crate::ims::pcscf_files::{Outage, PoolState, PoolStateMark, POOL_STATE_VERSION};
 use crate::ims::PcscfSnapshot;
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -60,9 +60,22 @@ impl std::fmt::Display for FailureCause {
             FailureCause::Transport => f.write_str("transport"),
             FailureCause::EndpointFailure(c) => write!(f, "endpoint-failure:{c}"),
             FailureCause::GmKeepalive => f.write_str("gm-keepalive"),
-            FailureCause::RetryAfter(_) => f.write_str("retry-after"),
+            FailureCause::RetryAfter(_) => f.write_str(RETRY_AFTER_CAUSE),
         }
     }
+}
+
+/// How a [`FailureCause::RetryAfter`] mark's cause is written, and recognised
+/// once persisted.
+const RETRY_AFTER_CAUSE: &str = "retry-after";
+
+/// Whether a mark with this persisted cause could have been caused by the path
+/// to the ePDG going down: every cause is a silence (a timeout, a failed
+/// connect or send, an unanswered keepalive or probe) except `retry-after`,
+/// which is the P-CSCF answering. An answer proves the path worked when it
+/// came, so it is the P-CSCF's own word, whenever it came.
+fn could_be_the_path(cause: &str) -> bool {
+    cause != RETRY_AFTER_CAUSE
 }
 
 /// The P-CSCF failure a registration attempt amounts to, if any (FR-007–FR-009,
@@ -415,6 +428,31 @@ impl PcscfPool {
         );
         self.save();
         true
+    }
+
+    /// Drops the marks set during `outage`, the last one the path to the
+    /// ePDG came back from (specs/100 FR-011): those P-CSCFs went silent
+    /// because the path did, and a mark on them would only hold the agent back
+    /// once the path is back. Kept: a mark of unknown age, and a `Retry-After`
+    /// the P-CSCF actually sent, which is a pause it asked for, not an outage
+    /// (the window reaches back before the hold, so such a reply can fall in
+    /// it). Returns how many went.
+    pub(crate) fn forget_outage(&mut self, outage: Option<Outage>) -> usize {
+        let Some(outage) = outage else { return 0 };
+        let before = self.marks.len();
+        self.marks
+            .retain(|_, m| !(outage.contains(m.marked_at) && could_be_the_path(&m.cause)));
+        let dropped = before - self.marks.len();
+        if dropped > 0 {
+            tracing::info!(
+                dropped,
+                outage_from = %rfc3339(UNIX_EPOCH + Duration::from_secs(outage.from)),
+                outage_to = %rfc3339(UNIX_EPOCH + Duration::from_secs(outage.to)),
+                "dropped P-CSCF marks set while the path to the ePDG was down"
+            );
+            self.save();
+        }
+        dropped
     }
 
     /// For status (FR-020): only marks still in force, in candidate order.
@@ -1091,6 +1129,55 @@ mod tests {
         for (f, want) in cases {
             assert_eq!(cause_of(&f), want, "{} {:?}", f.error, f.status);
         }
+    }
+
+    #[test]
+    fn forget_outage_drops_only_the_marks_set_inside_it_and_saves() {
+        let dir = std::env::temp_dir().join(format!("pcscf-outage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pcscf-0.state");
+        let mut p = PcscfPool::new(ip(A), ips(&[A, B]), Some(path.clone()));
+        let before = t0();
+        let during = t0() + Duration::from_secs(100);
+        p.select(before);
+        p.on_failure(ip(A), FailureCause::GmKeepalive, before);
+        p.select(during);
+        p.on_failure(ip(B), FailureCause::GmKeepalive, during);
+        let outage = Outage {
+            from: to_unix(t0() + Duration::from_secs(50)),
+            to: to_unix(t0() + Duration::from_secs(200)),
+        };
+        assert_eq!(p.forget_outage(None), 0);
+        assert_eq!(p.forget_outage(Some(outage)), 1);
+        assert!(p.marks.contains_key(&ip(A)), "set before the outage");
+        assert!(!p.marks.contains_key(&ip(B)), "set during it");
+        assert_eq!(p.forget_outage(Some(outage)), 0, "already gone");
+        let restarted = PcscfPool::new(ip(A), ips(&[A, B]), Some(path));
+        assert_eq!(restarted.marks.len(), 1, "the drop was saved");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn forget_outage_keeps_a_retry_after_the_pcscf_sent_inside_the_window() {
+        // A 503 Retry-After: 600 just before the route went: the P-CSCF
+        // answered, so its pause stands when the path comes back.
+        let mut p = mem(A, &[A, B]);
+        let at = t0() + Duration::from_secs(100);
+        p.select(at);
+        p.on_failure(
+            ip(A),
+            FailureCause::RetryAfter(Duration::from_secs(600)),
+            at,
+        );
+        p.select(at);
+        p.on_failure(ip(B), FailureCause::GmKeepalive, at);
+        let outage = Outage {
+            from: to_unix(t0()),
+            to: to_unix(t0() + Duration::from_secs(200)),
+        };
+        assert_eq!(p.forget_outage(Some(outage)), 1);
+        assert_eq!(p.marks[&ip(A)].cause, "retry-after");
+        assert!(!p.marks.contains_key(&ip(B)));
     }
 
     #[test]

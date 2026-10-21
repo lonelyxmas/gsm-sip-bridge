@@ -5,7 +5,10 @@
 //! current script's `grep`/`sed` pattern with the same fixture the original
 //! bash comment used, tested independently of any [`CommandRunner`].
 
-use super::line_supervisor::{ChildSaLifetime, InboundEsp, SteadyStateHealth, TunnelEngine};
+use super::line_supervisor::{
+    ChildSaLifetime, IkeActivity, IkeEvidence, IkeHeaderState, InboundEsp, SteadyStateHealth,
+    TunnelEngine,
+};
 use super::runner::{ChildHandle, ChildSpec, CommandRunner};
 use crate::config::TunnelAddressFamily;
 use crate::control::protocol::IkeSaLossCause;
@@ -101,22 +104,7 @@ fn dedup_pool(batch: Vec<String>) -> Vec<String> {
 /// The batch of a negotiation that started after byte offset `mark`, if it has
 /// been closed by its establishment (see [`extract_pcscf_after`]).
 fn closed_batch_after(charon_log: &str, conn_name: &str, mark: usize) -> Option<Vec<String>> {
-    let slice = if mark > charon_log.len() {
-        charon_log
-    } else {
-        let mut at = mark;
-        while !charon_log.is_char_boundary(at) {
-            at += 1;
-        }
-        // Mid-line: the rest of that line belongs to the old batch.
-        if at > 0 && charon_log.as_bytes()[at - 1] != b'\n' {
-            match charon_log[at..].find('\n') {
-                Some(nl) => at += nl + 1,
-                None => at = charon_log.len(),
-            }
-        }
-        &charon_log[at..]
-    };
+    let slice = log_after(charon_log, mark);
     let (batch, closed) = latest_pcscf_batch(slice, conn_name);
     closed.then_some(batch)
 }
@@ -381,6 +369,122 @@ pub fn list_sas_has_ike_sa(sas_output: &str, conn_name: &str) -> bool {
     sas_output.lines().any(|l| l.starts_with(&prefix))
 }
 
+/// The `#N` and state of `conn_name`'s IKE_SA header in `swanctl --list-sas`
+/// output (specs/100): `ims0: #2, CONNECTING, IKEv2, …`.
+///
+/// Matched on `"<conn>: #"` at column 0, so `ims10` is not `ims1`, and the
+/// indented CHILD_SA lines (which print `  ims0: #4, reqid …`) are not
+/// headers. The first matching header wins.
+pub fn ike_sa_header(sas_output: &str, conn_name: &str) -> Option<(u32, IkeHeaderState)> {
+    let prefix = format!("{conn_name}: #");
+    let rest = sas_output
+        .lines()
+        .find_map(|l| l.strip_prefix(prefix.as_str()))?;
+    let mut fields = rest.split(',').map(str::trim);
+    let id = fields.next()?.parse().ok()?;
+    let state = match fields.next()? {
+        "ESTABLISHED" => IkeHeaderState::Established,
+        "CONNECTING" => IkeHeaderState::Connecting,
+        other => IkeHeaderState::Other(other.to_string()),
+    };
+    Some((id, state))
+}
+
+/// The text charon logged after `<conn|N>` on one of its lines, without the
+/// timestamp / thread / facility prefix.
+fn ike_line_body<'a>(line: &'a str, conn_name: &str) -> Option<&'a str> {
+    let needle = format!("<{conn_name}|");
+    let at = line.find(&needle)?;
+    let rest = &line[at + needle.len()..];
+    Some(&rest[rest.find("> ")? + 2..])
+}
+
+/// Is this log body the connection's IKE traffic (specs/100 R4/R6): a message
+/// generated, a message parsed, or a retransmit of an outstanding request.
+fn is_ike_traffic(body: &str) -> bool {
+    body.starts_with("generating ")
+        || body.starts_with("parsed ")
+        || (body.starts_with("retransmit ") && body.contains(" of request"))
+}
+
+/// A fingerprint of the IKE traffic charon has logged for `conn_name`
+/// (specs/100 R6): how many generated, parsed or retransmitted lines, and the
+/// last of them. `None` when there are none.
+///
+/// A fingerprint rather than a time because charon's log is stamped in the
+/// container's local time (the Jio Pi's is IST), so a time parsed from it
+/// would be wrong by the zone's offset. Two fingerprints that differ say that
+/// charon was busy between two looks, which is all the half-open check needs.
+pub fn ike_activity(charon_log: &str, conn_name: &str) -> Option<IkeActivity> {
+    let mut lines = 0usize;
+    let mut last: Option<&str> = None;
+    for line in lines_for_conn(charon_log, conn_name) {
+        if ike_line_body(line, conn_name).is_some_and(is_ike_traffic) {
+            lines += 1;
+            last = Some(line);
+        }
+    }
+    last.map(|last| IkeActivity {
+        lines,
+        last: last.to_string(),
+    })
+}
+
+/// What `log` (the charon log **after** a mark) shows of the ePDG for
+/// `conn_name` (specs/100 R4): whether it said anything, and how many
+/// retransmits of an outstanding request have gone unanswered since it last
+/// did. A parsed message clears the count: it is the peer answering, or
+/// speaking first with a DPD of its own.
+pub fn ike_evidence(log: &str, conn_name: &str) -> IkeEvidence {
+    let mut evidence = IkeEvidence::default();
+    for body in lines_for_conn(log, conn_name).filter_map(|l| ike_line_body(l, conn_name)) {
+        if body.starts_with("parsed ")
+            && (body.contains(" request ") || body.contains(" response "))
+        {
+            evidence.parsed_from_peer = true;
+            evidence.unanswered_retransmits = 0;
+        } else if body.starts_with("retransmit ") && body.contains(" of request") {
+            evidence.unanswered_retransmits += 1;
+        }
+    }
+    evidence
+}
+
+/// Whether `ip route get <addr>` finds a usable route (specs/100 R3): exit 0
+/// **and** a `src` address. A blackhole, unreachable or prohibit route and a
+/// missing default route all fail with a non-zero exit; a route without a
+/// source address could not carry the packet either.
+pub fn route_to(runner: &dyn CommandRunner, addr: &str) -> bool {
+    runner
+        .run(&["ip", "route", "get", addr])
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .any(|t| t == "src")
+        })
+}
+
+/// The part of `charon_log` after byte offset `mark`, snapped forward to a
+/// line start (see [`extract_pcscf_after`] for the rules).
+fn log_after(charon_log: &str, mark: usize) -> &str {
+    if mark > charon_log.len() {
+        return charon_log;
+    }
+    let mut at = mark;
+    while !charon_log.is_char_boundary(at) {
+        at += 1;
+    }
+    if at > 0 && charon_log.as_bytes()[at - 1] != b'\n' {
+        match charon_log[at..].find('\n') {
+            Some(nl) => at += nl + 1,
+            None => at = charon_log.len(),
+        }
+    }
+    &charon_log[at..]
+}
+
 /// Best-effort reason this connection's IKE_SA was lost, from the charon log.
 ///
 /// Only lines after the most recent `IKE_SA <conn>[N] established` count, so a
@@ -523,13 +627,26 @@ pub struct SharedCharon {
     /// to the same file (a length comparison alone cannot: the new log may
     /// have grown past the old mark by the next read).
     log_generation: AtomicU64,
+    /// What each line has heard from each ePDG, so lines on one ePDG share
+    /// the evidence for its verdict (specs/100 FR-001). Here because every
+    /// line that can share an ePDG shares this daemon.
+    pub epdg_heard: super::underlay::EpdgHeard,
 }
 
 /// A position in the shared charon log: its truncation generation and length.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LogMark {
     generation: u64,
     len: usize,
+}
+
+#[cfg(test)]
+impl LogMark {
+    /// A mark `len` bytes into the first log, for tests that need two marks
+    /// to differ.
+    pub fn at(len: usize) -> Self {
+        Self { generation: 0, len }
+    }
 }
 
 impl SharedCharon {
@@ -540,6 +657,7 @@ impl SharedCharon {
             charon_log,
             handle: Mutex::new(None),
             log_generation: AtomicU64::new(0),
+            epdg_heard: Default::default(),
         }
     }
 
@@ -694,6 +812,13 @@ pub struct StrongswanEngine {
     /// [`TunnelEngine::steady_state_health`] read it, on every tick that
     /// found the interface, for [`TunnelEngine::tun_rx_packets`] (specs/098).
     pub last_tun_rx: std::cell::Cell<Option<u64>>,
+    /// The ePDG address this line's tunnel runs to, for the underlay guard's
+    /// route check (specs/100); `None` skips the check.
+    pub epdg_addr: Option<String>,
+    /// The IKE_SA header the last [`TunnelEngine::steady_state_health`] read,
+    /// for [`TunnelEngine::ike_header`] (specs/100). Cleared whenever a health
+    /// check could not read the SAs.
+    pub last_ike_header: RefCell<Option<(u32, IkeHeaderState)>>,
 }
 
 impl StrongswanEngine {
@@ -740,6 +865,21 @@ impl StrongswanEngine {
                 .map(|c| c.len())
                 .unwrap_or(0),
         }
+    }
+
+    /// The tunnel interface's received-packet counter, read now (specs/100).
+    ///
+    /// Not [`TunnelEngine::tun_rx_packets`], which is the value the previous
+    /// tick's health check cached: that check runs before a tick's liveness
+    /// check is sent, so packets that predate the check would read as its
+    /// answer. Leaves that cached value alone, which specs/098 compares across
+    /// ticks. `None` when the interface cannot be read.
+    pub fn read_tun_rx_packets(&self, runner: &dyn CommandRunner) -> Option<u64> {
+        let out = runner
+            .run_in_netns(&self.netns, &["ip", "-s", "link", "show", &self.tun_iface])
+            .ok()
+            .filter(|o| o.status.success())?;
+        link_rx_packets(&String::from_utf8_lossy(&out.stdout))
     }
 
     /// The P-CSCF of a negotiation logged after `mark`, if one has completed.
@@ -950,6 +1090,7 @@ impl TunnelEngine for StrongswanEngine {
     fn steady_state_health(&self, runner: &dyn CommandRunner) -> SteadyStateHealth {
         self.last_inbound.set(None);
         self.last_tun_rx.set(None);
+        *self.last_ike_header.borrow_mut() = None;
         // `-s` for the counter a dead-peer verdict compares across ticks; the
         // existence check is the same.
         let tun_check =
@@ -979,6 +1120,14 @@ impl TunnelEngine for StrongswanEngine {
             );
             return SteadyStateHealth::IkeSaMissing;
         }
+        let header = ike_sa_header(&sas_output, &self.conn_name);
+        *self.last_ike_header.borrow_mut() = header.clone();
+        // A half-open IKE_SA is charon's own negotiation in flight, not a lost
+        // CHILD_SA: the tick leaves it to charon while it is still working
+        // (specs/100 US3).
+        if let Some((ike_id, IkeHeaderState::Connecting)) = header {
+            return SteadyStateHealth::IkeSaConnecting { ike_id };
+        }
         if !list_sas_has_child_sa(&sas_output, &self.conn_name) {
             println!(
                 "[supervise] line {}: {} CHILD_SA missing; re-initiating",
@@ -997,6 +1146,66 @@ impl TunnelEngine for StrongswanEngine {
 
     fn inbound_esp(&self) -> Option<InboundEsp> {
         self.last_inbound.get()
+    }
+
+    fn epdg_addr(&self) -> Option<&str> {
+        self.epdg_addr.as_deref()
+    }
+
+    fn route_ok(&self, runner: &dyn CommandRunner) -> bool {
+        self.epdg_addr
+            .as_deref()
+            .is_none_or(|addr| route_to(runner, addr))
+    }
+
+    fn ike_header(&self) -> Option<(u32, IkeHeaderState)> {
+        self.last_ike_header.borrow().clone()
+    }
+
+    fn ike_activity(&self, runner: &dyn CommandRunner) -> Option<IkeActivity> {
+        runner
+            .read_file(&self.shared.charon_log)
+            .ok()
+            .and_then(|c| ike_activity(&c, &self.conn_name))
+    }
+
+    /// A log truncated since the mark (charon restarted) is read from its
+    /// start: everything in it is newer than the mark. An unreadable log reads
+    /// as life, so a failed read never holds a line.
+    fn ike_evidence_since(&self, runner: &dyn CommandRunner, mark: LogMark) -> IkeEvidence {
+        let offset = if self.shared.log_generation.load(Ordering::SeqCst) == mark.generation {
+            mark.len
+        } else {
+            0
+        };
+        runner
+            .read_file(&self.shared.charon_log)
+            .map(|c| ike_evidence(log_after(&c, offset), &self.conn_name))
+            .unwrap_or(IkeEvidence::LIFE)
+    }
+
+    fn log_mark(&self, runner: &dyn CommandRunner) -> LogMark {
+        StrongswanEngine::log_mark(self, runner)
+    }
+
+    /// `swanctl --dpd --ike <conn>` under the bounded wrapper `list_sas` uses
+    /// (specs/100 contracts/dpd-command.md). The command only queues the
+    /// exchange; the answer is read from the log on a later tick.
+    fn send_dpd(&self, runner: &dyn CommandRunner) -> bool {
+        let env = self.env_prefix();
+        let secs = STEADY_LIST_SAS_TIMEOUT_SECS.to_string();
+        runner
+            .run(&[
+                "timeout",
+                &secs,
+                "env",
+                &env,
+                "swanctl",
+                "--dpd",
+                "--ike",
+                &self.conn_name,
+            ])
+            .is_ok_and(|o| o.status.success())
     }
 
     fn tun_rx_packets(&self) -> Option<u64> {
@@ -1876,6 +2085,8 @@ mod tests {
                 address_family: TunnelAddressFamily::Dual,
                 last_inbound: Default::default(),
                 last_tun_rx: Default::default(),
+                epdg_addr: None,
+                last_ike_header: Default::default(),
             }
         }
 
@@ -2197,10 +2408,13 @@ mod tests {
                 engine.steady_state_health(&seed(0, "")),
                 SteadyStateHealth::IkeSaMissing
             );
+            // A half-open IKE_SA is charon's own negotiation in flight, so it
+            // is reported as that and not as a lost CHILD_SA (specs/100; it
+            // used to read as `ChildSaMissing`, 087 R1).
             let connecting = seed(0, "ims0: #2, CONNECTING, IKEv2, aa_i* bb_r\n");
             assert_eq!(
                 engine.steady_state_health(&connecting),
-                SteadyStateHealth::ChildSaMissing
+                SteadyStateHealth::IkeSaConnecting { ike_id: 2 }
             );
             assert_eq!(
                 engine.steady_state_health(&seed(256, "")),
@@ -2697,5 +2911,384 @@ mod tests {
                 Some("ims0[5]")
             );
         }
+    }
+}
+
+/// Parsers and engine methods behind the underlay guard (specs/100), over the
+/// text charon and iproute2 print. Log lines are the shape the pinned 5.9.3
+/// fork writes at `filelog default = 1` with `time_format` and `ike_name` set
+/// (research R4), with synthetic addresses and identities.
+#[cfg(test)]
+mod underlay_tests {
+    use super::*;
+    use crate::supervise::line_supervisor::TunnelEngine;
+    use crate::supervise::runner::MockCommandRunner;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn engine() -> StrongswanEngine {
+        StrongswanEngine {
+            idx: 0,
+            conn_name: "ims0".to_string(),
+            netns: "ims".to_string(),
+            tun_iface: "tun23".to_string(),
+            if_id: "23".to_string(),
+            shared: Arc::new(SharedCharon::new(
+                "/etc/strongswan-shared.conf".to_string(),
+                "/etc/swanctl/swanctl.conf".to_string(),
+                PathBuf::from("/tmp/charon.log"),
+            )),
+            max_establish_attempts: None,
+            address_family: TunnelAddressFamily::Dual,
+            last_inbound: Default::default(),
+            last_tun_rx: Default::default(),
+            epdg_addr: Some("203.0.113.9".to_string()),
+            last_ike_header: Default::default(),
+        }
+    }
+
+    fn output(status: i32, stdout: &str) -> std::process::Output {
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(status << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    // ---- T004: ike_sa_header -------------------------------------------
+
+    #[test]
+    fn the_ike_sa_header_gives_its_number_and_state() {
+        let established = "ims0: #1, ESTABLISHED, IKEv2, aa_i* bb_r\n  local  'x' @ 198.51.100.10[4500]\n  ims0: #4, reqid 1, INSTALLED, TUNNEL-in-UDP, ESP:AES_CBC-128/HMAC_SHA1_96\n";
+        assert_eq!(
+            ike_sa_header(established, "ims0"),
+            Some((1, IkeHeaderState::Established))
+        );
+        assert_eq!(
+            ike_sa_header("ims0: #17, CONNECTING, IKEv2, aa_i* bb_r\n", "ims0"),
+            Some((17, IkeHeaderState::Connecting))
+        );
+        assert_eq!(
+            ike_sa_header("ims0: #2, REKEYING, IKEv2, aa_i* bb_r\n", "ims0"),
+            Some((2, IkeHeaderState::Other("REKEYING".to_string())))
+        );
+    }
+
+    #[test]
+    fn the_ike_sa_header_is_matched_by_whole_connection_name_and_column() {
+        let sas = "ims10: #3, CONNECTING, IKEv2, aa_i* bb_r\nims1: #4, ESTABLISHED, IKEv2, cc_i* dd_r\n  ims0: #9, reqid 1, INSTALLED, TUNNEL-in-UDP, ESP:AES_CBC-128/HMAC_SHA1_96\n";
+        assert_eq!(
+            ike_sa_header(sas, "ims1"),
+            Some((4, IkeHeaderState::Established))
+        );
+        assert_eq!(
+            ike_sa_header(sas, "ims10"),
+            Some((3, IkeHeaderState::Connecting))
+        );
+        // An indented CHILD_SA line of the same name is not a header.
+        assert_eq!(ike_sa_header(sas, "ims0"), None);
+        assert_eq!(ike_sa_header("", "ims0"), None);
+    }
+
+    // ---- T005: ike_activity ----------------------------------------------
+
+    /// An IKE_SA_INIT retry cycle, as charon logs it while the ePDG is
+    /// unreachable. Timestamps are in the container's local time.
+    const INIT_RETRY: &str = "\
+2026-10-20 22:30:00 08[IKE] <ims0|5> initiating IKE_SA ims0[5] to 203.0.113.9
+2026-10-20 22:30:00 08[ENC] <ims0|5> generating IKE_SA_INIT request 0 [ SA KE No N(NATD_S_IP) N(NATD_D_IP) N(FRAG_SUP) N(HASH_ALG) N(REDIR_SUP) ]
+2026-10-20 22:30:04 09[IKE] <ims0|5> retransmit 1 of request with message ID 0
+2026-10-20 22:30:11 10[IKE] <ims0|5> retransmit 2 of request with message ID 0
+2026-10-20 22:30:24 11[IKE] <ims0|5> retransmit 3 of request with message ID 0
+";
+
+    fn activity(lines: usize, last: &str) -> Option<IkeActivity> {
+        Some(IkeActivity {
+            lines,
+            last: last.to_string(),
+        })
+    }
+
+    #[test]
+    fn a_retry_cycle_is_fingerprinted_by_its_ike_lines_and_the_last_of_them() {
+        // The `initiating IKE_SA` line is not traffic; the other four are.
+        assert_eq!(
+            ike_activity(INIT_RETRY, "ims0"),
+            activity(
+                4,
+                "2026-10-20 22:30:24 11[IKE] <ims0|5> retransmit 3 of request with message ID 0"
+            )
+        );
+    }
+
+    #[test]
+    fn every_further_ike_line_changes_the_fingerprint() {
+        let before = ike_activity(INIT_RETRY, "ims0");
+        let more = format!(
+            "{INIT_RETRY}2026-10-20 22:30:47 12[IKE] <ims0|5> retransmit 4 of request with message ID 0\n"
+        );
+        assert_ne!(ike_activity(&more, "ims0"), before);
+        // The same log read twice is the same fingerprint.
+        assert_eq!(ike_activity(INIT_RETRY, "ims0"), before);
+    }
+
+    #[test]
+    fn a_dpd_exchange_counts_as_activity() {
+        let log = "\
+2026-10-20 03:10:00 08[ENC] <ims0|1> generating INFORMATIONAL request 6 [ ]
+2026-10-20 03:10:00 07[ENC] <ims0|1> parsed INFORMATIONAL response 6 [ ]
+2026-10-20 03:12:30 10[ENC] <ims0|1> parsed INFORMATIONAL request 13 [ ]
+2026-10-20 03:12:30 10[ENC] <ims0|1> generating INFORMATIONAL response 13 [ ]
+";
+        let a = ike_activity(log, "ims0").unwrap();
+        assert_eq!(a.lines, 4);
+        assert!(a.last.contains("generating INFORMATIONAL response 13"));
+    }
+
+    #[test]
+    fn other_lines_and_other_log_chatter_are_not_this_connections_activity() {
+        let log = "\
+2026-10-20 03:00:00 08[ENC] <ims0|5> generating IKE_SA_INIT request 0 [ SA KE No ]
+2026-10-20 03:05:00 08[ENC] <ims1|2> generating IKE_SA_INIT request 0 [ SA KE No ]
+2026-10-20 03:06:00 08[CFG] <ims0|5> peer not responding, trying again (2/0)
+2026-10-20 03:07:00 08[IKE] <ims0|5> received P-CSCF server IP 192.0.2.10
+2026-10-20 03:08:00 08[IKE] <ims0|5> sending keep alive to 203.0.113.9[4500]
+";
+        assert_eq!(ike_activity(log, "ims0").unwrap().lines, 1);
+        assert!(ike_activity(log, "ims1").unwrap().last.contains("<ims1|2>"));
+        assert_eq!(ike_activity(log, "ims2"), None);
+        assert_eq!(ike_activity("", "ims0"), None);
+    }
+
+    #[test]
+    fn the_fingerprint_does_not_depend_on_the_timestamps_zone() {
+        // Same lines, stamped in IST and in UTC: only the text differs, and the
+        // count is what it is. Nothing here parses a time.
+        let utc = "2026-10-20 16:45:00 08[ENC] <ims0|5> generating IKE_SA_INIT request 0 [ SA ]\n";
+        let ist = "2026-10-20 22:15:00 08[ENC] <ims0|5> generating IKE_SA_INIT request 0 [ SA ]\n";
+        assert_eq!(ike_activity(utc, "ims0").unwrap().lines, 1);
+        assert_eq!(ike_activity(ist, "ims0").unwrap().lines, 1);
+        // And a line with no timestamp at all is still activity.
+        let bare = "08[ENC] <ims0|5> generating IKE_SA_INIT request 0 [ SA ]\n";
+        assert_eq!(ike_activity(bare, "ims0").unwrap().lines, 1);
+    }
+
+    // ---- T006: ike_evidence --------------------------------------------
+
+    #[test]
+    fn retransmits_with_nothing_parsed_are_unanswered() {
+        let e = ike_evidence(INIT_RETRY, "ims0");
+        assert!(!e.parsed_from_peer);
+        assert_eq!(e.unanswered_retransmits, 3);
+    }
+
+    #[test]
+    fn a_message_generated_and_not_yet_retransmitted_is_neither_life_nor_silence() {
+        let log = "2026-10-20 03:00:00 08[ENC] <ims0|1> generating INFORMATIONAL request 6 [ ]\n";
+        assert_eq!(ike_evidence(log, "ims0"), IkeEvidence::default());
+    }
+
+    #[test]
+    fn a_parsed_response_clears_the_retransmit_count() {
+        let log = "\
+2026-10-20 03:00:00 08[ENC] <ims0|1> generating INFORMATIONAL request 6 [ ]
+2026-10-20 03:00:04 09[IKE] <ims0|1> retransmit 1 of request with message ID 6
+2026-10-20 03:00:11 10[IKE] <ims0|1> retransmit 2 of request with message ID 6
+2026-10-20 03:00:12 07[ENC] <ims0|1> parsed INFORMATIONAL response 6 [ ]
+";
+        assert_eq!(
+            ike_evidence(log, "ims0"),
+            IkeEvidence {
+                parsed_from_peer: true,
+                unanswered_retransmits: 0
+            }
+        );
+    }
+
+    #[test]
+    fn an_epdg_initiated_request_is_life() {
+        let log = "2026-10-20 03:12:30 10[ENC] <ims0|1> parsed INFORMATIONAL request 13 [ ]\n";
+        assert!(ike_evidence(log, "ims0").parsed_from_peer);
+    }
+
+    #[test]
+    fn silence_after_life_counts_only_the_retransmits_since() {
+        let log = "\
+2026-10-20 03:00:00 07[ENC] <ims0|1> parsed INFORMATIONAL response 5 [ ]
+2026-10-20 03:00:30 08[ENC] <ims0|1> generating INFORMATIONAL request 6 [ ]
+2026-10-20 03:00:34 09[IKE] <ims0|1> retransmit 1 of request with message ID 6
+2026-10-20 03:00:41 10[IKE] <ims0|1> retransmit 2 of request with message ID 6
+";
+        let e = ike_evidence(log, "ims0");
+        assert!(e.parsed_from_peer);
+        assert_eq!(e.unanswered_retransmits, 2);
+    }
+
+    #[test]
+    fn another_connections_traffic_is_not_this_connections_evidence() {
+        let log = "\
+2026-10-20 03:00:04 09[IKE] <ims0|1> retransmit 1 of request with message ID 6
+2026-10-20 03:00:05 07[ENC] <ims1|2> parsed INFORMATIONAL response 6 [ ]
+";
+        let e = ike_evidence(log, "ims0");
+        assert!(!e.parsed_from_peer);
+        assert_eq!(e.unanswered_retransmits, 1);
+    }
+
+    #[test]
+    fn evidence_since_a_mark_reads_only_the_log_after_it() {
+        let runner = MockCommandRunner::new();
+        let engine = engine();
+        let before =
+            "2026-10-20 03:00:04 09[IKE] <ims0|1> retransmit 1 of request with message ID 6\n";
+        runner.set_file(&engine.shared.charon_log, before);
+        let mark = TunnelEngine::log_mark(&engine, &runner);
+        // Nothing after the mark: the old retransmit does not count.
+        assert_eq!(
+            engine.ike_evidence_since(&runner, mark),
+            IkeEvidence::default()
+        );
+        let after = format!(
+            "{before}2026-10-20 03:00:30 07[ENC] <ims0|1> parsed INFORMATIONAL response 7 [ ]\n"
+        );
+        runner.set_file(&engine.shared.charon_log, after);
+        assert!(engine.ike_evidence_since(&runner, mark).parsed_from_peer);
+    }
+
+    #[test]
+    fn an_unreadable_log_reads_as_life_so_it_never_holds_a_line() {
+        let runner = MockCommandRunner::new();
+        let engine = engine();
+        assert_eq!(
+            engine.ike_evidence_since(&runner, LogMark::default()),
+            IkeEvidence::LIFE
+        );
+    }
+
+    // ---- T007: route_to ------------------------------------------------
+
+    // MOCK JUSTIFICATION: the same as `MockCommandRunner`'s own (charon, a
+    // netns and root are not available in `cargo test`); the outputs below are
+    // what iproute2 printed on the rig for each kind of route (research R3).
+    fn route_get(addr: &str, status: i32, stdout: &str) -> bool {
+        let runner = MockCommandRunner::new();
+        runner.set_run_output(&format!("ip route get {addr}"), output(status, stdout));
+        route_to(&runner, addr)
+    }
+
+    #[test]
+    fn a_normal_route_with_a_source_is_usable() {
+        assert!(route_get(
+            "192.0.2.123",
+            0,
+            "192.0.2.123 via 198.51.100.1 dev eth0 src 198.51.100.10 uid 0\n    cache\n"
+        ));
+        assert!(route_get(
+            "2001:db8::1",
+            0,
+            "2001:db8::1 from :: via fe80::1 dev eth0 src 2001:db8::2 metric 100 pref medium\n"
+        ));
+    }
+
+    #[test]
+    fn every_rtnetlink_failure_and_a_missing_default_route_is_no_route() {
+        // Blackhole (`Invalid argument`), unreachable (`Host is unreachable`),
+        // prohibit (`Permission denied`) and no default route at all
+        // (`Network is unreachable`) all exit 2 with the reason on stderr.
+        assert!(!route_get("192.0.2.123", 2, ""));
+    }
+
+    #[test]
+    fn exit_zero_without_a_source_address_is_no_route() {
+        assert!(!route_get(
+            "192.0.2.123",
+            0,
+            "192.0.2.123 dev eth0 uid 0\n    cache\n"
+        ));
+        assert!(!route_get("192.0.2.123", 0, ""));
+    }
+
+    // ---- T008: the engine seam -----------------------------------------
+
+    #[test]
+    fn route_ok_asks_about_this_lines_epdg() {
+        let runner = MockCommandRunner::new();
+        runner.set_run_output(
+            "ip route get 203.0.113.9",
+            output(
+                0,
+                "203.0.113.9 via 198.51.100.1 dev eth0 src 198.51.100.10\n",
+            ),
+        );
+        let engine = engine();
+        assert_eq!(engine.epdg_addr(), Some("203.0.113.9"));
+        assert!(engine.route_ok(&runner));
+        runner.set_run_output("ip route get 203.0.113.9", output(2, ""));
+        assert!(!engine.route_ok(&runner));
+    }
+
+    #[test]
+    fn an_engine_without_an_epdg_address_never_reports_no_route() {
+        let runner = MockCommandRunner::new();
+        let mut engine = engine();
+        engine.epdg_addr = None;
+        assert!(engine.route_ok(&runner));
+        assert!(runner.run_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn send_dpd_runs_swanctl_dpd_scoped_to_this_connection_and_bounded() {
+        let runner = MockCommandRunner::new();
+        let engine = engine();
+        assert!(engine.send_dpd(&runner));
+        let calls = runner.run_calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![vec![
+                "timeout".to_string(),
+                "10".to_string(),
+                "env".to_string(),
+                "STRONGSWAN_CONF=/etc/strongswan-shared.conf".to_string(),
+                "swanctl".to_string(),
+                "--dpd".to_string(),
+                "--ike".to_string(),
+                "ims0".to_string(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn send_dpd_reports_a_refusal_as_not_sent() {
+        let runner = MockCommandRunner::new();
+        let engine = engine();
+        runner.set_run_output(
+            "timeout 10 env STRONGSWAN_CONF=/etc/strongswan-shared.conf swanctl --dpd --ike ims0",
+            output(1, ""),
+        );
+        assert!(!engine.send_dpd(&runner));
+    }
+
+    #[test]
+    fn a_listing_with_a_half_open_ike_sa_is_cached_and_reported_connecting() {
+        let runner = MockCommandRunner::new();
+        runner.set_run_output(
+            "timeout 10 env STRONGSWAN_CONF=/etc/strongswan-shared.conf swanctl --list-sas --ike ims0",
+            output(0, "ims0: #17, CONNECTING, IKEv2, aa_i* bb_r\n"),
+        );
+        let engine = engine();
+        assert_eq!(
+            engine.steady_state_health(&runner),
+            SteadyStateHealth::IkeSaConnecting { ike_id: 17 }
+        );
+        assert_eq!(engine.ike_header(), Some((17, IkeHeaderState::Connecting)));
+        // A listing that cannot be read drops the cached header.
+        runner.set_run_output(
+            "timeout 10 env STRONGSWAN_CONF=/etc/strongswan-shared.conf swanctl --list-sas --ike ims0",
+            output(1, ""),
+        );
+        assert_eq!(
+            engine.steady_state_health(&runner),
+            SteadyStateHealth::ViciBroken
+        );
+        assert_eq!(engine.ike_header(), None);
     }
 }

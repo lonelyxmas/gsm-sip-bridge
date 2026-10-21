@@ -10,9 +10,11 @@
 //! `healthcheck`, the keepalive loop and `EpdgTransport` all read it as a
 //! single address (FR-004).
 
+use crate::control::protocol::UplinkState;
 use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// `/tmp/pcscf-N.pool` for the selection file `/tmp/pcscf-N`.
 pub fn pool_path(selection_path: &str) -> PathBuf {
@@ -38,6 +40,90 @@ pub fn write_active_calls(path: &Path, n: u32) -> io::Result<()> {
 /// that is not a plain unsigned number, which the reader treats as "no call".
 pub fn parse_active_calls(contents: &str) -> Option<u32> {
     contents.trim().parse().ok()
+}
+
+/// `/tmp/pcscf-N.uplink` for the selection file `/tmp/pcscf-N` (specs/100).
+pub fn uplink_path(selection_path: &str) -> PathBuf {
+    PathBuf::from(format!("{selection_path}.uplink"))
+}
+
+/// The `.uplink` file's version (specs/100 `contracts/status-file.md`).
+pub const UPLINK_VERSION: u32 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct UplinkFile {
+    v: u32,
+    state: UplinkState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    since: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_outage: Option<Outage>,
+}
+
+/// The last outage the path came back from, in unix seconds: from when it was
+/// last known to work until the hold on it ended because it returned.
+///
+/// For the IMS agent (specs/100 FR-011): a P-CSCF it marked unavailable inside
+/// this window failed because the path did, so the mark says nothing about the
+/// P-CSCF and is dropped. A hold cut at the 15-minute bound records none: the
+/// path is not known to have come back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Outage {
+    pub from: u64,
+    pub to: u64,
+}
+
+impl Outage {
+    pub fn contains(&self, t: SystemTime) -> bool {
+        t.duration_since(UNIX_EPOCH)
+            .is_ok_and(|d| (self.from..=self.to).contains(&d.as_secs()))
+    }
+}
+
+/// One line of JSON for the `.uplink` file: the supervisor's verdict on the
+/// path to the line's ePDG, when a hold began (only while held), and the last
+/// outage the path came back from.
+pub fn render_uplink(
+    state: UplinkState,
+    since: Option<u64>,
+    last_outage: Option<Outage>,
+) -> String {
+    let file = UplinkFile {
+        v: UPLINK_VERSION,
+        state,
+        since: since.filter(|_| state != UplinkState::Up),
+        last_outage,
+    };
+    // Serializing plain fields cannot fail.
+    format!("{}\n", serde_json::to_string(&file).unwrap_or_default())
+}
+
+/// The last outage the path came back from, as an `.uplink` file's contents
+/// say; `None` when there was none or the file does not parse.
+pub fn parse_last_outage(contents: &str) -> Option<Outage> {
+    serde_json::from_str::<UplinkFile>(contents.trim())
+        .ok()
+        .filter(|f| f.v == UPLINK_VERSION)
+        .and_then(|f| f.last_outage)
+}
+
+/// [`parse_last_outage`] of the `.uplink` file beside `selection_path`. A
+/// missing file (no guard, a swu line, the supervisor not yet started) is
+/// `None`.
+pub fn read_last_outage(selection_path: &str) -> Option<Outage> {
+    std::fs::read_to_string(uplink_path(selection_path))
+        .ok()
+        .and_then(|c| parse_last_outage(&c))
+}
+
+/// An `.uplink` file's contents; `None` for anything that does not parse, names
+/// an unknown state, or carries another version, which `vowifi-status` prints
+/// as `unknown`.
+pub fn parse_uplink(contents: &str) -> Option<(UplinkState, Option<u64>)> {
+    serde_json::from_str::<UplinkFile>(contents.trim())
+        .ok()
+        .filter(|f| f.v == UPLINK_VERSION)
+        .map(|f| (f.state, f.since))
 }
 
 /// One address per line, trailing newline.
@@ -253,5 +339,68 @@ mod tests {
         assert!(!dir.join("pcscf-0.pool.tmp").exists());
         assert!(read_pool(&dir.join("missing.pool")).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_uplink_file_sits_beside_the_selection_file() {
+        assert_eq!(
+            uplink_path("/tmp/pcscf-1"),
+            PathBuf::from("/tmp/pcscf-1.uplink")
+        );
+    }
+
+    #[test]
+    fn the_uplink_file_round_trips_each_state() {
+        let up = render_uplink(UplinkState::Up, Some(1_792_500_000), None);
+        assert_eq!(up, "{\"v\":1,\"state\":\"up\"}\n", "no `since` while up");
+        assert_eq!(parse_uplink(&up), Some((UplinkState::Up, None)));
+        let held = render_uplink(UplinkState::NoRoute, Some(1_792_500_000), None);
+        assert_eq!(
+            held,
+            "{\"v\":1,\"state\":\"no_route\",\"since\":1792500000}\n"
+        );
+        assert_eq!(
+            parse_uplink(&held),
+            Some((UplinkState::NoRoute, Some(1_792_500_000)))
+        );
+        assert_eq!(
+            parse_uplink(&render_uplink(UplinkState::NoResponse, Some(5), None)),
+            Some((UplinkState::NoResponse, Some(5)))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_uplink_file_parses_to_nothing() {
+        for bad in [
+            "",
+            "not json",
+            "{\"v\":2,\"state\":\"up\"}",
+            "{\"v\":1,\"state\":\"sideways\"}",
+            "{\"state\":\"up\"}",
+        ] {
+            assert_eq!(parse_uplink(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_uplink_file_is_written_atomically() {
+        let dir = temp_dir();
+        let path = dir.join("pcscf-9.uplink");
+        write_atomic(&path, &render_uplink(UplinkState::NoRoute, Some(7), None)).unwrap();
+        let read = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(parse_uplink(&read), Some((UplinkState::NoRoute, Some(7))));
+    }
+    #[test]
+    fn the_last_outage_round_trips_and_an_older_file_has_none() {
+        let o = Outage { from: 100, to: 400 };
+        let up = render_uplink(UplinkState::Up, None, Some(o));
+        assert_eq!(parse_uplink(&up), Some((UplinkState::Up, None)));
+        assert_eq!(parse_last_outage(&up), Some(o));
+        // A file written before the field existed, or with no outage yet.
+        assert_eq!(parse_last_outage(r#"{"v":1,"state":"up"}"#), None);
+        assert_eq!(parse_last_outage("garbage"), None);
+        let at = |s| UNIX_EPOCH + std::time::Duration::from_secs(s);
+        assert!(o.contains(at(100)) && o.contains(at(400)));
+        assert!(!o.contains(at(99)) && !o.contains(at(401)));
     }
 }

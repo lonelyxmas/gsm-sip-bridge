@@ -152,10 +152,14 @@ pub enum DeadPeerVerdict {
     /// No snapshot, or one that cannot place the last inbound packet on either
     /// side of the window.
     Unknown,
+    /// The loss was seen while the line was held for an uplink outage
+    /// (specs/100 FR-022): the peer's silence is explained by the path, so it
+    /// is never `real`.
+    Uplink,
 }
 
 impl DeadPeerVerdict {
-    pub const ALL: [Self; 3] = [Self::False, Self::Real, Self::Unknown];
+    pub const ALL: [Self; 4] = [Self::False, Self::Real, Self::Unknown, Self::Uplink];
 
     /// The wire and metric label.
     pub fn as_str(self) -> &'static str {
@@ -163,6 +167,83 @@ impl DeadPeerVerdict {
             Self::False => "false",
             Self::Real => "real",
             Self::Unknown => "unknown",
+            Self::Uplink => "uplink",
+        }
+    }
+}
+
+/// What the underlay guard believes about the path to a line's ePDG
+/// (specs/100). Closed: it is a wire value and a metric label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UplinkState {
+    Up,
+    /// The host has no usable route (or source address) to the ePDG.
+    NoRoute,
+    /// The route is fine, but the ePDG has stopped answering.
+    NoResponse,
+}
+
+impl UplinkState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::NoRoute => "no_route",
+            Self::NoResponse => "no_response",
+        }
+    }
+}
+
+/// Why a line is held (specs/100): the two non-`up` [`UplinkState`]s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UplinkHoldCause {
+    NoRoute,
+    NoResponse,
+}
+
+impl UplinkHoldCause {
+    pub const ALL: [Self; 2] = [Self::NoRoute, Self::NoResponse];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoRoute => "no_route",
+            Self::NoResponse => "no_response",
+        }
+    }
+}
+
+impl From<UplinkHoldCause> for UplinkState {
+    fn from(cause: UplinkHoldCause) -> Self {
+        match cause {
+            UplinkHoldCause::NoRoute => Self::NoRoute,
+            UplinkHoldCause::NoResponse => Self::NoResponse,
+        }
+    }
+}
+
+/// What ended a hold (specs/100).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HoldEndedBy {
+    /// The path came back.
+    Restored,
+    /// The 15-minute bound was reached.
+    MaxHold,
+    /// The supervisor was shutting down.
+    Shutdown,
+    /// The path is still down, for another reason: the hold carries on under
+    /// the new cause, and its 15-minute bound still runs from its start.
+    CauseChanged,
+}
+
+impl HoldEndedBy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Restored => "restored",
+            Self::MaxHold => "max_hold",
+            Self::Shutdown => "shutdown",
+            Self::CauseChanged => "cause_changed",
         }
     }
 }
@@ -190,10 +271,13 @@ pub enum TunnelRecoveryReason {
     /// The agent marked every P-CSCF in the pool since the last negotiation
     /// (specs/097).
     PcscfPoolExhausted,
+    /// A half-open IKE_SA stopped showing any IKE activity (specs/100): charon
+    /// is no longer working on it, so it was terminated and re-initiated.
+    IkeSaNegotiationStuck,
 }
 
 impl TunnelRecoveryReason {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::ProcessDied,
         Self::ViciBroken,
         Self::TunVanished,
@@ -206,6 +290,7 @@ impl TunnelRecoveryReason {
         Self::PcscfUnreachable,
         Self::DefaultRouteMissing,
         Self::PcscfPoolExhausted,
+        Self::IkeSaNegotiationStuck,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -222,6 +307,7 @@ impl TunnelRecoveryReason {
             Self::PcscfUnreachable => "pcscf_unreachable",
             Self::DefaultRouteMissing => "default_route_missing",
             Self::PcscfPoolExhausted => "pcscf_pool_exhausted",
+            Self::IkeSaNegotiationStuck => "ike_sa_negotiation_stuck",
         }
     }
 }
@@ -289,6 +375,12 @@ pub struct AgentState {
     /// For alert text; never drives a decision.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ike_sa_loss_cause: Option<IkeSaLossCause>,
+    /// Supervisor only: what the underlay guard believes about the path to
+    /// this line's ePDG (specs/100). Absent when the guard is off, on the swu
+    /// engine, and from an older supervisor; ingest then leaves its state
+    /// untouched.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub uplink: Option<UplinkState>,
 }
 
 /// A counter delta or histogram observation. Every enumerated field below is
@@ -370,6 +462,16 @@ pub enum ObservedEvent {
         /// absent on the wire, for every other recovery.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dead_peer: Option<DeadPeerVerdict>,
+    },
+    /// Supervisor only: the underlay guard put this line on hold (specs/100).
+    UplinkHoldStarted {
+        cause: UplinkHoldCause,
+    },
+    /// Supervisor only: a hold ended, after `held_secs` (specs/100).
+    UplinkHoldEnded {
+        cause: UplinkHoldCause,
+        held_secs: u64,
+        ended_by: HoldEndedBy,
     },
 }
 
@@ -621,6 +723,19 @@ mod tests {
     }
 
     #[test]
+    fn a_stuck_half_open_ike_sa_has_its_own_wire_label() {
+        let event = ObservedEvent::TunnelRecovered {
+            reason: TunnelRecoveryReason::IkeSaNegotiationStuck,
+            pcscfs: Vec::new(),
+            rebuilt_at_unix: None,
+            dead_peer: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"ike_sa_negotiation_stuck\""), "{json}");
+        assert_eq!(serde_json::from_str::<ObservedEvent>(&json).unwrap(), event);
+    }
+
+    #[test]
     fn tunnel_recovery_reasons_round_trip_under_their_labels() {
         for reason in TunnelRecoveryReason::ALL {
             let json = serde_json::to_string(&reason).unwrap();
@@ -670,6 +785,99 @@ mod tests {
                 format!("\"{}\"", v.as_str())
             );
         }
+    }
+
+    #[test]
+    fn uplink_states_causes_and_end_reasons_serialize_under_their_labels() {
+        for state in [
+            UplinkState::Up,
+            UplinkState::NoRoute,
+            UplinkState::NoResponse,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&state).unwrap(),
+                format!("\"{}\"", state.as_str())
+            );
+        }
+        for cause in UplinkHoldCause::ALL {
+            assert_eq!(
+                serde_json::to_string(&cause).unwrap(),
+                format!("\"{}\"", cause.as_str())
+            );
+            assert_eq!(UplinkState::from(cause).as_str(), cause.as_str());
+        }
+        for ended in [
+            HoldEndedBy::Restored,
+            HoldEndedBy::MaxHold,
+            HoldEndedBy::Shutdown,
+            HoldEndedBy::CauseChanged,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&ended).unwrap(),
+                format!("\"{}\"", ended.as_str())
+            );
+        }
+        assert_eq!(DeadPeerVerdict::Uplink.as_str(), "uplink");
+    }
+
+    #[test]
+    fn uplink_state_and_hold_events_round_trip_and_old_payloads_still_parse() {
+        let state = AgentState {
+            uplink: Some(UplinkState::NoRoute),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, r#"{"uplink":"no_route"}"#);
+        assert_eq!(
+            serde_json::from_str::<AgentState>(&json).unwrap().uplink,
+            Some(UplinkState::NoRoute)
+        );
+        // Without the field (an older supervisor, or the guard off) it is absent.
+        assert_eq!(serde_json::to_string(&AgentState::default()).unwrap(), "{}");
+        assert_eq!(
+            serde_json::from_str::<AgentState>(r#"{"child_sa_up":true}"#)
+                .unwrap()
+                .uplink,
+            None
+        );
+
+        let started = ObservedEvent::UplinkHoldStarted {
+            cause: UplinkHoldCause::NoRoute,
+        };
+        let json = serde_json::to_string(&started).unwrap();
+        assert_eq!(
+            json,
+            r#"{"event":"uplink_hold_started","cause":"no_route"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ObservedEvent>(&json).unwrap(),
+            started
+        );
+
+        let ended = ObservedEvent::UplinkHoldEnded {
+            cause: UplinkHoldCause::NoResponse,
+            held_secs: 312,
+            ended_by: HoldEndedBy::Restored,
+        };
+        let json = serde_json::to_string(&ended).unwrap();
+        assert_eq!(
+            json,
+            r#"{"event":"uplink_hold_ended","cause":"no_response","held_secs":312,"ended_by":"restored"}"#
+        );
+        assert_eq!(serde_json::from_str::<ObservedEvent>(&json).unwrap(), ended);
+    }
+
+    #[test]
+    fn a_dead_peer_loss_attributed_to_the_uplink_round_trips() {
+        let event = ObservedEvent::TunnelRecovered {
+            reason: TunnelRecoveryReason::IkeSaLost,
+            pcscfs: Vec::new(),
+            rebuilt_at_unix: None,
+            dead_peer: Some(DeadPeerVerdict::Uplink),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""dead_peer":"uplink""#), "{json}");
+        assert_eq!(serde_json::from_str::<ObservedEvent>(&json).unwrap(), event);
     }
 
     #[test]
