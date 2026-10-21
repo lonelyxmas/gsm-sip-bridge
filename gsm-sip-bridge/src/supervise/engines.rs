@@ -254,10 +254,109 @@ pub fn initiate_argv(shared_conf: &str, conn: &str) -> Vec<String> {
     .to_vec()
 }
 
-/// The initiate client a line currently has outstanding.
-pub struct PendingInitiate {
-    handle: ChildHandle,
-    started: Instant,
+/// Every line's outstanding initiate client, owned in one place so shutdown
+/// can reach them (#139, US6). A client is a child of the bridge; the plan
+/// that tears the tunnel down cannot see an engine, so it reaps through this.
+///
+/// The map owns the [`ChildHandle`] by value: finishing a client means taking
+/// it out and `wait`ing on it, which needs the sole owner.
+#[derive(Default)]
+pub struct InitiateClients {
+    clients: Mutex<std::collections::HashMap<u32, (ChildHandle, Instant)>>,
+    /// Set by [`Self::cancel_all`]: shutdown has begun, so a line still
+    /// looping must not start a client the plan has already swept past.
+    closed: std::sync::atomic::AtomicBool,
+}
+
+/// What [`InitiateClients::poll`] found for a line.
+pub enum ClientState {
+    None,
+    /// Still running, for this many seconds.
+    Running(u64),
+    /// Had finished; it has now been collected after this many seconds.
+    Finished(u64),
+}
+
+impl InitiateClients {
+    /// Collects the line's client if it has finished, so it never lingers as a
+    /// zombie with a table entry.
+    ///
+    /// The exit code is not reported: the runner's liveness check consumes it
+    /// when it notices the exit, so `wait` could only return `None`.
+    pub fn poll(&self, line: u32, runner: &dyn CommandRunner) -> ClientState {
+        let mut map = self.clients.lock().unwrap();
+        let Some((handle, started)) = map.get(&line) else {
+            return ClientState::None;
+        };
+        let secs = started.elapsed().as_secs();
+        if runner.is_alive(handle) {
+            return ClientState::Running(secs);
+        }
+        if let Some((handle, _)) = map.remove(&line) {
+            let _ = runner.wait(handle);
+        }
+        ClientState::Finished(secs)
+    }
+
+    /// Spawns the line's client and registers it, unless shutdown has closed
+    /// the registry. Check, spawn and insert all happen under the lock
+    /// [`Self::cancel_all`] takes to close and drain, so a start in flight
+    /// either lands before the sweep (and is reaped by it) or sees the closed
+    /// flag and never spawns.
+    fn start(
+        &self,
+        line: u32,
+        runner: &dyn CommandRunner,
+        spec: ChildSpec,
+    ) -> Option<std::io::Result<()>> {
+        let mut map = self.clients.lock().unwrap();
+        if self.closed.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(runner.spawn(spec).map(|handle| {
+            map.insert(line, (handle, Instant::now()));
+        }))
+    }
+
+    /// Reaps one line's client, if it has one.
+    pub fn cancel(&self, line: u32, runner: &dyn CommandRunner) {
+        let taken = self.clients.lock().unwrap().remove(&line);
+        if let Some((handle, _)) = taken {
+            Self::reap(handle, runner);
+        }
+    }
+
+    /// Reaps every line's client. What shutdown calls, before it touches the
+    /// tunnels, so no client is left to race the IKE_SA terminate.
+    pub fn cancel_all(&self, runner: &dyn CommandRunner) {
+        let taken: Vec<_> = {
+            let mut map = self.clients.lock().unwrap();
+            self.closed.store(true, Ordering::SeqCst);
+            map.drain().collect()
+        };
+        for (_, (handle, _)) in taken {
+            Self::reap(handle, runner);
+        }
+    }
+
+    fn reap(handle: ChildHandle, runner: &dyn CommandRunner) {
+        runner.reap(&handle);
+        // `reap` signals and polls but does not untrack: consuming the handle
+        // is what removes the runner's table entry.
+        let _ = runner.wait(handle);
+    }
+}
+
+impl std::fmt::Debug for InitiateClients {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InitiateClients")
+    }
+}
+
+impl PartialEq for InitiateClients {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
 }
 
 /// CHILD_SA states that still carry (or are about to carry) traffic. A rekey
@@ -694,6 +793,8 @@ pub struct SharedCharon {
     /// the evidence for its verdict (specs/100 FR-001). Here because every
     /// line that can share an ePDG shares this daemon.
     pub epdg_heard: super::underlay::EpdgHeard,
+    /// Every line's outstanding initiate client (#139).
+    pub initiate_clients: Arc<InitiateClients>,
 }
 
 /// A position in the shared charon log: its truncation generation and length.
@@ -721,6 +822,7 @@ impl SharedCharon {
             handle: Mutex::new(None),
             log_generation: AtomicU64::new(0),
             epdg_heard: Default::default(),
+            initiate_clients: Default::default(),
         }
     }
 
@@ -911,10 +1013,6 @@ pub struct StrongswanEngine {
     /// for [`TunnelEngine::ike_header`] (specs/100). Cleared whenever a health
     /// check could not read the SAs.
     pub last_ike_header: RefCell<Option<(u32, IkeHeaderState)>>,
-    /// This line's outstanding initiate client, if any (#139). At most one, so
-    /// at most one live client per line, and held (not detached) so shutdown
-    /// can reach it and its exit status can be logged.
-    pub pending_initiate: RefCell<Option<PendingInitiate>>,
     /// The shared daemon's log generation when the last establish probe ran,
     /// for [`SharedCharon::restart_if_wedged`].
     pub probe_generation: std::cell::Cell<u64>,
@@ -1042,73 +1140,52 @@ impl StrongswanEngine {
             .and_then(|c| child_rekey_invalid_selectors_session(&c, &self.conn_name))
     }
 
-    /// Reaps the outstanding initiate client if it has finished, so a finished
-    /// client never lingers as a zombie with a tracked entry through a long
-    /// outage in which nothing starts another. Returns whether a client is
-    /// still running.
-    ///
-    /// The exit code is not logged: the runner's liveness check consumes the
-    /// status when it notices the exit, so `wait` can only return `None`.
-    /// How long it ran says what it was (about 20s = swanctl detached, about
-    /// 27s = the outer timeout, quick = it failed).
+    /// Collects this line's initiate client if it has finished (see
+    /// [`InitiateClients::poll`]), logging it. Returns whether one is still
+    /// running. How long it ran says what it was (about 20s = swanctl
+    /// detached, about 27s = the outer timeout, quick = it failed); the time
+    /// is when it was collected, so it is rounded up to the next probe.
     fn collect_initiate(&self, runner: &dyn CommandRunner) -> bool {
-        let mut pending = self.pending_initiate.borrow_mut();
-        let Some(p) = pending.take() else {
-            return false;
-        };
-        if runner.is_alive(&p.handle) {
-            *pending = Some(p);
-            return true;
+        match self.shared.initiate_clients.poll(self.idx, runner) {
+            ClientState::None => false,
+            ClientState::Running(_) => true,
+            ClientState::Finished(secs) => {
+                println!(
+                    "[supervise] line {}: {} initiate client exited after {secs}s",
+                    self.idx, self.conn_name
+                );
+                false
+            }
         }
-        println!(
-            "[supervise] line {}: {} initiate client exited after {}s",
-            self.idx,
-            self.conn_name,
-            p.started.elapsed().as_secs()
-        );
-        let _ = runner.wait(p.handle);
-        false
     }
 
     /// Starts this line's tunnel initiation, unless the previous client is
     /// still running (#139).
     ///
     /// The client is bounded (`initiate_argv`: swanctl detaches at 20s, an
-    /// outer `timeout` ends it by 27s) and tracked, never detached: a
-    /// `spawn_detached` waiter thread per call could neither answer "is one
-    /// still pending?" nor be reached by shutdown. A finished client is
-    /// `wait`ed here, which reaps it and yields its exit status to log.
-    /// Not backgrounding the initiate at all would block the supervisor tick
-    /// for as long as IKE negotiation takes, which an earlier review caught.
+    /// outer `timeout` ends it by 27s) and tracked in
+    /// [`SharedCharon::initiate_clients`], never detached: a `spawn_detached`
+    /// waiter thread per call could neither answer "is one still pending?" nor
+    /// be reached by shutdown. Not backgrounding the initiate at all would
+    /// block the supervisor tick for as long as IKE negotiation takes, which
+    /// an earlier review caught.
     pub fn initiate(&self, runner: &dyn CommandRunner) {
         if self.collect_initiate(runner) {
-            let secs = self
-                .pending_initiate
-                .borrow()
-                .as_ref()
-                .map_or(0, |p| p.started.elapsed().as_secs());
             println!(
-                "[supervise] line {}: {} initiate skipped, previous client still running ({secs}s)",
+                "[supervise] line {}: {} initiate skipped, previous client still running",
                 self.idx, self.conn_name
             );
             return;
         }
-        let mut pending = self.pending_initiate.borrow_mut();
-        match runner.spawn(ChildSpec::new(initiate_argv(
-            &self.shared.strongswan_conf,
-            &self.conn_name,
-        ))) {
-            Ok(handle) => {
-                println!(
-                    "[supervise] line {}: {} initiate started",
-                    self.idx, self.conn_name
-                );
-                *pending = Some(PendingInitiate {
-                    handle,
-                    started: Instant::now(),
-                });
-            }
-            Err(e) => eprintln!(
+        let spec = ChildSpec::new(initiate_argv(&self.shared.strongswan_conf, &self.conn_name));
+        match self.shared.initiate_clients.start(self.idx, runner, spec) {
+            // Shutting down: the plan has swept past, start nothing.
+            None => {}
+            Some(Ok(())) => println!(
+                "[supervise] line {}: {} initiate started",
+                self.idx, self.conn_name
+            ),
+            Some(Err(e)) => eprintln!(
                 "[supervise] line {}: {} initiate failed to start: {e}",
                 self.idx, self.conn_name
             ),
@@ -1237,12 +1314,7 @@ impl TunnelEngine for StrongswanEngine {
 
     /// Reaps the outstanding initiate client so none outlives the line.
     fn cancel_initiate(&self, runner: &dyn CommandRunner) {
-        if let Some(p) = self.pending_initiate.borrow_mut().take() {
-            runner.reap(&p.handle);
-            // `reap` signals and polls but does not untrack: consuming the
-            // handle is what removes the runner's table entry.
-            let _ = runner.wait(p.handle);
-        }
+        self.shared.initiate_clients.cancel(self.idx, runner);
     }
 
     fn establish_probe(&self, runner: &dyn CommandRunner) -> EstablishProbe {
@@ -2273,7 +2345,6 @@ mod tests {
                 last_tun_rx: Default::default(),
                 epdg_addr: None,
                 last_ike_header: Default::default(),
-                pending_initiate: Default::default(),
                 probe_generation: Default::default(),
             }
         }
@@ -3007,6 +3078,26 @@ mod tests {
         }
 
         #[test]
+        fn cancel_all_reaps_every_lines_client_and_closes_the_registry() {
+            let runner = MockCommandRunner::new();
+            let a = strongswan_engine();
+            let mut b = strongswan_engine();
+            b.shared = Arc::clone(&a.shared);
+            b.idx = 1;
+            a.initiate(&runner);
+            b.initiate(&runner);
+            let ids = runner.child_ids();
+            assert_eq!(ids.len(), 2);
+            a.shared.initiate_clients.cancel_all(&runner);
+            assert!(ids.iter().all(|id| runner.waited_on(*id)));
+            assert!(runner.child_ids().is_empty());
+            // A line still looping must not start a client shutdown swept past.
+            a.initiate(&runner);
+            b.initiate(&runner);
+            assert_eq!(runner.spawn_specs.lock().unwrap().len(), 2);
+        }
+
+        #[test]
         fn load_all_runs_under_a_timeout() {
             let runner = MockCommandRunner::new();
             strongswan_engine().shared.load_all(&runner);
@@ -3282,7 +3373,6 @@ mod underlay_tests {
             last_tun_rx: Default::default(),
             epdg_addr: Some("203.0.113.9".to_string()),
             last_ike_header: Default::default(),
-            pending_initiate: Default::default(),
             probe_generation: Default::default(),
         }
     }
