@@ -23,7 +23,7 @@
 //! request/response transaction directly instead.
 
 pub mod agent;
-mod amr_rtp;
+pub(crate) mod amr_rtp;
 /// The MIME body decoder every SDP consumer goes through (specs/088): a SIP
 /// body may be `multipart/*` (RFC 5621 §4.2), never assume bare SDP.
 pub(crate) mod body;
@@ -44,7 +44,7 @@ pub mod lifecycle;
 pub mod media_stats;
 pub mod observability;
 pub mod pcscf_files;
-mod rtcp;
+pub(crate) mod rtcp;
 /// `pub` rather than private: `siptest` (specs/037-siptest-softphone,
 /// research.md R1) reuses RTP framing, the μ-law codec and the WAV writer
 /// rather than re-implementing them — the reasoning `digest` and
@@ -2050,7 +2050,7 @@ mod tests {
             algorithm: Some("AKAv1-MD5".to_string()),
         };
         let auth = build_authorization(
-            "404438083996440@ims.mnc043.mcc404.3gppnetwork.org",
+            "404430000000000@ims.mnc043.mcc404.3gppnetwork.org",
             &challenge,
             "sip:ims.mnc043.mcc404.3gppnetwork.org",
             b"\x01\x02\x03\x04\x05\x06\x07\x08",
