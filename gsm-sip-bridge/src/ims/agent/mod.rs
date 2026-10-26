@@ -395,6 +395,7 @@ fn run_inner(
         sms_report_pcscf_route: config.sms_report_pcscf_route,
         respect_caller_privacy: config.respect_caller_privacy,
         amr_passthrough: config.amr_passthrough,
+        gm_options_keepalive: config.gm_options_keepalive,
         amr_mode_set: config.amr_mode_set,
         // Already this line's value: discovery applied any `[[vowifi.line]]`
         // override to the per-line config.
@@ -758,6 +759,9 @@ pub(crate) struct InboundParams<'a> {
     /// See `config::VowifiConfig::amr_passthrough`. Both transports read the
     /// `[vowifi]` copy: it is one deployment-wide setting (FR-015).
     pub amr_passthrough: bool,
+    /// See `config::VowifiConfig::gm_options_keepalive`. Both transports read
+    /// the `[vowifi]` copy: it is one deployment-wide setting.
+    pub gm_options_keepalive: bool,
     /// See `config::VowifiConfig::amr_mode_set`.
     pub amr_mode_set: crate::amr_forward::ModeSetPolicy,
     /// This line's resolved `reg_rejected_cooldown_sec` (specs/089) — each
@@ -838,6 +842,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         sms_report_pcscf_route,
         respect_caller_privacy,
         amr_passthrough,
+        gm_options_keepalive,
         amr_mode_set,
         reg_rejected_cooldown,
         answer_preference,
@@ -857,6 +862,16 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
         agent_kind,
     } = p;
     let mut pcscf_pool = pcscf_pool;
+    tracing::info!(
+        gm_options_keepalive,
+        "{}",
+        if gm_options_keepalive {
+            "periodic Gm OPTIONS keepalive on ([vowifi].gm_options_keepalive = true)"
+        } else {
+            "periodic Gm OPTIONS keepalive off ([vowifi].gm_options_keepalive = false); \
+             a dead Gm connection is found by the reg-event probe, a failed send or the renewal"
+        }
+    );
 
     // Best-effort: a store that fails to open must not stop the agent from
     // registering and carrying calls (FR-018) — call history is simply
@@ -1033,6 +1048,7 @@ pub(crate) fn serve_inbound(p: InboundParams) -> BridgeResult<()> {
             originating_headers: app_config.vowifi.originating_headers,
             respect_caller_privacy,
             amr_passthrough,
+            gm_options_keepalive,
             amr_mode_set,
             pbx_registered: pbx_registered.as_ref(),
             obs: &obs,
@@ -1940,6 +1956,9 @@ struct DispatchParams<'a> {
     /// See `config::VowifiConfig::amr_passthrough`; consumed by
     /// [`inbound::handle_invite`].
     amr_passthrough: bool,
+    /// See `config::VowifiConfig::gm_options_keepalive`; consumed by
+    /// [`ping::probe_gm_connection`].
+    gm_options_keepalive: bool,
     amr_mode_set: crate::amr_forward::ModeSetPolicy,
     pbx_registered: Option<&'a Arc<AtomicBool>>,
     obs: &'a observability::AgentObservability,
@@ -2567,6 +2586,7 @@ fn dispatch_loop(
 ) -> BridgeResult<()> {
     let mut st = LoopState::new();
     st.pool = pool;
+    st.ping.periodic = p.gm_options_keepalive;
     let respond_on_client = p.respond_on_client;
     if respond_on_client {
         tracing::warn!(

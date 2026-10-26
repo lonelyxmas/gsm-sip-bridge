@@ -978,6 +978,7 @@ fn build_vowifi(raw: RawVowifi) -> BridgeResult<VowifiConfig> {
         src_addr: raw.src_addr.filter(|s| !s.is_empty()),
         idle_keepalive: raw.idle_keepalive,
         supervisor_pcscf_probe: raw.supervisor_pcscf_probe,
+        gm_options_keepalive: raw.gm_options_keepalive,
         amr_passthrough: raw.amr_passthrough,
         amr_mode_set: raw.amr_mode_set,
         amr_client_rtp_latch: raw.amr_client_rtp_latch,

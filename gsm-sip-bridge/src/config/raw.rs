@@ -472,6 +472,9 @@ section! {
         /// Whether the line supervisor probes the P-CSCF. See
         /// `VowifiConfig::supervisor_pcscf_probe`.
         pub supervisor_pcscf_probe: bool,
+        /// Whether the IMS agent sends the periodic idle SIP OPTIONS. See
+        /// `VowifiConfig::gm_options_keepalive`.
+        pub gm_options_keepalive: bool,
         /// Whether inbound AMR calls are forwarded without transcoding. See
         /// `VowifiConfig::amr_passthrough`.
         pub amr_passthrough: bool,
@@ -528,6 +531,7 @@ impl Default for RawVowifi {
             src_addr: None,
             idle_keepalive: false,
             supervisor_pcscf_probe: false,
+            gm_options_keepalive: false,
             amr_passthrough: false,
             amr_mode_set: crate::amr_forward::ModeSetPolicy::Strict,
             amr_client_rtp_latch: false,

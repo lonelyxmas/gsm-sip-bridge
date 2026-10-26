@@ -85,6 +85,16 @@ across releases.
   `gsm-sip-bridge config --shell-env`
   ([#120](https://github.com/selvakn/gsm-sip-bridge/issues/120)).
 
+- **The idle Gm OPTIONS keepalive is off by default.** The IMS agent no
+  longer sends a SIP OPTIONS to the P-CSCF every 120s on an idle line.
+  `[vowifi].gm_options_keepalive = true` restores it, for both VoWiFi and
+  VoLTE lines. Without it, a dead Gm connection is found by the reg-event
+  SUBSCRIBE confirm probe, a failed send, the repair ladder or the registration
+  renewal, and `gm_connection: up` means no failure has been seen rather than
+  a recent answer. The bridge advertises no Via `keep`, so no negotiated
+  keepalive is dropped
+  ([#164](https://github.com/selvakn/gsm-sip-bridge/issues/164)).
+
 ### Added
 
 - **Underlay guard for VoWiFi.** While the path from the host to a line's ePDG

@@ -1071,6 +1071,15 @@ pub struct VowifiConfig {
     /// handset does this, and the per-tick route repair, the rebuild when the
     /// agent has marked every P-CSCF, and tuned DPD cover what it caught.
     pub supervisor_pcscf_probe: bool,
+    /// Whether the IMS agent sends a SIP OPTIONS to the P-CSCF every 120s on
+    /// an otherwise idle Gm connection, and treats an unanswered one as a dead
+    /// connection (#164). Off by default: SIP requires a UE to answer OPTIONS,
+    /// not to send it on a timer, and we advertise no Via `keep` (RFC 6223), so
+    /// no negotiated keepalive is owed. Off, a dead connection is still found
+    /// by the reg-event SUBSCRIBE confirm probe, a failed send, the repair
+    /// ladder and the registration renewal, just later than the ~130s bound
+    /// the timer gave. Applies to both VoWiFi and VoLTE lines.
+    pub gm_options_keepalive: bool,
     /// Forward AMR audio between the carrier and an AMR-capable client without
     /// decoding it (#111 option 2a, specs/120-amr-passthrough-forwarder).
     /// Inbound VoWiFi/VoLTE calls only, off by default; a call that does not
@@ -1264,6 +1273,7 @@ impl Default for VowifiConfig {
             src_addr: None,
             idle_keepalive: false,
             supervisor_pcscf_probe: false,
+            gm_options_keepalive: false,
             amr_passthrough: false,
             amr_mode_set: crate::amr_forward::ModeSetPolicy::Strict,
             amr_client_rtp_latch: false,
@@ -2540,6 +2550,32 @@ password = "pass"
         .unwrap_err()
         .to_string();
         assert!(err.contains("supervisor_pcscf_probe"), "{err}");
+    }
+
+    #[test]
+    fn vowifi_gm_options_keepalive_is_off_by_default() {
+        // #164: the periodic idle OPTIONS is a product-specific availability
+        // check, not something SIP or IMS requires of a UE.
+        let cfg = parse(&format!("{MINIMAL_TOML}\n[vowifi]\n"));
+        assert!(!cfg.vowifi.gm_options_keepalive);
+    }
+
+    #[test]
+    fn vowifi_gm_options_keepalive_can_be_turned_on() {
+        let cfg = parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\ngm_options_keepalive = true\n"
+        ));
+        assert!(cfg.vowifi.gm_options_keepalive);
+    }
+
+    #[test]
+    fn vowifi_gm_options_keepalive_rejects_a_non_boolean() {
+        let err = try_parse(&format!(
+            "{MINIMAL_TOML}\n[vowifi]\ngm_options_keepalive = \"yes\"\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("gm_options_keepalive"), "{err}");
     }
 
     #[test]

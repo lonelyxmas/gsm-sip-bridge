@@ -300,7 +300,12 @@ The HEALTHCHECK no longer connects to the P-CSCF itself
 ([#120](https://github.com/selvakn/gsm-sip-bridge/issues/120)). The line
 supervisor's own P-CSCF probe is off by default too
 (`[vowifi].supervisor_pcscf_probe`); a lost route, an exhausted P-CSCF pool and
-a dead peer are repaired from their own signals. The two faults to grep the container's health log for:
+a dead peer are repaired from their own signals. The IMS agent's routine
+120s OPTIONS to the P-CSCF is off by default as well
+(`[vowifi].gm_options_keepalive`,
+[#164](https://github.com/selvakn/gsm-sip-bridge/issues/164)); with it off, a
+Gm `up` means no failure has been seen, not that the P-CSCF answered recently.
+The two faults to grep the container's health log for:
 
 ```text
 line N: IMS agent at <ip>:5071 not responding: <reason>

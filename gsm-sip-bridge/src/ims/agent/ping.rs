@@ -14,7 +14,8 @@ use crate::error::BridgeResult;
 use crate::ims::session::{restart_client_reader, restart_gm_server, Inbound};
 use std::time::{Instant, SystemTime};
 
-/// How often, while idle, an `OPTIONS` keepalive probes the Gm client
+/// How often, while idle and `[vowifi].gm_options_keepalive` is on (#164, off
+/// by default), an `OPTIONS` keepalive probes the Gm client
 /// connection for liveness. A silently-reset connection is otherwise not
 /// noticed until the next scheduled renewal (~55 min) or an attempted call
 /// fails mid-way. 120s bounds the worst-case dead-line duration to ~130s
@@ -60,6 +61,10 @@ pub(super) struct PingState {
     /// replaces `last_sent + PING_INTERVAL`, which would leave a dead
     /// connection unprobed for most of an interval (#137).
     retry_at: Option<Instant>,
+    /// Whether an idle line sends a routine `OPTIONS` every `PING_INTERVAL`
+    /// (`[vowifi].gm_options_keepalive`, #164). Set once by the dispatch loop
+    /// and left alone by `reset`, which only drops per-connection state.
+    pub(super) periodic: bool,
 }
 
 /// What the idle-poll branch should do about liveness this iteration. Kept a
@@ -82,7 +87,11 @@ enum PingVerdict {
 impl PingState {
     /// Decide what to do about the liveness probe this iteration. Pure: no I/O,
     /// takes `now` so tests never sleep.
-    fn verdict(&self, now: Instant, call_in_progress: bool) -> PingVerdict {
+    ///
+    /// `periodic` is `[vowifi].gm_options_keepalive` (#164). Off, nothing
+    /// starts a fresh interval: the only probes left are the ones a repair
+    /// owes (`pending`, `retry_at`), which confirm a rebuilt connection.
+    fn verdict(&self, now: Instant, call_in_progress: bool, periodic: bool) -> PingVerdict {
         if call_in_progress {
             return PingVerdict::Idle;
         }
@@ -97,6 +106,7 @@ impl PingState {
             None => match (self.retry_at, self.last_sent) {
                 (Some(r), _) if now < r => PingVerdict::Idle,
                 (Some(_), _) => PingVerdict::Send,
+                (None, _) if !periodic => PingVerdict::Idle,
                 (None, Some(t)) if now.duration_since(t) < PING_INTERVAL => PingVerdict::Idle,
                 (None, _) => PingVerdict::Send,
             },
@@ -189,7 +199,10 @@ fn reconnect_gm_client(
 /// restart failing is not the P-CSCF's fault and returns `false`.
 ///
 /// Only ever called with no call in progress (the caller gates on it), so the
-/// ping verdict is evaluated as not-in-a-call.
+/// ping verdict is evaluated as not-in-a-call. With
+/// `ping.periodic` (`[vowifi].gm_options_keepalive`) off, no routine keepalive
+/// is sent, but the listener check and a repair's confirming probe still run
+/// (#164).
 pub(super) fn probe_gm_connection(
     session: &mut crate::ims::RegisteredSession,
     inbound: &mut Inbound,
@@ -235,7 +248,7 @@ pub(super) fn probe_gm_connection(
 
     // Client half (R1/R2): OPTIONS keepalive, correlated at the response arm.
     let mut client_down = false;
-    match ping.verdict(now, false) {
+    match ping.verdict(now, false, ping.periodic) {
         PingVerdict::Idle | PingVerdict::Await => {}
         PingVerdict::Send => match session.send_gm_ping() {
             Ok(cseq) => ping.on_sent(cseq, now),
@@ -338,7 +351,7 @@ mod tests {
         let mut s = PingState::default();
         let t0 = Instant::now();
         s.on_sent(1, t0 - PING_INTERVAL * 2);
-        assert_eq!(s.verdict(t0, true), PingVerdict::Idle);
+        assert_eq!(s.verdict(t0, true, true), PingVerdict::Idle);
     }
 
     #[test]
@@ -346,17 +359,23 @@ mod tests {
         let s = PingState::default();
         let t0 = Instant::now();
         // Never pinged yet.
-        assert_eq!(s.verdict(t0, false), PingVerdict::Send);
+        assert_eq!(s.verdict(t0, false, true), PingVerdict::Send);
 
         let mut s2 = PingState {
             last_sent: Some(t0),
             ..PingState::default()
         };
         // Interval not yet elapsed → idle.
-        assert_eq!(s2.verdict(t0 + PING_INTERVAL / 2, false), PingVerdict::Idle);
+        assert_eq!(
+            s2.verdict(t0 + PING_INTERVAL / 2, false, true),
+            PingVerdict::Idle
+        );
         // Interval elapsed → send.
         s2.pending = None;
-        assert_eq!(s2.verdict(t0 + PING_INTERVAL, false), PingVerdict::Send);
+        assert_eq!(
+            s2.verdict(t0 + PING_INTERVAL, false, true),
+            PingVerdict::Send
+        );
     }
 
     #[test]
@@ -366,12 +385,12 @@ mod tests {
         s.on_sent(7, t0);
         // Within the deadline: keep waiting.
         assert_eq!(
-            s.verdict(t0 + PING_RESPONSE_TIMEOUT / 2, false),
+            s.verdict(t0 + PING_RESPONSE_TIMEOUT / 2, false, true),
             PingVerdict::Await
         );
         // Past the deadline: the connection is dead.
         assert_eq!(
-            s.verdict(t0 + PING_RESPONSE_TIMEOUT, false),
+            s.verdict(t0 + PING_RESPONSE_TIMEOUT, false, true),
             PingVerdict::Dead
         );
     }
@@ -383,7 +402,7 @@ mod tests {
         s.on_sent(1, t0);
         // Even long after the interval, a pending ping means Await/Dead — never
         // a second concurrent Send.
-        let v = s.verdict(t0 + PING_INTERVAL * 2, false);
+        let v = s.verdict(t0 + PING_INTERVAL * 2, false, true);
         assert!(matches!(v, PingVerdict::Dead), "got {v:?}");
     }
 
@@ -410,7 +429,7 @@ mod tests {
         let t0 = Instant::now();
 
         // First probe, answered within the deadline → alive.
-        assert_eq!(s.verdict(t0, false), PingVerdict::Send);
+        assert_eq!(s.verdict(t0, false, true), PingVerdict::Send);
         s.on_sent(1, t0);
         assert!(
             s.on_response(1),
@@ -420,14 +439,14 @@ mod tests {
 
         // Interval elapses, second probe sent, and no answer arrives.
         let t1 = t0 + PING_INTERVAL;
-        assert_eq!(s.verdict(t1, false), PingVerdict::Send);
+        assert_eq!(s.verdict(t1, false, true), PingVerdict::Send);
         s.on_sent(2, t1);
         assert_eq!(
-            s.verdict(t1 + PING_RESPONSE_TIMEOUT / 2, false),
+            s.verdict(t1 + PING_RESPONSE_TIMEOUT / 2, false, true),
             PingVerdict::Await
         );
         assert_eq!(
-            s.verdict(t1 + PING_RESPONSE_TIMEOUT, false),
+            s.verdict(t1 + PING_RESPONSE_TIMEOUT, false, true),
             PingVerdict::Dead
         );
     }
@@ -467,7 +486,7 @@ mod tests {
         assert!(s.last_sent.is_none());
         // After a reset the next verdict is Send, not a spurious Dead against a
         // CSeq that belonged to the replaced session (R11).
-        assert_eq!(s.verdict(Instant::now(), false), PingVerdict::Send);
+        assert_eq!(s.verdict(Instant::now(), false, true), PingVerdict::Send);
     }
 
     #[test]
@@ -480,19 +499,19 @@ mod tests {
         let t0 = Instant::now();
         s.on_sent(1, t0);
         let dead_at = t0 + PING_RESPONSE_TIMEOUT;
-        assert_eq!(s.verdict(dead_at, false), PingVerdict::Dead);
+        assert_eq!(s.verdict(dead_at, false, true), PingVerdict::Dead);
         s.on_repair_failed(dead_at);
         assert_eq!(
-            s.verdict(dead_at + PING_RESPONSE_TIMEOUT / 2, false),
+            s.verdict(dead_at + PING_RESPONSE_TIMEOUT / 2, false, true),
             PingVerdict::Idle
         );
         assert_eq!(
-            s.verdict(dead_at + PING_RESPONSE_TIMEOUT, false),
+            s.verdict(dead_at + PING_RESPONSE_TIMEOUT, false, true),
             PingVerdict::Send
         );
         // A call still suppresses it.
         assert_eq!(
-            s.verdict(dead_at + PING_RESPONSE_TIMEOUT, true),
+            s.verdict(dead_at + PING_RESPONSE_TIMEOUT, true, true),
             PingVerdict::Idle
         );
     }
@@ -507,12 +526,12 @@ mod tests {
         s.on_sent(1, t0);
         let mut now = t0 + PING_RESPONSE_TIMEOUT;
         let mut attempts_at = Vec::new();
-        assert_eq!(s.verdict(now, false), PingVerdict::Dead);
+        assert_eq!(s.verdict(now, false, true), PingVerdict::Dead);
         attempts_at.push(now);
         s.on_repair_failed(now);
         while attempts_at.len() < 3 {
             now += Duration::from_secs(1);
-            if s.verdict(now, false) == PingVerdict::Send {
+            if s.verdict(now, false, true) == PingVerdict::Send {
                 // The send fails (no transport), and so does the repair.
                 attempts_at.push(now);
                 s.on_repair_failed(now);
@@ -533,11 +552,11 @@ mod tests {
         s.on_sent(2, t0 + Duration::from_secs(1));
         assert!(s.on_response(2));
         assert_eq!(
-            s.verdict(t0 + PING_RESPONSE_TIMEOUT * 2, false),
+            s.verdict(t0 + PING_RESPONSE_TIMEOUT * 2, false, true),
             PingVerdict::Idle
         );
         assert_eq!(
-            s.verdict(t0 + Duration::from_secs(1) + PING_INTERVAL, false),
+            s.verdict(t0 + Duration::from_secs(1) + PING_INTERVAL, false, true),
             PingVerdict::Send
         );
 
@@ -545,6 +564,54 @@ mod tests {
         r.on_sent(3, t0);
         r.on_repair_failed(t0);
         r.reset();
-        assert_eq!(r.verdict(t0, false), PingVerdict::Send);
+        assert_eq!(r.verdict(t0, false, true), PingVerdict::Send);
+    }
+
+    /// #164: with `gm_options_keepalive` off nothing starts a routine probe,
+    /// however long the line has been idle or whether one was ever sent.
+    #[test]
+    fn ping_verdict_never_starts_a_routine_probe_when_not_periodic() {
+        let t0 = Instant::now();
+        let fresh = PingState::default();
+        assert_eq!(fresh.verdict(t0, false, false), PingVerdict::Idle);
+        assert_eq!(
+            fresh.verdict(t0 + PING_INTERVAL * 100, false, false),
+            PingVerdict::Idle
+        );
+
+        let sent_long_ago = PingState {
+            last_sent: Some(t0),
+            ..PingState::default()
+        };
+        assert_eq!(
+            sent_long_ago.verdict(t0 + PING_INTERVAL * 2, false, false),
+            PingVerdict::Idle
+        );
+    }
+
+    /// The probes a repair owes must survive the flag: the confirming probe
+    /// after a rebuild is answered or scored dead, and a failed repair still
+    /// retries on `retry_at`.
+    #[test]
+    fn ping_verdict_still_runs_repair_probes_when_not_periodic() {
+        let t0 = Instant::now();
+        let mut pending = PingState::default();
+        pending.on_sent(1, t0);
+        assert_eq!(
+            pending.verdict(t0 + PING_RESPONSE_TIMEOUT / 2, false, false),
+            PingVerdict::Await
+        );
+        assert_eq!(
+            pending.verdict(t0 + PING_RESPONSE_TIMEOUT, false, false),
+            PingVerdict::Dead
+        );
+
+        let mut retry = PingState::default();
+        retry.on_repair_failed(t0);
+        assert_eq!(retry.verdict(t0, false, false), PingVerdict::Idle);
+        assert_eq!(
+            retry.verdict(t0 + PING_RESPONSE_TIMEOUT, false, false),
+            PingVerdict::Send
+        );
     }
 }
