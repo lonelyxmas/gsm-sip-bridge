@@ -887,6 +887,14 @@ that actually runs.
 The one thing that reliably works is letting the VoWiFi/ePDG path capture the
 address once, from the IKEv2 config payload, and handing that to VoLTE.
 
+**Check the address family.** A carrier's VoWiFi core can hand out a P-CSCF the
+LTE IMS PDN cannot reach at all: on Jio, priming captured an IPv4 P-CSCF while
+the LTE IMS PDN was IPv6-only (#165). The carrier agent now refuses such a
+pairing after attaching and logs `P-CSCF <addr> is IPv4, but this line's IMS
+PDN is IPv6-only, so it can never be reached over LTE`, instead of failing
+every registration with `Network unreachable`. Set `[[volte.line]].pcscf` to
+the carrier's VoLTE P-CSCF (one the modem's own VoLTE stack uses) in that case.
+
 #### It's automatic now (specs/080-volte-pcscf-auto-prime, specs/081-multi-carrier-pcscf)
 
 As of specs/080, `supervise` does this for you. When `[volte].enabled = true`
@@ -1060,6 +1068,14 @@ Note that "attached" and "usable" are different states: the assigned address is
 installed by the bridge regardless, so **the default route — not the presence
 of an address — is what proves the RA was accepted**.
 
+On a **point-to-point** interface (a raw-IP modem link such as rmnet or
+qmimux, listed as `<UP,LOWER_UP>` with no `BROADCAST`), a missing RA no longer
+leaves the line dead: everything on such a link goes to the modem anyway, so
+the bridge installs `default dev <iface>` itself (metric 2048, so a later RA
+route still wins) and logs `no router advertisement was accepted; the
+interface is point-to-point, so a default route was installed through it`.
+Ethernet-style ECM/RNDIS adapters (`enx*`) still need the RA (#165).
+
 This whole RA dance is IPv6-specific. An **IPv4-only PDN** (confirmed on Jio,
 2026-09-16 — the same modem gave Vodafone an IPv6-only bearer) is a different
 code path: the ECM/RNDIS `enx*` adapter `AT+QNETDEVCTL` binds to hands out its
@@ -1155,6 +1171,23 @@ exactly once even if both routes deliver the same message.
 Messages are acknowledged **after** being recorded, never before, so an
 ill-timed crash costs a retransmission (which is de-duplicated) rather than a
 silently lost text.
+
+#### The LTE interface lives in the line's namespace
+
+Each line's LTE interface is moved into that line's namespace (`volte0`,
+`volte1`, ...) before its carrier agent starts, and the supervisor keeps it
+there. Three log lines say when it could not:
+
+| Log line | Meaning |
+|---|---|
+| `volte line N: FATAL: could not move interface X into netns Y: <reason>; skipping this line` | The kernel refused the move at startup (some drivers do not allow namespace moves). The line stays down until the container is recreated. |
+| `volte line N: interface X is no longer in netns Y (...); restarting the carrier agent` | The interface left the namespace while the line ran. A modem that re-enumerates on USB, or a link re-created by ModemManager/NetworkManager, comes back in the host namespace. The agent is stopped and the new interface is moved in before it restarts, within about 30 s. |
+| `volte line N: interface X is not present in the container or in netns Y; retrying in 15s` | The interface is gone everywhere, typically a modem mid-reset. The line restarts once it reappears. |
+
+Inside the namespace the agent itself reports `interface X is not in this
+line's namespace` when it finds its interface missing, instead of a PDN or
+route error. Check with `ip netns exec volte0 ip link` (the interface should
+be listed) and `ip link show <iface>` on the host (it should not exist there).
 
 ## AMR passthrough kill switch
 

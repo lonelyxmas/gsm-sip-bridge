@@ -92,7 +92,15 @@ pub(crate) fn run(
     // `attach` records the displaced context (via `settings.restore_cid_path`)
     // *before* it rebinds, so the container's cleanup can restore it even if
     // this line is killed mid-attach.
-    let plmn = {
+    if !line.settings.iface.is_empty() && !super::netcfg::iface_present(&line.settings.iface) {
+        tracing::error!(
+            card_id = %line.card_id,
+            "{}",
+            super::netcfg::iface_missing_reason(&line.settings.iface)
+        );
+        return;
+    }
+    let (plmn, pdn) = {
         let Some(_guard) = modem_lock.lock() else {
             tracing::error!(
                 card_id = %line.card_id,
@@ -124,7 +132,7 @@ pub(crate) fn run(
             }
         };
         match crate::vowifi::plmn::derive_plmn(&mut at) {
-            Ok(p) => p,
+            Ok(p) => (p, attach.pdn),
             Err(e) => {
                 tracing::error!(card_id = %line.card_id, error = %e, "could not derive the home PLMN");
                 return;
@@ -136,6 +144,10 @@ pub(crate) fn run(
         tracing::error!(card_id = %line.card_id, "no P-CSCF configured for this line");
         return;
     };
+    if let Some(why) = super::pcscf::pcscf_family_mismatch(pcscf.ip(), &pdn) {
+        tracing::error!(card_id = %line.card_id, "{why}");
+        return;
+    }
 
     let reg_cfg = ImsRegisterConfig {
         modem_port: line.settings.modem_port.clone(),
